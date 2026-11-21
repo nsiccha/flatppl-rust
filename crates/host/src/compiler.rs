@@ -866,8 +866,11 @@ impl Context {
         let domain = typed
             .valueset_of(rhs)
             .ok_or_else(|| fail("the input has no known domain".into()))?;
-        let chart = Domain::of(typed, domain)
-            .chart_with_correlation_factors("point", correlation_factors)
+        let ty = typed
+            .type_of(rhs)
+            .ok_or_else(|| fail("the input has no inferred type".into()))?;
+        let chart = crate::transforms::nest(&Domain::of(typed, domain), ty, typed)
+            .and_then(|domain| domain.chart_with_correlation_factors("point", correlation_factors))
             .map_err(fail)?;
         let registered = loop {
             let name = format!("__flatppl_coordinates_{}.flatppl", self.next_inline);
