@@ -300,7 +300,8 @@
 //! - `get`/`get0` selector is not a literal integer — "get/get0: selector
 //!   must be a literal integer"
 //! - `in`'s set is none of `interval(lo, hi)`, `reals`, `posreals`,
-//!   `nonnegreals`, `stdsimplex(n)`, `ordered(n)`, `zerosum(n)` — "'in': only
+//!   `nonnegreals`, `stdsimplex(n)`, `ordered(n)`, `zerosum(n)`,
+//!   `corrcholesky(n)` — "'in': only
 //!   an interval(lo, hi), reals, posreals or nonnegreals set is supported ..."
 //!   (one shared closure, invoked for either a
 //!   non-`interval`-headed call or a non-`Call` set expression; the existing

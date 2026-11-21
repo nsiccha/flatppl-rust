@@ -189,6 +189,11 @@ pub enum ValueSet {
     Ordered(Dim),
     /// `zerosum(n)` — real n-vectors summing to zero, an (n-1)-dim subspace.
     ZeroSum(Dim),
+    /// `corrcholesky(n)` — Cholesky factors of n×n correlation matrices:
+    /// lower-triangular real n×n matrices with positive diagonal and unit-norm
+    /// rows, an n(n-1)/2-dim manifold (the support of `LKJCholesky(n, eta)`).
+    /// Fork-only until flatppl-design adopts it.
+    CorrCholesky(Dim),
     /// `interval(lo, hi)` with static literal bounds.
     Interval(f64, f64),
     /// `cartpow(set, n)` — arrays with every element in `set`.
@@ -255,7 +260,8 @@ impl ValueSet {
     pub fn is_bounded(&self) -> Option<bool> {
         use ValueSet::*;
         match self {
-            UnitInterval | Booleans | StdSimplex(_) => Some(true),
+            // Unit-norm rows keep every `corrcholesky(n)` entry in [-1, 1].
+            UnitInterval | Booleans | StdSimplex(_) | CorrCholesky(_) => Some(true),
             // `ordered(1)` is all of ℝ; `zerosum(1)` is the single point {[0]}.
             Ordered(Dim::Static(n)) => Some(*n == 0),
             ZeroSum(Dim::Static(n)) => Some(*n <= 1),
@@ -298,6 +304,14 @@ impl ValueSet {
             }
             (Ordered(n) | ZeroSum(n), CartPow(elem, d)) => {
                 (n == d || matches!(d, Dim::Dynamic)) && Reals.subset_of(elem.as_ref())
+            }
+            // An n×n matrix with entries in [-1, 1]: rows of a right-nested
+            // `cartpow(cartpow(S, n), n)` whose element set holds [-1, 1].
+            (CorrCholesky(n), CartPow(row, d)) => {
+                let fits = |d: &Dim| n == d || matches!(d, Dim::Dynamic);
+                fits(d)
+                    && matches!(row.as_ref(), CartPow(elem, c)
+                        if fits(c) && Interval(-1.0, 1.0).subset_of(elem.as_ref()))
             }
             (CartPow(a, n), CartPow(b, d)) => {
                 (n == d || matches!(d, Dim::Dynamic)) && a.subset_of(b)
@@ -506,6 +520,7 @@ impl fmt::Display for ValueSet {
             StdSimplex(d) => write!(f, "stdsimplex({d})"),
             Ordered(d) => write!(f, "ordered({d})"),
             ZeroSum(d) => write!(f, "zerosum({d})"),
+            CorrCholesky(d) => write!(f, "corrcholesky({d})"),
             Interval(lo, hi) => write!(f, "interval({lo}, {hi})"),
             CartPow(set, d) => write!(f, "cartpow({set}, {d})"),
             CartProd(parts) => {
@@ -790,6 +805,18 @@ mod tests {
             !ZeroSum(Dim::Static(3)).subset_of(&CartPow(Box::new(NonNegReals), Dim::Static(3)))
         );
         assert!(!Ordered(Dim::Static(3)).subset_of(&ZeroSum(Dim::Static(3))));
+        // corrcholesky(n) is a set of n×n matrices with entries in [-1, 1].
+        let square = |elem: ValueSet, rows: Dim, cols: Dim| {
+            CartPow(Box::new(CartPow(Box::new(elem), cols)), rows)
+        };
+        let l3 = CorrCholesky(Dim::Static(3));
+        assert!(l3.subset_of(&square(Reals, Dim::Static(3), Dim::Static(3))));
+        assert!(l3.subset_of(&square(Reals, Dim::Dynamic, Dim::Dynamic)));
+        assert!(l3.subset_of(&square(Interval(-1.0, 1.0), Dim::Static(3), Dim::Static(3))));
+        assert!(!l3.subset_of(&square(NonNegReals, Dim::Static(3), Dim::Static(3))));
+        assert!(!l3.subset_of(&square(Reals, Dim::Static(3), Dim::Static(4))));
+        assert!(!l3.subset_of(&CartPow(Box::new(Reals), Dim::Static(9))));
+        assert!(!l3.subset_of(&CorrCholesky(Dim::Static(2))));
         assert!(
             CartPow(Box::new(UnitInterval), Dim::Static(3))
                 .subset_of(&CartPow(Box::new(Reals), Dim::Static(3)))
@@ -810,6 +837,8 @@ mod tests {
         assert_eq!(ZeroSum(Dim::Static(1)).is_bounded(), Some(true));
         assert_eq!(ZeroSum(Dim::Static(2)).is_bounded(), Some(false));
         assert_eq!(ZeroSum(Dim::Dynamic).is_bounded(), None);
+        assert_eq!(CorrCholesky(Dim::Static(3)).is_bounded(), Some(true));
+        assert_eq!(CorrCholesky(Dim::Dynamic).is_bounded(), Some(true));
         assert_eq!(Interval(0.0, 1.0).is_bounded(), Some(true));
         assert_eq!(Interval(0.0, f64::INFINITY).is_bounded(), Some(false));
         assert_eq!(Reals.is_bounded(), Some(false));
@@ -837,6 +866,7 @@ mod tests {
         assert_eq!(StdSimplex(Dim::Static(4)).to_string(), "stdsimplex(4)");
         assert_eq!(Ordered(Dim::Static(4)).to_string(), "ordered(4)");
         assert_eq!(ZeroSum(Dim::Dynamic).to_string(), "zerosum(?)");
+        assert_eq!(CorrCholesky(Dim::Static(2)).to_string(), "corrcholesky(2)");
         assert_eq!(Interval(0.0, 1.0).to_string(), "interval(0, 1)");
         assert_eq!(
             CartPow(Box::new(Reals), Dim::Dynamic).to_string(),

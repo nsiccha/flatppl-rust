@@ -43,6 +43,8 @@
      note: "Stan uses an isometric (Helmert) transform; §03 uses the first n-1 coordinates."),
     (set: "stdsimplex(n)", block: "parameters", decl: "simplex[{n}] {name};", chart: "differs", status: "verified",
      note: "Stan 2.37+ uses softmax of a sum-to-zero vector; §03 uses centered stick-breaking."),
+    (set: "corrcholesky(n)", block: "parameters", decl: "cholesky_factor_corr[{n}] {name};", chart: "same", status: "unverified: fork-only set, not yet run through verify.py",
+     note: "Fork-only until flatppl-design adopts it: the support of LKJCholesky(n, eta). The host's chart, like Stan's, maps n(n-1)/2 row-major coordinates through tanh to canonical partial correlations, with the log volume taken on the strictly lower-triangular entries."),
     (set: "cartpow(S, n)", block: "parameters", decl: "vector{bounds}[{n}] {name};", chart: "same", status: "verified",
      note: "S a real set with a scalar row (reals, posreals, intervals, ...). Integer S: the next row."),
     (set: "cartpow(S, n), S integer", block: "data", decl: "array[{n}] int{bounds} {name};", chart: "n/a", status: "verified",

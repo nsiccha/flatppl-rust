@@ -30,6 +30,12 @@ fn keyword_lists_path() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+/// Names the dogfood fork adds before `flatppl-grammars` has them, so they are
+/// in `BUILTINS` but not yet in `keyword-lists.json`. `corrcholesky` is the
+/// support set of `LKJCholesky` (fork-only until flatppl-design adopts it).
+/// Drop a name here once the keyword list carries it.
+const FORK_ONLY: &[&str] = &["corrcholesky"];
+
 #[test]
 fn builtins_match_keyword_lists() {
     let Some(path) = keyword_lists_path() else {
@@ -45,11 +51,30 @@ fn builtins_match_keyword_lists() {
         .flat_map(|c| c["words"].as_array().unwrap())
         .map(|w| w.as_str().unwrap().to_string())
         .collect();
+    for name in FORK_ONLY {
+        assert!(
+            !expected.contains(*name),
+            "keyword-lists.json now has `{name}`: remove it from FORK_ONLY"
+        );
+    }
     let actual: BTreeSet<String> = flatppl_lint::test_builtins()
         .iter()
+        .filter(|s| !FORK_ONLY.contains(*s))
         .map(|s| s.to_string())
         .collect();
     assert_eq!(actual, expected, "BUILTINS drifted from keyword-lists.json");
+}
+
+/// Every fork-only name is a real roster entry, so the divergence list above
+/// cannot hide a stale name.
+#[test]
+fn fork_only_names_are_builtins() {
+    for name in FORK_ONLY {
+        assert!(
+            flatppl_lint::test_builtins().contains(name),
+            "`{name}` is listed as fork-only but is not in BUILTINS"
+        );
+    }
 }
 
 /// `shadows-builtin` looks up names with `binary_search`, which requires the

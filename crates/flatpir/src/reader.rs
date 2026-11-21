@@ -548,6 +548,12 @@ fn read_valueset(module: &mut Module, form: &Sexpr) -> Result<Option<ValueSet>> 
                     }
                     Ok(Some(ValueSet::ZeroSum(parse_dim(&items[1])?)))
                 }
+                "corrcholesky" => {
+                    if items.len() != 2 {
+                        return Err(err(form, "(corrcholesky <n>) takes one size"));
+                    }
+                    Ok(Some(ValueSet::CorrCholesky(parse_dim(&items[1])?)))
+                }
                 "interval" => {
                     if items.len() != 3 {
                         return Err(err(form, "(interval <lo> <hi>) takes two bounds"));

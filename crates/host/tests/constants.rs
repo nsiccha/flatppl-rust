@@ -232,6 +232,45 @@ fn fixed_vector_equalities_allow_roundoff_without_projection()
     Ok(())
 }
 
+/// `corrcholesky(n)` constants: an exactly zero upper triangle, a positive
+/// diagonal and unit row norms up to roundoff, as for the vector equalities.
+#[test]
+fn fixed_correlation_cholesky_factors_allow_roundoff_in_row_norms()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let matrix = |data: [f64; 9]| Constant::Array {
+        shape: vec![3, 3],
+        data: data.into_iter().map(Constant::Real).collect(),
+    };
+    let module = context.parse("x = external(corrcholesky(3))", None, None)?;
+    // Rows (1), (0.6, 0.8) and (0.3, sqrt(1 - 0.09 - 0.16)), computed in f64.
+    let last = (1.0_f64 - 0.3 * 0.3 - 0.4 * 0.4).sqrt();
+    let valid = matrix([1.0, 0.0, 0.0, 0.6, 0.8, 0.0, 0.3, 0.4, last]);
+    let bound = context.set(&module, &[("x".into(), valid.clone())])?;
+    assert_eq!(bound.constant("x")?, valid);
+    for invalid in [
+        // A nonzero upper entry.
+        matrix([1.0, 1e-300, 0.0, 0.6, 0.8, 0.0, 0.3, 0.4, last]),
+        // A negative diagonal with a unit row.
+        matrix([1.0, 0.0, 0.0, 0.6, -0.8, 0.0, 0.3, 0.4, last]),
+        // A row norm off by far more than roundoff.
+        matrix([1.0, 0.0, 0.0, 0.6, 0.8, 0.0, 0.3, 0.4, last + 1e-12]),
+        // The identity's first row scaled.
+        matrix([0.5, 0.0, 0.0, 0.6, 0.8, 0.0, 0.3, 0.4, last]),
+        matrix([f64::NAN, 0.0, 0.0, 0.6, 0.8, 0.0, 0.3, 0.4, last]),
+    ] {
+        assert!(
+            context
+                .set(&module, &[("x".into(), invalid)])
+                .is_err()
+        );
+    }
+    // The same value under the unconstrained matrix domain is accepted too.
+    let reals = context.parse("x = external(cartpow(reals, [3, 3]))", None, None)?;
+    context.set(&reals, &[("x".into(), valid)])?;
+    Ok(())
+}
+
 #[test]
 fn packed_f32_constants_use_their_source_precision() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();

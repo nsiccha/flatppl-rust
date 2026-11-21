@@ -1028,12 +1028,14 @@ mod tests {
         );
     }
 
-    /// §03 `ordered(n)` and `zerosum(n)` reach hover in the set vocabulary.
+    /// §03 `ordered(n)` and `zerosum(n)`, and the fork's `corrcholesky(n)`,
+    /// reach hover in the set vocabulary.
     #[test]
     fn hover_reports_ordered_and_zerosum_value_sets() {
         for (src, want) in [
             ("c = elementof(ordered(3))", "`ordered(3)`"),
             ("c = elementof(zerosum(3))", "`zerosum(3)`"),
+            ("c = elementof(corrcholesky(3))", "`corrcholesky(3)`"),
         ] {
             let db = Database::default();
             let cats = Catalogues::new(&db, vec![]);
@@ -1423,7 +1425,7 @@ mod tests {
         let items = completion(&db, file, fs, cats, CompletionContext::Other, false);
         // Full set still present; no AfterTilde bias applied.
         assert!(items.iter().any(|i| i.label == "Normal"));
-        for name in ["ordered", "zerosum", "tilt", "in"] {
+        for name in ["ordered", "zerosum", "corrcholesky", "tilt", "in"] {
             assert_eq!(
                 items.iter().filter(|i| i.label == name).count(),
                 1,

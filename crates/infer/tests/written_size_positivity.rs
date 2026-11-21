@@ -121,6 +121,11 @@ fn every_written_size_position_refuses_a_zero() {
             "§03 \"Zero-sum vectors\"",
         ),
         (
+            "corrcholesky",
+            "x = elementof(corrcholesky(0))",
+            "§08 `LKJCholesky`",
+        ),
+        (
             "iid",
             "x = iid(Normal(mu = 0.0, sigma = 1.0), 0)",
             "§06 `iid`",

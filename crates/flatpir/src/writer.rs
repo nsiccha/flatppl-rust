@@ -290,8 +290,8 @@ fn render_mass(mass: Mass) -> &'static str {
 }
 
 /// A value set renders as its FlatPPL set expression (bare set constants,
-/// `(stdsimplex n)`, `(ordered n)`, `(zerosum n)`, `(interval lo hi)`,
-/// `(cartpow set n)`, `(cartprod set...)` and the keyword `(cartprod (%field name set)...)`).
+/// `(stdsimplex n)`, `(ordered n)`, `(zerosum n)`, `(corrcholesky n)`,
+/// `(interval lo hi)`, `(cartpow set n)`, `(cartprod set...)` and the keyword `(cartprod (%field name set)...)`).
 fn render_valueset(module: &Module, set: &ValueSet) -> String {
     match set {
         ValueSet::Deferred => "%deferred".to_string(),
@@ -310,6 +310,7 @@ fn render_valueset(module: &Module, set: &ValueSet) -> String {
         ValueSet::StdSimplex(n) => format!("(stdsimplex {})", render_dim(*n)),
         ValueSet::Ordered(n) => format!("(ordered {})", render_dim(*n)),
         ValueSet::ZeroSum(n) => format!("(zerosum {})", render_dim(*n)),
+        ValueSet::CorrCholesky(n) => format!("(corrcholesky {})", render_dim(*n)),
         ValueSet::Interval(lo, hi) => {
             format!("(interval {} {})", render_real(*lo), render_real(*hi))
         }
