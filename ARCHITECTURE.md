@@ -295,7 +295,13 @@ Literal observations and derived data vectors use
 partitions with total selector length equal to the observation count. No
 operation scans every observation once per possible group, and unused groups
 add no scoring terms on the fixed-partition path. Runtime Bernoulli scoring batches
-the group terms. Preparation reuses monotonically allocated summary names.
+the group terms. Fixed-partition group terms of one shape, differing only in
+literals, summaries and literal parameter cells, become one elementwise
+`broadcast` over stacked group vectors and a `sum`, so the scoring program does
+not grow with the number of groups. The summaries, and so the preparation ABI,
+are unchanged. Terms that inference cannot type in vector form keep their
+scalar form.
+Preparation reuses monotonically allocated summary names.
 Runtime Normal and LogNormal partitions also prepare guarded centered moments.
 Gathered parameters must share their selector, origin and array extent. Scalar
 parameters remain invariant. The pass bounds both forward and reverse arithmetic

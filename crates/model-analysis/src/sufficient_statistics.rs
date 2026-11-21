@@ -35,6 +35,7 @@ mod runtime_partition;
 mod scalar;
 mod sorted;
 mod structural;
+mod vectorize;
 use flatppl_core::graph::{build_call, build_record};
 pub use report::{GroupPartition, ReductionDecision, ReductionOutcome, ReductionReport};
 pub use structural::{IidNormalPlan, plan_iid_normal};
