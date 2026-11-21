@@ -30,8 +30,10 @@
 //!
 //! One `stablehlo.while` of steps per output time is nested in a counted loop
 //! over `ts`. The step loop's trip count depends on the inputs, so it is not a
-//! counted loop: Enzyme-JAX's reverse mode refuses it today ("WhileOp does not
-//! have known iteration count for cache removal"; KB decision `1jb3rn9`).
+//! counted loop. Enzyme-JAX's reverse mode refuses it today ("WhileOp does not
+//! have known iteration count for cache removal"), while its forward mode
+//! differentiates it. That is a limitation to lift in Enzyme-JAX; the loop is
+//! deliberately not reshaped into a fixed trip count around it.
 
 use super::sequences::Components;
 use super::*;
