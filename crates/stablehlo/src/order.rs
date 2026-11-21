@@ -161,11 +161,7 @@ pub(crate) fn lower_cumulative_extremum(
     let [xs_id] = args_exact(id, args)?;
     require_not_table_vector(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
-    let cell = Value {
-        ty: e.cell_ty(&xs),
-        ..xs.clone()
-    };
-    let n = require_static_vector(id, head, &cell)?;
+    let n = require_static_vector(id, head, &e.cell_ty(&xs))?;
     if n == 0 {
         return Ok(xs);
     }
@@ -199,8 +195,12 @@ pub(crate) fn lower_linf_norm(
 ) -> Result<Value, EmitError> {
     let [v_id] = args_exact(id, args)?;
     let v = e.lower_node(v_id)?;
-    let n = require_static_vector(id, "linfnorm", &v)?;
-    if n == 0 {
+    // Inside a broadcast the operand carries the callable's batch axes in
+    // front of its cell: the domain "vectors" constrains the cell, as for the
+    // sibling norms (`crate::norms::lower_norm`).
+    let n = require_static_vector(id, "linfnorm", &e.cell_ty(&v))?;
+    let batched = e.batch_rank(&v) > 0;
+    if n == 0 && !batched {
         return Ok(e.scalar(0.0));
     }
     let v = if v.elem == ElemKind::Complex {
@@ -209,7 +209,12 @@ pub(crate) fn lower_linf_norm(
         e.convert(&v, ElemKind::Real)
     };
     let a = e.abs(&v);
-    e.reduce_trailing_axes(id, AxisReduce::Max, &a, 1)
+    let norm = e.reduce_trailing_axes(id, AxisReduce::Max, &a, 1)?;
+    if n == 0 {
+        // One zero per batch cell, not the max-reduction's `-inf` identity.
+        return Ok(e.constant_like(0.0, &norm));
+    }
+    Ok(norm)
 }
 
 // ---- §07 order statistics -----------------------------------------------------
@@ -331,8 +336,8 @@ pub(crate) fn order_statistic_value(
 /// [`crate::norms::require_static_vector`]'s twin, for the same §07 "vectors"
 /// domain. Duplicated rather than shared to keep this wave's module free of edits
 /// to `crate::norms`, whose sibling branch is concurrently changing.
-fn require_static_vector(id: NodeId, head: &str, v: &Value) -> Result<u64, EmitError> {
-    match &v.ty {
+fn require_static_vector(id: NodeId, head: &str, ty: &MlirTy) -> Result<u64, EmitError> {
+    match ty {
         MlirTy::Ranked(dims) if dims.len() == 1 => {
             if let Some(n) = dims[0] {
                 return Ok(n);
@@ -345,7 +350,7 @@ fn require_static_vector(id: NodeId, head: &str, v: &Value) -> Result<u64, EmitE
         format!(
             "{head}: §07 gives this head the domain \"vectors\", so its operand must be a \
              statically-sized rank-1 array, got {:?}",
-            v.ty
+            ty
         ),
     ))
 }
