@@ -38,6 +38,20 @@ outputs = sum(rowstack(odesolve(decay, [k, 2.0], 0.0, [0.5, 1.0]))[:, 1])
 inputs = k
 "#;
 
+/// The soil incubation model's call: `y0` is built from record fields, whose
+/// element type is still undecided when the rule first runs.
+const TWO_POOL: &str = r#"flatppl_compat = "0.1"
+domain = cartprod(k1 = posreals, k2 = posreals, alpha21 = posreals, alpha12 = posreals,
+    gamma = unitinterval)
+p = elementof(domain)
+two_pool(t, C, th) = [-th.k1 * C[1] + th.alpha12 * th.k2 * C[2],
+    -th.k2 * C[2] + th.alpha21 * th.k1 * C[1]]
+pools = rowstack(odesolve(two_pool, [p.gamma * 7.7, (1 - p.gamma) * 7.7], 0.0,
+    [1.0, 2.0, 5.0], p, rtol = 1e-10, atol = 1e-10))
+inputs = p
+outputs = sum(pools[:, 1] .+ pools[:, 2])
+"#;
+
 fn inferred(src: &str) -> (flatppl_core::Module, Vec<flatppl_infer::Diagnostic>) {
     let mut model = flatppl_syntax::parse(src).unwrap();
     let diagnostics = flatppl_infer::infer(&mut model);
@@ -103,7 +117,7 @@ fn mixed_positional_and_keyword_call_lowers_to_nested_loops() {
 
 #[test]
 fn record_parameter_branch_and_two_input_callback_lower() {
-    for src in [ABSORPTION, DECAY] {
+    for src in [ABSORPTION, DECAY, TWO_POOL] {
         let ir = emit(src, Target::Cpu, Dtype::F64).expect("emit odesolve");
         assert_eq!(ir.matches("stablehlo.while").count(), 2, "{ir}");
     }

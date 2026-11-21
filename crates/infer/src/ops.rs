@@ -1618,49 +1618,43 @@ fn odesolve_type(
             "`odesolve` takes one final parameter `p`; pass several values as one record".into(),
         );
     }
-    let state = match &y0.1 {
-        Type::Array { shape, elem }
-            if shape.len() == 1
-                && matches!(**elem, Type::Scalar(ScalarType::Real | ScalarType::Integer)) =>
-        {
-            Type::Array {
-                shape: shape.clone(),
-                elem: Box::new(Type::Scalar(ScalarType::Real)),
-            }
-        }
-        Type::Deferred | Type::Any | Type::Var(_) => return Ready(Type::Deferred),
-        _ => {
+    let shown = |inf: &mut Inferencer<'_, '_>, ty: &Type| crate::boundary::show(inf, ty);
+    let state = match real_vector_len(&y0.1) {
+        Ok(Some(d)) => Type::Array {
+            shape: Box::new([d]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+        Ok(None) => return Ready(Type::Deferred),
+        Err(()) => {
+            let got = shown(inf, &y0.1);
             return refuse(
                 inf,
                 y0.0,
-                "`odesolve` takes the initial state `y0` as a real vector".into(),
+                format!("`odesolve` takes the initial state `y0` as a real vector, got {got}"),
             );
         }
     };
     match &t0.1 {
         Type::Scalar(ScalarType::Real | ScalarType::Integer) => {}
         Type::Deferred | Type::Any | Type::Var(_) => return Ready(Type::Deferred),
-        _ => {
+        other => {
+            let got = shown(inf, other);
             return refuse(
                 inf,
                 t0.0,
-                "`odesolve` takes the initial time `t0` as a real number".into(),
+                format!("`odesolve` takes the initial time `t0` as a real number, got {got}"),
             );
         }
     }
-    let len = match &ts.1 {
-        Type::Array { shape, elem }
-            if shape.len() == 1
-                && matches!(**elem, Type::Scalar(ScalarType::Real | ScalarType::Integer)) =>
-        {
-            shape[0]
-        }
-        Type::Deferred | Type::Any | Type::Var(_) => return Ready(Type::Deferred),
-        _ => {
+    let len = match real_vector_len(&ts.1) {
+        Ok(Some(len)) => len,
+        Ok(None) => return Ready(Type::Deferred),
+        Err(()) => {
+            let got = shown(inf, &ts.1);
             return refuse(
                 inf,
                 ts.0,
-                "`odesolve` takes the output times `ts` as a real vector".into(),
+                format!("`odesolve` takes the output times `ts` as a real vector, got {got}"),
             );
         }
     };
@@ -1710,6 +1704,22 @@ fn odesolve_type(
             })
         },
     )
+}
+
+/// The length of a rank-1 real (or integer) vector type: `Ok(None)` while its
+/// element type is still undecided, `Err(())` when it is not such a vector.
+fn real_vector_len(ty: &Type) -> Result<Option<Dim>, ()> {
+    let (len, elem) = match ty {
+        Type::Array { shape, elem } if shape.len() == 1 => (shape[0], &**elem),
+        Type::TVector { len, elem } => (*len, &**elem),
+        Type::Deferred | Type::Any | Type::Var(_) => return Ok(None),
+        _ => return Err(()),
+    };
+    match elem {
+        Type::Scalar(ScalarType::Real | ScalarType::Integer) => Ok(Some(len)),
+        Type::Deferred | Type::Any | Type::Var(_) => Ok(None),
+        _ => Err(()),
+    }
 }
 
 fn state_shape(ty: &Type) -> Option<&Box<[Dim]>> {
