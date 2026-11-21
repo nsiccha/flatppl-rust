@@ -216,7 +216,9 @@ impl LoadedModule {
                     phase: module
                         .phase_of(b.rhs)
                         .map(|p| format!("{p:?}").to_lowercase()),
-                    domain: module.valueset_of(b.rhs).map(|s| Domain::of(module, s)),
+                    domain: module
+                        .valueset_of(b.rhs)
+                        .map(|s| inspect::typed_domain(module, s, ty)),
                     shape: ty.and_then(inspect::shape),
                     size: ty.and_then(inspect::size),
                     span,
@@ -866,8 +868,11 @@ impl Context {
         let domain = typed
             .valueset_of(rhs)
             .ok_or_else(|| fail("the input has no known domain".into()))?;
-        let chart = Domain::of(typed, domain)
-            .chart_with_correlation_factors("point", correlation_factors)
+        let ty = typed
+            .type_of(rhs)
+            .ok_or_else(|| fail("the input has no inferred type".into()))?;
+        let chart = crate::transforms::nest(&Domain::of(typed, domain), ty, typed)
+            .and_then(|domain| domain.chart_with_correlation_factors("point", correlation_factors))
             .map_err(fail)?;
         let registered = loop {
             let name = format!("__flatppl_coordinates_{}.flatppl", self.next_inline);

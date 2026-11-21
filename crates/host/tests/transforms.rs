@@ -63,13 +63,103 @@ fn array_nesting_is_not_silently_replaced_with_matrix_semantics()
         None,
         None,
     )?;
-    // Both use tensor<2x3x...>, but reductions and broadcasts differ by type.
-    nested.compile(&EmitOptions::default())?;
-    assert!(context.transform(&nested, false).is_err());
-    context
-        .transform(&matrix, false)?
-        .constrain
-        .compile(&EmitOptions::default())?;
+    // Both use tensor<2x3x...>, but reductions and broadcasts differ by type,
+    // so each chart keeps its own: free, constrained and inverse values all
+    // have the input's type.
+    let options = EmitOptions::default();
+    let mut types = Vec::new();
+    for query in [&nested, &matrix] {
+        let original = serde_json::to_value(query.compile(&options)?)?;
+        let input = &original["inputs"][0]["value"];
+        let maps = context.transform(query, false)?;
+        let free = serde_json::to_value(maps.unconstrained.compile(&options)?)?;
+        let forward = serde_json::to_value(maps.constrain.compile(&options)?)?;
+        let inverse = serde_json::to_value(maps.unconstrain.compile(&options)?)?;
+        assert_eq!(&free["inputs"][0]["value"], input);
+        assert_eq!(&forward["output"], input);
+        assert_eq!(&inverse["output"], input);
+        types.push(input["value_type"].clone());
+    }
+    assert_ne!(types[0], types[1], "{types:?}");
+    Ok(())
+}
+
+/// A power of a non-scalar set charts each element and keeps the nesting:
+/// the free value of `cartpow(stdsimplex(3), 3)` is three free 2-vectors, of
+/// `cartpow(cartpow(reals, 4), 3)` the array itself, inside records, at the
+/// top level and in table rows.
+#[test]
+fn powers_of_array_sets_chart_each_element() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let options = EmitOptions::default();
+    let shapes = |schema: &serde_json::Value| {
+        schema["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field["value"]["shape"].clone())
+            .collect::<Vec<_>>()
+    };
+    let check = |context: &mut Context, source: &str| {
+        let query = context.parse(source, None, None)?;
+        let original = serde_json::to_value(query.compile(&options)?)?;
+        let maps = context.transform(&query, true)?;
+        let free = serde_json::to_value(maps.unconstrained.compile(&options)?)?;
+        let forward = serde_json::to_value(maps.constrain.compile(&options)?)?;
+        let inverse = serde_json::to_value(maps.unconstrain.compile(&options)?)?;
+        let input = original["inputs"][0]["value"].clone();
+        let coordinates = free["inputs"][0]["value"].clone();
+        assert_eq!(forward["inputs"][0]["value"], coordinates);
+        assert_eq!(forward["output"], input);
+        assert_eq!(inverse["inputs"][0]["value"], input);
+        assert_eq!(inverse["output"], coordinates);
+        assert_eq!(original["output"], free["output"]);
+        Ok::<_, Box<dyn std::error::Error>>((input, coordinates))
+    };
+
+    // The HMM and IOHMM shapes: a power of simplices and an array of vectors.
+    let (input, free) = check(
+        &mut context,
+        "p = elementof(cartprod(pi1 = stdsimplex(3), A = cartpow(stdsimplex(3), 3), \
+             mu = ordered(3), sigma = cartpow(posreals, 3), w = cartpow(cartpow(reals, 4), 3)))\n\
+         inputs = p\n\
+         outputs = sum(log.(p.pi1)) + sum(broadcast(r -> sum(log.(r)), p.A)) + sum(p.mu) \
+             - sum(p.sigma) - sum(broadcast(r -> sum(r .* r), p.w))",
+    )?;
+    assert_eq!(
+        shapes(&free),
+        [json!([2]), json!([3, 2]), json!([3]), json!([3]), json!([3, 4])]
+    );
+    assert_eq!(
+        shapes(&input),
+        [json!([3]), json!([3, 3]), json!([3]), json!([3]), json!([3, 4])]
+    );
+    // The array of vectors is its own chart: free and constrained types agree.
+    assert_eq!(free["fields"][4], input["fields"][4]);
+
+    // An LDA-style top-level power of simplices, and of correlation factors.
+    for (set, free_shape) in [
+        ("cartpow(stdsimplex(2), 6)", json!([6, 1])),
+        ("cartpow(stdsimplex(249), 2)", json!([2, 248])),
+        ("cartpow(corrcholesky(3), 2)", json!([2, 3])),
+        ("cartpow(ordered(3), [2, 2])", json!([2, 2, 3])),
+        ("cartpow(cartpow(stdsimplex(3), 2), 2)", json!([2, 2, 2])),
+    ] {
+        let (_, free) = check(
+            &mut context,
+            &format!("p = elementof({set})\ninputs = p\noutputs = 0.0"),
+        )?;
+        assert_eq!(free["shape"], free_shape, "{set}");
+    }
+
+    // A table column holding a power of simplices.
+    let (_, free) = check(
+        &mut context,
+        "p = elementof(cartpow(cartprod(A = cartpow(stdsimplex(3), 2), s = posreals), 4))\n\
+         inputs = p\noutputs = sum(p.s)",
+    )?;
+    assert_eq!(free["rows"], 4);
+    assert_eq!(shapes(&free), [json!([4, 2, 2]), json!([4])]);
     Ok(())
 }
 

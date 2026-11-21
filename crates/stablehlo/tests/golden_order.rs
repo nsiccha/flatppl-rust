@@ -401,6 +401,26 @@ outputs = (o1)
     );
 }
 
+/// Broadcast over an array of vectors, `linfnorm` reduces each cell and keeps
+/// the batch axis: one norm per row, as `l2norm` already did. The correlation
+/// chart of `cartpow(corrcholesky(n), k)` needs it.
+#[test]
+fn linfnorm_reduces_each_cell_of_a_broadcast() {
+    let out = emit(
+        "\
+x = elementof(cartpow(cartpow(reals, 3), 2))
+o1 = broadcast(r -> linfnorm(r), x)
+inputs = (x)
+outputs = (o1)
+",
+    );
+    assert!(
+        out.contains("(%arg0: tensor<2x3xf32>) -> tensor<2xf32>"),
+        "one norm per row:\n{out}"
+    );
+    assert!(out.contains("applies stablehlo.maximum"), "{out}");
+}
+
 /// $\max_i \lvert v_i \rvert$ is an `abs` then a `maximum` reduce — the shape
 /// `l1norm`'s $\sum_i \lvert v_i \rvert$ takes with the combine swapped, and the
 /// contrast with `l2norm`, which squares instead and needs no `abs` at all.
