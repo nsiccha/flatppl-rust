@@ -395,6 +395,17 @@ and retains raw data needed by unreduced factors or other outputs. No identity
 cache can silently retain a caller's changed arrays. Both queries must use the
 same numeric precision.
 
+Fixed data are literals in the emitted program, and XLA does not fold loops
+over them, so ordinary emission repeats data-only setup, such as a bounded QR,
+on every call. `LoadedModule::compile_prepared` splits the ordinarily reduced
+query like explicit preparation with no data inputs, since some reductions
+match fixed data only before `load_data` becomes literals. It returns the
+scoring program with the preparation as `Export::preparation`. A host runs the
+preparation once, checks its status, and passes its output leaves after the
+declared input leaves of every call. Batched prepared compiles share those
+leaves across batch cells. Queries without separable summaries compile as
+`compile` does.
+
 `LoweringOptions::disable_sufficient_statistics` disables the shared rewrite.
 `EmitOptions::sufficient_statistics` controls both shared lowering and the
 existing StableHLO fixed-data fallback. The CLI exposes
