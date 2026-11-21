@@ -127,3 +127,58 @@ fn table_coordinates_preserve_rows_and_transform_each_field()
     assert_eq!(forward["output"], inverse["inputs"][0]["value"]);
     Ok(())
 }
+
+/// `corrcholesky(n)` inputs take the LKJCholesky correlation chart: n(n-1)/2
+/// free coordinates, an n×n constrained matrix, and an inverse that reads the
+/// declared set back. n = 2 and 30 are the PosteriorDB factor sizes.
+#[test]
+fn corrcholesky_inputs_have_one_free_coordinate_per_strict_lower_entry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let options = EmitOptions::default();
+    for n in [2_u32, 3, 30] {
+        let free = n * (n - 1) / 2;
+        let query = context.parse(
+            &format!(
+                "L = elementof(corrcholesky({n}))\ninputs = L\n\
+                 outputs = logdensityof(LKJCholesky({n}, 2.0), L)"
+            ),
+            None,
+            None,
+        )?;
+        let transformed = context.transform(&query, true)?;
+        let unconstrained = serde_json::to_value(transformed.unconstrained.compile(&options)?)?;
+        let forward = serde_json::to_value(transformed.constrain.compile(&options)?)?;
+        let inverse = serde_json::to_value(transformed.unconstrain.compile(&options)?)?;
+        let shape = |schema: &serde_json::Value| schema["value"]["shape"].clone();
+        assert_eq!(shape(&unconstrained["inputs"][0]), json!([free]), "n = {n}");
+        assert_eq!(shape(&forward["inputs"][0]), json!([free]), "n = {n}");
+        assert_eq!(forward["output"]["shape"], json!([n, n]), "n = {n}");
+        assert_eq!(shape(&inverse["inputs"][0]), json!([n, n]), "n = {n}");
+        assert_eq!(inverse["output"]["shape"], json!([free]), "n = {n}");
+    }
+    // A record field takes the same chart beside its other coordinates.
+    let query = context.parse(
+        "p = elementof(cartprod(mu = reals, L = corrcholesky(3)))\ninputs = p\n\
+         outputs = logdensityof(LKJCholesky(3, 4.0), p.L) - p.mu * p.mu",
+        None,
+        None,
+    )?;
+    let transformed = context.transform(&query, true)?;
+    let unconstrained = serde_json::to_value(transformed.unconstrained.compile(&options)?)?;
+    let fields = unconstrained["inputs"][0]["value"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field["value"]["shape"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(fields, [json!([]), json!([3])]);
+    // corrcholesky(1) = {[[1]]} has no free coordinate, so no chart.
+    let point = context.parse(
+        "L = elementof(corrcholesky(1))\ninputs = L\noutputs = sum(L)",
+        None,
+        None,
+    )?;
+    assert!(context.transform(&point, false).is_err());
+    Ok(())
+}

@@ -3985,11 +3985,17 @@ fn lkj_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError
 /// nothing here calls [`Emitter::cholesky`] at all) is checked square/sized
 /// against `n` by [`require_matrix_dim`] before [`Emitter::diag`] runs. No
 /// `@sample` builder (`sample: None`).
-fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky", "logdensity")?;
-    require_matrix_dim(e, p.variate_id()?, v, n, "LKJCholesky", "L")?;
-    let eta = p.get(e, "eta")?;
-
+/// Membership of a (possibly batched) real n×n matrix `v` in §08
+/// LKJCholesky's support, the fork's `corrcholesky(n)`: lower-triangular with
+/// a positive diagonal and unit-norm rows. Returns the per-cell `i1` predicate
+/// and `v` with every cell outside the support replaced by the identity, so
+/// a density can read it without non-finite intermediates.
+///
+/// Only rounding is tolerated: entries at most `1 + tol` in magnitude, an
+/// exactly zero upper triangle, a diagonal `> 0`, and `|sum_j L_ij^2 - 1| <=
+/// tol` per row, with [`correlation_tolerance`]'s precision-scaled `tol`.
+/// `NaN` fails the magnitude bound.
+pub(crate) fn corr_cholesky_support(e: &mut Emitter, v: &Value, n: u64) -> (Value, Value) {
     let (identity, upper) = correlation_masks(e, v, n);
     let tolerance = correlation_tolerance(e, n);
     let zero = e.scalar(0.0);
@@ -4015,6 +4021,16 @@ fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
     let unit = e.reduce_all(&unit);
     let supported = e.and(&structural, &unit);
     let safe = e.select(&supported, &safe, &identity);
+    (supported, safe)
+}
+
+fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky", "logdensity")?;
+    require_matrix_dim(e, p.variate_id()?, v, n, "LKJCholesky", "L")?;
+    let eta = p.get(e, "eta")?;
+
+    let (supported, safe) = corr_cholesky_support(e, v, n);
+    let one = e.scalar(1.0);
     let diag_l = e.diag(&safe);
     let eta = e.select(&supported, &eta, &one);
     let two = e.scalar(2.0);

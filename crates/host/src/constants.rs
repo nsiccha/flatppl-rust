@@ -642,6 +642,9 @@ fn array_in_set(
             Ok(true)
         }
         ZeroSum(Dim::Static(n)) if shape == [*n] => Ok(sum_matches(data, 0.0)),
+        CorrCholesky(Dim::Static(n)) if shape == [*n, *n] => {
+            Ok(corr_cholesky_matches(data, *n as usize))
+        }
         CartProd(parts) if shape.len() == 1 => {
             let mut offset = 0;
             for part in parts {
@@ -667,7 +670,8 @@ fn array_in_set(
         | CartPow(_, Dim::Dynamic)
         | StdSimplex(Dim::Dynamic)
         | Ordered(Dim::Dynamic)
-        | ZeroSum(Dim::Dynamic) => {
+        | ZeroSum(Dim::Dynamic)
+        | CorrCholesky(Dim::Dynamic) => {
             Err("external domain cannot be resolved after substitution".into())
         }
         _ => Ok(false),
@@ -699,6 +703,33 @@ fn sum_matches(data: &[Constant], target: f64) -> bool {
         abs_sum += number.abs();
     }
     (sum - target / scale).abs() <= 8.0 * data.len() as f64 * (epsilon / 2.0) * abs_sum
+}
+
+/// Fixed-data acceptance for a row-major n×n `corrcholesky(n)` value: finite
+/// entries, an exactly zero upper triangle, a positive diagonal and unit row
+/// norms, |sum_j L_ij^2 - 1| <= 8 n u, with the unit roundoff `u` of
+/// [`sum_matches`] (f32 unless an entry is a real). The entries are at most one
+/// in magnitude, so the squares need no scaling.
+fn corr_cholesky_matches(data: &[Constant], n: usize) -> bool {
+    if n == 0 {
+        return data.is_empty();
+    }
+    let mut epsilon = f64::from(f32::EPSILON);
+    let mut values = Vec::with_capacity(data.len());
+    for value in data {
+        let Some(number) = value.real_value().filter(|v| v.is_finite()) else {
+            return false;
+        };
+        if matches!(value, Constant::Real(_)) {
+            epsilon = f64::EPSILON;
+        }
+        values.push(number);
+    }
+    let tolerance = 8.0 * n as f64 * (epsilon / 2.0);
+    values.chunks(n).enumerate().all(|(i, row)| {
+        let norm: f64 = row[..=i].iter().map(|v| v * v).sum();
+        row[i] > 0.0 && row[i + 1..].iter().all(|&v| v == 0.0) && (norm - 1.0).abs() <= tolerance
+    })
 }
 
 fn product_width(set: &ValueSet) -> Option<usize> {

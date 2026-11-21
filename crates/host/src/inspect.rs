@@ -49,6 +49,10 @@ pub enum Domain {
     ZeroSum {
         n: Option<u32>,
     },
+    /// `corrcholesky(n)`: n×n Cholesky factors of correlation matrices.
+    CorrCholesky {
+        n: Option<u32>,
+    },
     /// Nested per-axis powers flatten into one shape. `None` is a dynamic extent.
     CartPow {
         of: Box<Domain>,
@@ -104,6 +108,7 @@ impl Domain {
             ValueSet::StdSimplex(n) => Self::StdSimplex { n: extent(*n) },
             ValueSet::Ordered(n) => Self::Ordered { n: extent(*n) },
             ValueSet::ZeroSum(n) => Self::ZeroSum { n: extent(*n) },
+            ValueSet::CorrCholesky(n) => Self::CorrCholesky { n: extent(*n) },
             ValueSet::CartPow(elem, n) => {
                 let mut shape = vec![extent(*n)];
                 let mut elem = elem.as_ref();

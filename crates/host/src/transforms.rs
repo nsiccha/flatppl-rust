@@ -123,7 +123,12 @@ fn record_chart(
 
 // Formula correlation factors use LKJCholesky, whose reference measure is
 // Lebesgue measure on the independent strictly lower-triangular coordinates.
+// Such a factor is declared as a square real matrix; `corrcholesky(n)` inputs
+// take the same chart through `Domain::chart`.
 fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
+    if let Domain::CorrCholesky { .. } = domain {
+        return domain.chart(point);
+    }
     let Domain::CartPow { of, shape } = domain else {
         return Err(format!(
             "correlation factor `{point}` must be a square real matrix"
@@ -140,6 +145,15 @@ fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
             "correlation factor `{point}` must be a square real matrix of size at least two"
         ));
     }
+    cholesky_factor_chart(n, format!("cartpow(reals, [{n}, {n}])"), point)
+}
+
+/// The chart of n×n correlation Cholesky factors (n >= 2) declared on
+/// `domain`: tanh partial correlations, with free coordinates in the row-major
+/// order of the n(n-1)/2 strictly lower-triangular entries. Its log volume is
+/// relative to coordinate Lebesgue measure on those entries, LKJCholesky's
+/// reference measure (§08) and `Lebesgue(support = corrcholesky(n))`'s.
+fn cholesky_factor_chart(n: u32, domain: String, point: &str) -> Result<Chart, String> {
     let size = n
         .checked_mul(n)
         .ok_or("correlation matrix size overflows")?;
@@ -197,7 +211,7 @@ fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
         }
     }
     Ok(Chart {
-        domain: format!("cartpow(reals, [{n}, {n}])"),
+        domain,
         free: format!("cartpow(reals, {free_size})"),
         constrain: format!("rowstack([{}])", rows.join(", ")),
         unconstrain: format!(
@@ -429,6 +443,10 @@ impl Domain {
                 free_size: n - 1,
                 scalar: false,
             }),
+            // `corrcholesky(1)` is the single point [[1]], with no free coordinate.
+            Self::CorrCholesky { n: Some(n) } if *n > 1 => {
+                cholesky_factor_chart(*n, format!("corrcholesky({n})"), point)
+            }
             Self::StdSimplex { n: Some(n) } if *n > 1 => {
                 let offsets = (1..*n)
                     .rev()
@@ -486,7 +504,9 @@ impl Domain {
                 let mut parts = Vec::new();
                 let complex = of.iter().any(Self::has_complex_elements);
                 for domain in of {
-                    if matches!(domain, Self::CartPow { shape, .. } if shape.len() != 1) {
+                    if matches!(domain, Self::CartPow { shape, .. } if shape.len() != 1)
+                        || matches!(domain, Self::CorrCholesky { .. })
+                    {
                         return Err("coordinate products currently require scalar or flat-vector components".into());
                     }
                     let base = domain.chart(point)?;

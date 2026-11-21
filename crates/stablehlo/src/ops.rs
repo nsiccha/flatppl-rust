@@ -3387,6 +3387,10 @@ fn lower_membership(
         return vector_set_membership(e, id, &v, set, n_id);
     }
 
+    if let Some(n_id) = corr_cholesky_size(e, set_id) {
+        return corr_cholesky_membership(e, id, &v, n_id);
+    }
+
     let set = classify_elem_set(e, id, set_id)?;
     elem_membership(e, id, &v, set)
 }
@@ -3513,6 +3517,80 @@ fn vector_set_membership(
     }
     let declared_size = e.lower_node(n_id)?;
     let point_size = e.int_value_const(len as i64);
+    let size_matches = e.compare("EQ", &declared_size, &point_size);
+    Ok(e.and(&membership, &size_matches))
+}
+
+/// The size argument of the fork's `corrcholesky(n)`; `None` for any other set.
+fn corr_cholesky_size(e: &Emitter, set_id: NodeId) -> Option<NodeId> {
+    let Node::Call(c) = e.node(set_id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    match &c.args[..] {
+        [n] if e.resolve(sym) == "corrcholesky" && c.named.is_empty() => Some(*n),
+        _ => None,
+    }
+}
+
+/// Membership of an n×n point in `corrcholesky(n)`, the support of §08
+/// LKJCholesky: one `i1` per batch cell, all-reduced over the matrix.
+///
+/// The predicate is LKJCholesky's own support check
+/// ([`crate::registry::corr_cholesky_support`]), so `in`, `Lebesgue(support =
+/// corrcholesky(n))` and the LKJCholesky density agree on every point: an
+/// exactly zero upper triangle, a positive diagonal and unit row norms within
+/// a precision-scaled rounding tolerance. Unlike the affine vector sets, the
+/// unit-norm equality is checked (to that tolerance): the density's diagonal
+/// is read from the point, so a point off the manifold would score as if on it.
+fn corr_cholesky_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v: &Value,
+    n_id: NodeId,
+) -> Result<Value, EmitError> {
+    let n = match e.cell_ty(v) {
+        MlirTy::Ranked(dims) if dims.len() == 2 => match (dims[0], dims[1]) {
+            (Some(rows), Some(cols)) if rows == cols => rows,
+            (Some(rows), Some(cols)) => {
+                return Err(EmitError::at(
+                    id,
+                    format!("'in' over corrcholesky: the point is {rows}x{cols}, not square"),
+                ));
+            }
+            _ => {
+                return Err(EmitError::at(
+                    id,
+                    "'in' over corrcholesky: the point's shape must be static",
+                ));
+            }
+        },
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "'in' over corrcholesky: only a rank-2 (matrix) point is supported, got {other:?}"
+                ),
+            ));
+        }
+    };
+    if let Node::Lit(Scalar::Int(size)) = e.node(n_id)
+        && (*size < 0 || *size as u64 != n)
+    {
+        return Err(EmitError::at(
+            id,
+            format!("'in' over corrcholesky({size}): the point is {n}x{n}"),
+        ));
+    }
+    let coordinates = e.convert(v, ElemKind::Real);
+    let (membership, _) = crate::registry::corr_cholesky_support(e, &coordinates, n);
+    if matches!(e.node(n_id), Node::Lit(Scalar::Int(_))) {
+        return Ok(membership);
+    }
+    let declared_size = e.lower_node(n_id)?;
+    let point_size = e.int_value_const(n as i64);
     let size_matches = e.compare("EQ", &declared_size, &point_size);
     Ok(e.and(&membership, &size_matches))
 }
@@ -3652,7 +3730,7 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
             id,
             "'in': only an interval(lo, hi), reals, complexes, posreals, nonnegreals, unitinterval, \
              integers, posintegers or nonnegintegers set is supported (optionally under one \
-             cartpow), or stdsimplex(n), ordered(n) or zerosum(n)",
+             cartpow), or stdsimplex(n), ordered(n), zerosum(n) or corrcholesky(n)",
         )
     };
     match e.node(set_id) {

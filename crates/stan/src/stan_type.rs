@@ -252,6 +252,17 @@ fn declare_layout(
                             support: None,
                         });
                     }
+                    // The fork's `corrcholesky(n)` is Stan's correlation
+                    // Cholesky factor, a constrained square matrix.
+                    if dims.len() == 2 && bounded && matches!(vs, ValueSet::CorrCholesky(_)) {
+                        return Ok(StanType {
+                            array: vec![],
+                            base: "matrix",
+                            dims,
+                            bounds: Bounds::default(),
+                            support: support_type("cholesky_factor_corr"),
+                        });
+                    }
                     match dims.len() {
                         1 => Ok(StanType {
                             array: vec![],
@@ -430,6 +441,17 @@ mod tests {
                 "stdsimplex(n)",
                 vector(real()),
                 ValueSet::StdSimplex(Dim::Static(4)),
+                "",
+                "",
+                "",
+            ),
+            (
+                "corrcholesky(n)",
+                Type::Array {
+                    shape: vec![Dim::Static(4), Dim::Static(4)].into(),
+                    elem: Box::new(real()),
+                },
+                ValueSet::CorrCholesky(Dim::Static(4)),
                 "",
                 "",
                 "",

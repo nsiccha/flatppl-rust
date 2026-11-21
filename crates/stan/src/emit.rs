@@ -642,6 +642,8 @@ impl<'m> Emitter<'m> {
             Some("stdsimplex" | "ordered" | "zerosum") if c.args.len() == 1 => {
                 vec![Some(c.args[0])]
             }
+            // `corrcholesky(n)`: an n×n matrix, both axes sized by `n`.
+            Some("corrcholesky") if c.args.len() == 1 => vec![Some(c.args[0]); 2],
             _ => vec![],
         }
     }

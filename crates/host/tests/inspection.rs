@@ -94,6 +94,17 @@ fn ordered_and_zerosum_domains_report_their_length() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn corrcholesky_domains_report_their_matrix_shape() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = bindings("L = elementof(corrcholesky(3))\nM ~ LKJCholesky(2, 4.0)\n")?;
+    assert_eq!(rows["L"]["domain"], json!({"set": "corrcholesky", "n": 3}));
+    // Nine stored values, three free coordinates: the ABI is a 3x3 real matrix.
+    assert_eq!(rows["L"]["shape"], json!([3, 3]));
+    assert_eq!(rows["L"]["size"], 9);
+    assert_eq!(rows["M"]["domain"], json!({"set": "corrcholesky", "n": 2}));
+    Ok(())
+}
+
+#[test]
 fn renamed_kernel_inputs_report_the_bound_values_support() -> Result<(), Box<dyn std::error::Error>>
 {
     let rows = bindings(

@@ -116,6 +116,9 @@ pub const BUILTINS: &[&str] = &[
     "complexes",
     "conj",
     "conv",
+    // Fork-only (not in flatppl-grammars yet): the support set of `LKJCholesky`.
+    // `crates/lint/tests/builtins_sync.rs` lists it as a known divergence.
+    "corrcholesky",
     "cos",
     "cosh",
     "cross",

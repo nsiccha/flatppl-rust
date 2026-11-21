@@ -400,6 +400,26 @@ mod tests {
         }
     }
 
+    /// The fork-only `corrcholesky(n)` has no conventional symbol, so it keeps
+    /// its written name and size rather than borrowing another set's glyph.
+    #[test]
+    fn corrcholesky_keeps_its_name() {
+        let src = "L = elementof(corrcholesky(3))";
+        let r = render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let row = r.bindings.iter().find(|b| b.name == "L").unwrap();
+        for markup in [
+            crate::tex::expr(&row.statement.rhs),
+            crate::typst::expr(&row.statement.rhs),
+            crate::mathml::expr(&row.statement.rhs),
+        ] {
+            assert!(
+                markup.contains("corrcholesky") && markup.contains('3'),
+                "{markup}"
+            );
+        }
+    }
+
     #[test]
     fn statistical_symbols_keep_parameter_roles_and_extended_support() {
         let r = render_source("s = elementof(reals)\nx ~ StudentT(5)\ny ~ ChiSquared(3)\nu = Uniform(unitinterval)\ng = Gamma(2, 3)\nL = lawof(x)", "m.flatppl", &HashMap::new()).unwrap();

@@ -272,6 +272,31 @@ fn stablehlo_ordered_and_zerosum_parameters_are_real_vector_inputs() {
     );
 }
 
+/// `elementof(corrcholesky(n))` is an n×n real matrix input, the ABI of
+/// `cartpow(reals, [n, n])`; an LKJCholesky prior on it and a Lebesgue
+/// reference on the set both lower.
+#[test]
+fn stablehlo_corrcholesky_parameters_are_real_matrix_inputs() {
+    let input = write_model(
+        "abi-corrcholesky",
+        "L = elementof(corrcholesky(3))\n\
+         lp = logdensityof(LKJCholesky(3, 2.0), L) + logdensityof(Lebesgue(support = corrcholesky(3)), L)\n\
+         inputs = L\n\
+         outputs = lp\n",
+    );
+    let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("func.func @logdensity(%arg0: tensor<3x3xf32>) -> tensor<f32>"),
+        "{stdout}"
+    );
+}
+
 /// A `load_data` ABI input is shaped from its declared `valueset` end-to-end
 /// through the real CLI binary, and THE SOURCE FILE NEED NOT EXIST: nothing in
 /// the pipeline opens it (spec §07 `load_data`: "`valueset` fully determines the

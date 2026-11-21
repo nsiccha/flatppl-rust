@@ -1029,7 +1029,9 @@ fn op_rule(
 
         // ---- set constructors (spec §03) — set objects have no first-class
         // type; consumers (`elementof`, `truncate`, …) read them structurally.
-        "interval" | "cartprod" | "stdsimplex" | "ordered" | "zerosum" => Type::Any,
+        "interval" | "cartprod" | "stdsimplex" | "ordered" | "zerosum" | "corrcholesky" => {
+            Type::Any
+        }
         // `cartpow(S, size)` takes exactly a set and a size; the size is an
         // integer (1-D) or a vector of positive integers (multi-axis), §03
         // "Cartesian power". The legacy variadic `cartpow(S, d1, d2, …)` form
@@ -3952,6 +3954,18 @@ fn set_element_type_at(
                     let dim = size_arg.map_or(Dim::Dynamic, |n| resolve_dim(inf, n));
                     Type::Array {
                         shape: Box::new([dim]),
+                        elem: Box::new(Type::Scalar(ScalarType::Real)),
+                    }
+                }
+                // `corrcholesky(n)` (fork-only) is a set of n×n real matrices:
+                // the element has the ABI of `cartpow(reals, [n, n])`, and the
+                // triangle, positive diagonal and unit row norms live in the
+                // value-set slot (`CorrCholesky`), as for `stdsimplex(n)`.
+                "corrcholesky" => {
+                    let size_arg = c.args.first().copied();
+                    let dim = size_arg.map_or(Dim::Dynamic, |n| resolve_dim(inf, n));
+                    Type::Array {
+                        shape: Box::new([dim, dim]),
                         elem: Box::new(Type::Scalar(ScalarType::Real)),
                     }
                 }
@@ -7890,6 +7904,7 @@ const WRITTEN_SIZE_ARGS: &[(&str, &str, usize, &str)] = &[
     ("stdsimplex", "n", 0, "§03 \"Standard simplex\""),
     ("ordered", "n", 0, "§03 \"Ordered vectors\""),
     ("zerosum", "n", 0, "§03 \"Zero-sum vectors\""),
+    ("corrcholesky", "n", 0, "§08 `LKJCholesky`"),
     ("iid", "size", 1, "§06 `iid`"),
     ("markovchain", "n", 2, "§06 `markovchain`"),
     ("LKJ", "n", 0, "§08 `LKJ`"),
@@ -10846,7 +10861,8 @@ pub(crate) fn call_valueset(
         // A set-constructor used directly as a value binding is a PRESET (spec
         // §03): its value-set is the set it denotes. (Its TYPE is `%any` — a set
         // is not a value type — set in the `cartprod`/`interval`/… type arms.)
-        "interval" | "stdsimplex" | "ordered" | "zerosum" | "cartpow" | "cartprod" => {
+        "interval" | "stdsimplex" | "ordered" | "zerosum" | "corrcholesky" | "cartpow"
+        | "cartprod" => {
             set_call_valueset(inf, call)
         }
         // Parameters / loaded sets.
@@ -11296,6 +11312,11 @@ fn set_call_valueset_at(
                 .first()
                 .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
         ),
+        "corrcholesky" => ValueSet::CorrCholesky(
+            c.args
+                .first()
+                .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
+        ),
         "cartpow" => {
             // The size is REQUIRED (spec §03 "Cartesian power") — the type
             // arm already fails 1-arg `cartpow(S)` (`Type::Failed`, above);
@@ -11427,6 +11448,13 @@ fn distribution_support(
     let Some(sig) = crate::catalogue::builtin().base(name) else {
         return ValueSet::Unknown;
     };
+    // §08 LKJCholesky: "lower-triangular n×n matrices with positive diagonal
+    // and unit-norm rows", the fork's `corrcholesky(n)` set. Its `n` sizes the
+    // set as it sizes the variate (`lkj_matrix_domain`).
+    if name == "LKJCholesky" {
+        let n = named_or_positional_node(inf.module, named, args, "n", 0);
+        return ValueSet::CorrCholesky(n.map_or(Dim::Dynamic, |n| resolve_dim(inf, n)));
+    }
     // Structural support: live code path reads the actual set argument.
     // Currently only Uniform; the static catalogue approximation (Unknown) is
     // not used here — the concrete arg-dependent value is what inference needs.
