@@ -821,6 +821,68 @@ impl<'m> Emitter<'m> {
     pub fn invlogit(&mut self, a: &Value) -> Value {
         self.unary_real("stablehlo.logistic", a)
     }
+    /// The logit `z` of a probability `p` emitted as [`Emitter::invlogit`]`(z)`.
+    /// A density takes `log p = -softplus(-z)` and `log(1 - p) = -softplus(z)`
+    /// from it: once `p` is rounded, `1 - p` keeps only the leading digits of
+    /// `exp(-z)` and is zero from `z` ≈ 17 in f32 and ≈ 37 in f64, so
+    /// `log(1 - p)` is `-inf` with a NaN derivative.
+    ///
+    /// The logistic commutes with reshapes, slices and transposes, which are
+    /// replayed on `z`. A select whose other branch is a fixed probability `k`
+    /// in (0, 1), such as a likelihood summary's stand-in 0.5 for an empty
+    /// group, selects `logit(k)` instead. Anything else is `None`, and the
+    /// density scores `p` itself.
+    pub(crate) fn invlogit_operand(&mut self, p: &Value) -> Option<Value> {
+        match self.pointwise.get(&p.ssa)?.op.clone() {
+            Pointwise::Unary(op, z) if op == "stablehlo.logistic" => Some(z),
+            Pointwise::Reshape(a) => {
+                let z = self.invlogit_operand(&a)?;
+                let axes = self.axes_of(p);
+                Some(self.reshape_axes(&z, p.ty.clone(), axes))
+            }
+            Pointwise::Slice(a, starts, limits, strides) => {
+                let z = self.invlogit_operand(&a)?;
+                Some(self.slice(&z, &starts, &limits, &strides))
+            }
+            Pointwise::Transpose(a, perm) => {
+                let z = self.invlogit_operand(&a)?;
+                Some(self.transpose(&z, &perm))
+            }
+            Pointwise::Select(c, a, b) => {
+                let (za, zb) = match (self.invlogit_operand(&a), self.invlogit_operand(&b)) {
+                    (Some(za), Some(zb)) => (za, zb),
+                    (Some(za), None) => (za, self.fixed_logit(&b)?),
+                    (None, Some(zb)) => (self.fixed_logit(&a)?, zb),
+                    (None, None) => return None,
+                };
+                Some(self.select(&c, &za, &zb))
+            }
+            _ => None,
+        }
+    }
+    /// `logit(k)` shaped like `p` when `p` is a fixed splat probability `k`
+    /// strictly inside (0, 1).
+    fn fixed_logit(&mut self, p: &Value) -> Option<Value> {
+        let data = self.constants.get(&p.ssa)?;
+        let Some(Scalar::Real(k)) = data.first().cloned() else {
+            return None;
+        };
+        if !(0.0 < k && k < 1.0) || data.iter().any(|x| *x != Scalar::Real(k)) {
+            return None;
+        }
+        Some(self.constant_like((k / (1.0 - k)).ln(), p))
+    }
+    /// `softplus(z) = log(1 + exp(z))` as `max(z, 0) + log1p(exp(-|z|))`, which
+    /// overflows in neither tail and has the derivative `invlogit(z)`.
+    pub(crate) fn softplus(&mut self, z: &Value) -> Value {
+        let abs = self.abs(z);
+        let negative = self.neg(&abs);
+        let ex = self.exp(&negative);
+        let tail = self.log1p(&ex);
+        let zero = self.scalar(0.0);
+        let positive = self.max(z, &zero);
+        self.add(&positive, &tail)
+    }
     /// `stablehlo.sine` — a NEW op form for this crate (Task 14's Cauchy
     /// `@sample`, which needs `tan(t) = sin(t) / cos(t)`; no `chlo`/
     /// `stablehlo` `tan` op is used, mirroring [`Emitter::cos`]'s existing

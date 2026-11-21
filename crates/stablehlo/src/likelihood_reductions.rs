@@ -438,14 +438,25 @@ impl Emitter<'_> {
                 ) else {
                     return Ok(None);
                 };
+                // `invlogit(z)` scores on the logit scale, as the per-cell density does.
+                let logit = self.invlogit_operand(&params[1]);
                 let successes = if sum == 0.0 {
                     self.scalar(0.0)
+                } else if let Some(logit) = &logit {
+                    let negative = self.neg(logit);
+                    let penalty = self.softplus(&negative);
+                    let scaled = self.mul(&total, &penalty);
+                    self.neg(&scaled)
                 } else {
                     let log_prob = self.log(&params[1]);
                     self.mul(&total, &log_prob)
                 };
                 let failures = if count as f64 * trials == sum {
                     self.scalar(0.0)
+                } else if let Some(logit) = &logit {
+                    let penalty = self.softplus(logit);
+                    let scaled = self.mul(&failures, &penalty);
+                    self.neg(&scaled)
                 } else {
                     let neg_prob = self.neg(&params[1]);
                     let log_complement = self.log1p(&neg_prob);
