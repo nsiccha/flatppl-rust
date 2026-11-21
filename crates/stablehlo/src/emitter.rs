@@ -67,6 +67,8 @@ mod matrix_eigen;
 mod matrix_exp;
 #[path = "matrix_svd.rs"]
 mod matrix_svd;
+#[path = "ode.rs"]
+mod ode;
 #[path = "packed_gathers.rs"]
 mod packed_gathers;
 #[path = "packing.rs"]
@@ -5153,6 +5155,8 @@ impl<'m> Emitter<'m> {
                     } else if matches!(name.as_str(), "scan" | "reduce") {
                         self.lower_sequence(id, &call.args, name == "reduce")?
                             .tensor(id)
+                    } else if name == "odesolve" {
+                        self.lower_odesolve(id, &call.args)
                     } else if name == "mul" {
                         // A BARE `mul` is the surface `*`, which spec §07 "Linear
                         // algebra" defines as the MATRIX product ("Matrix

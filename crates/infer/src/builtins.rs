@@ -227,6 +227,7 @@ pub const BUILTINS: &[&str] = &[
     "nonnegintegers",
     "nonnegreals",
     "normalize",
+    "odesolve",
     "onehot",
     "ones",
     "only",

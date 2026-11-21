@@ -107,7 +107,7 @@ fn op_rule(
     if !args.is_empty()
         && !named.is_empty()
         && !applied_chain
-        && !matches!(call.head, CallHead::Builtin(op) if matches!(inf.module.resolve(op), "functionof" | "kernelof" | "broadcast" | "ksuperpose" | "load_module" | "weighted" | "logweighted" | "pushfwd" | "reduce" | "filter" | "scan" | "kscan" | "markovchain"))
+        && !matches!(call.head, CallHead::Builtin(op) if matches!(inf.module.resolve(op), "functionof" | "kernelof" | "broadcast" | "ksuperpose" | "load_module" | "weighted" | "logweighted" | "pushfwd" | "reduce" | "filter" | "scan" | "kscan" | "markovchain" | "odesolve"))
     {
         inf.diags.push(crate::Diagnostic::error_at(
             id,
@@ -886,6 +886,9 @@ fn op_rule(
             });
         }
         "scan" => return scan_type(inf, args).map(inf, move |_, ty| (ty, joined)),
+        "odesolve" => {
+            return odesolve_type(inf, id, args, named).map(inf, move |_, ty| (ty, joined));
+        }
         // `fchain(f1, f2, …)` (spec §04) composes deterministic functions; the
         // result is a function with `f1`'s input signature (output type is not
         // tracked by `Type::Function`).
@@ -1549,6 +1552,171 @@ fn scan_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Type> {
         },
         _ => Type::Deferred,
     })
+}
+
+/// `odesolve(f, y0, t0, ts)` and `odesolve(f, y0, t0, ts, p)` (dogfood-fork
+/// extension; not yet in flatppl-design): the solution of the initial value
+/// problem `dy/dt = f(t, y)`, `y(t0) = y0`, at each time in `ts`. Like `scan`,
+/// the result is an array with one state per element of `ts`. `f` is called
+/// positionally as `f(t, y)`, or `f(t, y, p)` with the §04 explicit callback
+/// parameter, and returns `dy/dt` with the type of `y0`. The optional named
+/// inputs `rtol`, `atol` (real) and `max_steps` (integer, per output interval)
+/// configure the engine's error control.
+fn odesolve_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let refuse = |inf: &mut Inferencer<'_, '_>, node: NodeId, what: String| {
+        inf.diags
+            .push(crate::Diagnostic::error_at(node, what.clone()));
+        Ready(Type::Failed(format!("odesolve: {what}").into()))
+    };
+    for (name, node, ty, _) in named {
+        let integer = match inf.module.resolve(*name) {
+            "rtol" | "atol" => false,
+            "max_steps" => true,
+            other => {
+                return refuse(
+                    inf,
+                    *node,
+                    format!(
+                        "`odesolve` has no keyword input `{other}`; its named inputs are \
+                         `rtol`, `atol` and `max_steps`"
+                    ),
+                );
+            }
+        };
+        let fits = match ty {
+            Type::Scalar(ScalarType::Integer) => true,
+            Type::Scalar(ScalarType::Real) => !integer,
+            Type::Deferred | Type::Any | Type::Var(_) => true,
+            _ => false,
+        };
+        if !fits {
+            let want = if integer {
+                "an integer"
+            } else {
+                "a real number"
+            };
+            let name = inf.module.resolve(*name).to_string();
+            return refuse(inf, *node, format!("`odesolve` takes `{name}` as {want}"));
+        }
+    }
+    let [function, y0, t0, ts, parameters @ ..] = args else {
+        return refuse(
+            inf,
+            id,
+            "`odesolve` takes `odesolve(f, y0, t0, ts)` or `odesolve(f, y0, t0, ts, p)`".into(),
+        );
+    };
+    if parameters.len() > 1 {
+        return refuse(
+            inf,
+            id,
+            "`odesolve` takes one final parameter `p`; pass several values as one record".into(),
+        );
+    }
+    let state = match &y0.1 {
+        Type::Array { shape, elem }
+            if shape.len() == 1
+                && matches!(**elem, Type::Scalar(ScalarType::Real | ScalarType::Integer)) =>
+        {
+            Type::Array {
+                shape: shape.clone(),
+                elem: Box::new(Type::Scalar(ScalarType::Real)),
+            }
+        }
+        Type::Deferred | Type::Any | Type::Var(_) => return Ready(Type::Deferred),
+        _ => {
+            return refuse(
+                inf,
+                y0.0,
+                "`odesolve` takes the initial state `y0` as a real vector".into(),
+            );
+        }
+    };
+    match &t0.1 {
+        Type::Scalar(ScalarType::Real | ScalarType::Integer) => {}
+        Type::Deferred | Type::Any | Type::Var(_) => return Ready(Type::Deferred),
+        _ => {
+            return refuse(
+                inf,
+                t0.0,
+                "`odesolve` takes the initial time `t0` as a real number".into(),
+            );
+        }
+    }
+    let len = match &ts.1 {
+        Type::Array { shape, elem }
+            if shape.len() == 1
+                && matches!(**elem, Type::Scalar(ScalarType::Real | ScalarType::Integer)) =>
+        {
+            shape[0]
+        }
+        Type::Deferred | Type::Any | Type::Var(_) => return Ready(Type::Deferred),
+        _ => {
+            return refuse(
+                inf,
+                ts.0,
+                "`odesolve` takes the output times `ts` as a real vector".into(),
+            );
+        }
+    };
+    let mut arguments = vec![
+        (t0.0, Type::Scalar(ScalarType::Real), t0.2),
+        (y0.0, state.clone(), y0.2),
+    ];
+    arguments.extend(parameters.iter().cloned());
+    let function = function.0;
+    let y0_node = y0.0;
+    substituted_result(inf, function, &arguments, &[], None, false).and_then(
+        inf,
+        move |inf, result| {
+            let result = result
+                .map(|(ty, _)| ty)
+                .or_else(|| reified_result_type(inf, function));
+            match result {
+                Some(ty) if ty == state => {}
+                // An element type still being decided (a callback reading a
+                // record parameter, a branch) is checked again at emission.
+                Some(Type::Array { shape, elem })
+                    if Some(&shape) == state_shape(&state)
+                        && matches!(
+                            *elem,
+                            Type::Scalar(ScalarType::Integer)
+                                | Type::Deferred
+                                | Type::Any
+                                | Type::Var(_)
+                        ) => {}
+                None | Some(Type::Deferred | Type::Any | Type::Var(_)) => {}
+                Some(other) => {
+                    let got = crate::boundary::show(inf, &other);
+                    let want = crate::boundary::show(inf, &state);
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        y0_node,
+                        format!(
+                            "`odesolve` needs `f` to return dy/dt with the type of `y0` \
+                             ({want}), got {got}"
+                        ),
+                    ));
+                    return Ready(Type::Failed("odesolve: f result type".into()));
+                }
+            }
+            Ready(Type::Array {
+                shape: Box::new([len]),
+                elem: Box::new(state),
+            })
+        },
+    )
+}
+
+fn state_shape(ty: &Type) -> Option<&Box<[Dim]>> {
+    match ty {
+        Type::Array { shape, .. } => Some(shape),
+        _ => None,
+    }
 }
 
 fn scan_state_type(
