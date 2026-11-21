@@ -216,7 +216,9 @@ impl LoadedModule {
                     phase: module
                         .phase_of(b.rhs)
                         .map(|p| format!("{p:?}").to_lowercase()),
-                    domain: module.valueset_of(b.rhs).map(|s| Domain::of(module, s)),
+                    domain: module
+                        .valueset_of(b.rhs)
+                        .map(|s| inspect::typed_domain(module, s, ty)),
                     shape: ty.and_then(inspect::shape),
                     size: ty.and_then(inspect::size),
                     span,

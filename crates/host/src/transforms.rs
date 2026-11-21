@@ -113,11 +113,12 @@ pub(crate) fn nest(domain: &Domain, ty: &Type, module: &Module) -> Result<Domain
             shape: shape.clone(),
         }),
         (Type::Record(types), _) => {
-            let Some(fields) = record_fields(domain) else {
+            let Some(original) = record_fields(domain) else {
                 return Ok(domain.clone());
             };
-            let fields = fields
-                .into_iter()
+            let fields = original
+                .iter()
+                .cloned()
                 .map(|field| {
                     let ty = types
                         .iter()
@@ -131,6 +132,11 @@ pub(crate) fn nest(domain: &Domain, ty: &Type, module: &Module) -> Result<Domain
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            // Keep the written form (a product of record sets stays one) unless
+            // a field's nesting changed.
+            if fields == original {
+                return Ok(domain.clone());
+            }
             Ok(Domain::Record { fields })
         }
         _ => Ok(domain.clone()),
