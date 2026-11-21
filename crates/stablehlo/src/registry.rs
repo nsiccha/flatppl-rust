@@ -191,7 +191,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: lognormal_logpdf,
             sample: Some(lognormal_sample),
-            touniform: None,
+            touniform: Some(lognormal_cdf),
             broadcast: Broadcast::Elementwise,
         },
     ),
@@ -1982,6 +1982,24 @@ fn chi_squared_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 /// calling [`Emitter::log`] on `v` a second time (each call emits a fresh
 /// `stablehlo.log` op; unlike [`Emitter::lower_node`], these op helpers do
 /// not memoize by FlatPDL `NodeId`).
+/// §08 LogNormal's CDF: `Φ((log x - mu) / sigma)` on its support `posreals`
+/// and 0 at or below zero. The logarithm reads a safe 1 off the support, so
+/// neither the value nor its derivative picks up the NaN of `log(x <= 0)`.
+fn lognormal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let sigma = p.get(e, "sigma")?;
+    let zero = e.scalar(0.0);
+    let positive = e.compare("GT", x, &zero);
+    let one = e.constant_like(1.0, x);
+    let safe = e.select(&positive, x, &one);
+    let log_x = e.log(&safe);
+    let diff = e.sub(&log_x, &mu);
+    let z = e.div(&diff, &sigma);
+    let cdf = e.invprobit(&z);
+    let below = e.constant_like(0.0, &cdf);
+    Ok(e.select(&positive, &cdf, &below))
+}
+
 fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
