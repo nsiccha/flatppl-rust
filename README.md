@@ -68,6 +68,13 @@ Positive-count `Poisson` and `NegativeBinomial` laws expressed as
 including live parameter gradients. Sampling these truncated laws is not yet
 implemented and is explicitly refused.
 
+StableHLO scores `Bernoulli` and `Binomial` densities whose probability is
+`invlogit(z)`, including the dotted `Bernoulli.(invlogit.(eta))` form, on the
+logit scale: `log p = -softplus(-z)` and `log(1 - p) = -softplus(z)`, as Stan's
+`bernoulli_logit` and `binomial_logit`. Values and gradients stay finite at
+every finite logit; scoring the rounded `p` gave `-inf` with a NaN gradient
+from `z` ≈ 17 in f32 and ≈ 37 in f64.
+
 StableHLO emission restricts lowering to avoid known Enzyme limitations by
 default. This mode preserves zero-factor product derivatives and avoids known
 selection-adjoint failures. It retains source tensor operations but skips

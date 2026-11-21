@@ -30,7 +30,45 @@ fn repeated_predictors_prepare_without_runtime_observations()
             prepared.preparation.compile(&options)?;
             let score = prepared.score.compile(&options)?;
             assert!(!score.inputs.iter().any(|field| field.name == "y"));
+            // Each group scores its `invlogit` probability on the logit scale.
+            if link == "invlogit" {
+                assert!(
+                    !score.stablehlo.contains("stablehlo.log "),
+                    "{}",
+                    score.stablehlo
+                );
+            }
         }
+    }
+    Ok(())
+}
+
+/// A grouped Binomial with an `invlogit` probability scores each group on the
+/// logit scale, as the per-row density does: the log of a rounded probability
+/// was `-inf` from a logit of about 37 in f64.
+#[test]
+fn grouped_logit_binomial_scores_the_logit() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "a=elementof(reals)\nb=elementof(reals)\nx=[-1.0,-1.0,0.0,0.0,1.0,1.0]\nn=[5,5,5,5,5,5]\n\
+         y=external(cartpow(nonnegintegers,6))\ninputs=(a,b,y)\n\
+         outputs=logdensityof(Binomial.(n, invlogit.(a .+ b .* x)),y)",
+        None,
+        None,
+    )?;
+    let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+    assert!(!prepared.summaries.is_empty());
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let options = EmitOptions {
+            dtype,
+            ..Default::default()
+        };
+        let score = prepared.score.compile(&options)?;
+        assert!(
+            !score.stablehlo.contains("stablehlo.log "),
+            "{}",
+            score.stablehlo
+        );
     }
     Ok(())
 }

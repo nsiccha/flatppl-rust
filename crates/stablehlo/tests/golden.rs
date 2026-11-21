@@ -349,14 +349,16 @@ outputs = (score)\n";
 
 // `invlogit(x)` (§07 logistic sigmoid, e.g. a logit-link GLM's inverse link)
 // lowers to the native, numerically-stable `stablehlo.logistic` op. Verified
-// out-of-tree to IREE-execute == scipy `expit` oracle (Δ≈2e-8).
+// out-of-tree to IREE-execute == scipy `expit` oracle (Δ≈2e-8). The value is
+// a Normal mean here: a Bernoulli or Binomial probability `invlogit(x)` is
+// scored on the logit scale instead (tests/logit_link_densities.rs).
 #[test]
 fn invlogit_lowers_to_stablehlo_logistic() {
     let src = "flatppl_compat = \"0.1\"\n\
 a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
-p = invlogit(a)\n\
-y = draw(Bernoulli(p))\n\
-L = likelihoodof(kernelof(record(y = y), a = a), record(y = 1))\n\
+m = invlogit(a)\n\
+y = draw(Normal(mu = m, sigma = 1.0))\n\
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = 0.3))\n\
 post = bayesupdate(L, lawof(record(a = a)))\n\
 score = logdensityof(post, record(a = 0.7))\n\
 outputs = (score)\n";

@@ -2419,10 +2419,19 @@ pub(crate) fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
 // [`categorical_logpdf`]'s doc comment.
 
 /// Select the observed probability before taking its log, including p=0 and p=1.
+/// A probability spelled `invlogit(z)` is scored on the logit scale instead
+/// (see [`Emitter::invlogit_operand`]), as `bernoulli_logit` in Stan.
 fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
     let one = e.scalar(1.0);
     let zero = e.scalar(0.0);
+    if let Some(logit) = e.invlogit_operand(&prob) {
+        let success = e.compare("EQ", v, &one);
+        let failure = e.compare("EQ", v, &zero);
+        let supported = e.or(&success, &failure);
+        let score = bernoulli_logit_score(e, &success, &logit);
+        return Ok(outside_count_support(e, &supported, &score));
+    }
     let one_minus_p = e.sub(&one, &prob);
     let success = e.compare("EQ", v, &one);
     let failure = e.compare("EQ", v, &zero);
@@ -2433,6 +2442,30 @@ fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     let inf = e.inf_like(&score);
     let outside = e.neg(&inf);
     Ok(e.select(&supported, &score, &outside))
+}
+
+/// `log p` at a success and `log(1 - p)` at a failure for `p = invlogit(z)`:
+/// `-softplus(-z)` and `-softplus(z)`, finite with a finite derivative at every
+/// finite logit. Shared with §09 `BernoulliLogitGLM`.
+fn bernoulli_logit_score(e: &mut Emitter, success: &Value, z: &Value) -> Value {
+    let negative = e.neg(z);
+    let signed = e.select(success, &negative, z);
+    let penalty = e.softplus(&signed);
+    e.neg(&penalty)
+}
+
+/// `-count * softplus(signed)` for `p = invlogit(z)`: `signed = -z` gives
+/// `count * log p`, and `signed = z` gives `count * log(1 - p)`. A zero count
+/// contributes exactly zero, even at an infinite logit: its softplus argument
+/// is replaced by 0 first, so neither the value nor the derivative sees
+/// `0 * inf`.
+fn binomial_logit_term(e: &mut Emitter, count: &Value, signed: &Value) -> Value {
+    let zero = e.scalar(0.0);
+    let empty = e.compare("EQ", count, &zero);
+    let safe = e.select(&empty, &zero, signed);
+    let penalty = e.softplus(&safe);
+    let scaled = e.mul(count, &penalty);
+    e.neg(&scaled)
 }
 
 /// §08 Poisson uses the same expression as §09 ContinuedPoisson on its
@@ -2500,15 +2533,23 @@ fn outside_count_support(e: &mut Emitter, supported: &Value, score: &Value) -> V
 /// `(n-k) * log(1-p)` term — the spec's `n - k` appears in both positions
 /// verbatim, same reuse discipline as [`lognormal_logpdf`]'s shared `log(x)`.
 /// Its `@sample` builder is [`binomial_sample`] (Task 16) — the exact sum of
-/// `n` Bernoulli indicators.
+/// `n` Bernoulli indicators. A probability spelled `invlogit(z)` is scored on
+/// the logit scale (see [`binomial_logit_term`]), as `binomial_logit` in Stan.
 fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = p.get(e, "n")?;
     let prob = p.get(e, "p")?;
+    let logit = e.invlogit_operand(&prob);
     let fixed_log_choose = e.fold_log_choose(&n, v);
     let zero = e.scalar(0.0);
     let (supported, v) = count_support(e, v, Some(&n));
-    let half = e.scalar(0.5);
-    let prob = e.select(&supported, &prob, &half);
+    // Out-of-support lanes score an in-range stand-in and are masked below.
+    let (prob, logit) = match logit {
+        Some(logit) => (prob, Some(e.select(&supported, &logit, &zero))),
+        None => {
+            let half = e.scalar(0.5);
+            (e.select(&supported, &prob, &half), None)
+        }
+    };
     let one = e.scalar(1.0);
 
     let n_minus_k = e.sub(&n, &v);
@@ -2522,19 +2563,25 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
         e.sub(&neg_log1p_n, &log_beta)
     });
 
-    // A zero exponent contributes log(1), even when its probability is zero.
-    // Guard before log so its unused singular derivative cannot poison AD.
-    let no_successes = e.compare("EQ", &v, &zero);
-    let safe_prob = e.select(&no_successes, &one, &prob);
-    let log_p = e.log(&safe_prob);
-    let k_log_p = e.mul(&v, &log_p);
+    let (k_log_p, n_minus_k_log_one_minus_p) = if let Some(logit) = logit {
+        let negative = e.neg(&logit);
+        let k_log_p = binomial_logit_term(e, &v, &negative);
+        (k_log_p, binomial_logit_term(e, &n_minus_k, &logit))
+    } else {
+        // A zero exponent contributes log(1), even when its probability is zero.
+        // Guard before log so its unused singular derivative cannot poison AD.
+        let no_successes = e.compare("EQ", &v, &zero);
+        let safe_prob = e.select(&no_successes, &one, &prob);
+        let log_p = e.log(&safe_prob);
+        let k_log_p = e.mul(&v, &log_p);
 
-    // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
-    let no_failures = e.compare("EQ", &n_minus_k, &zero);
-    let safe_prob_complement = e.select(&no_failures, &zero, &prob);
-    let neg_prob = e.neg(&safe_prob_complement);
-    let log_one_minus_p = e.log1p(&neg_prob);
-    let n_minus_k_log_one_minus_p = e.mul(&n_minus_k, &log_one_minus_p);
+        // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
+        let no_failures = e.compare("EQ", &n_minus_k, &zero);
+        let safe_prob_complement = e.select(&no_failures, &zero, &prob);
+        let neg_prob = e.neg(&safe_prob_complement);
+        let log_one_minus_p = e.log1p(&neg_prob);
+        (k_log_p, e.mul(&n_minus_k, &log_one_minus_p))
+    };
 
     let t2 = e.add(&log_choose_nk, &k_log_p);
     let score = e.add(&t2, &n_minus_k_log_one_minus_p);
