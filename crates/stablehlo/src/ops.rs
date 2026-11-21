@@ -56,7 +56,7 @@
 use flatppl_core::{CallHead, Dim, Node, NodeId, Scalar, Symbol, Type};
 
 use crate::emitter::{Axes, Emitter, IntegralKind, elem_rank};
-use crate::mlir::{ElemKind, MlirTy, Value};
+use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 
 /// Lower one FlatPDL builtin call to a [`Value`]. `id` is the call (or
@@ -3299,9 +3299,12 @@ fn lower_membership(
     // §03: a record lies in `cartprod(name = S, …)` when each field lies in the set
     // of the same name, so the record needs no tensor form.
     if let Some(sets) = record_set_fields(e, set_id) {
-        let fields = record_fields(e, v_id).ok_or_else(|| {
-            EmitError::at(id, "'in' over a record set needs a written record point")
-        })?;
+        let Some(fields) = record_fields(e, v_id) else {
+            // A record-valued point that is not written out (a record input,
+            // a field of one, a bound record) is tested on its lowered fields.
+            let point = e.lower_value(v_id)?;
+            return record_value_membership(e, id, point, &sets);
+        };
         if fields.len() != sets.len() {
             return Err(EmitError::at(
                 id,
@@ -3328,7 +3331,64 @@ fn lower_membership(
     }
 
     let v = e.lower_node(v_id)?;
+    tensor_membership(e, id, v, set_id)
+}
 
+/// `in` for a lowered record point against the fields of a record set, field
+/// by field and recursively through nested record sets (§03).
+fn record_value_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    point: Lowered,
+    sets: &[(Symbol, NodeId)],
+) -> Result<Value, EmitError> {
+    let Lowered::Record(parts) = point else {
+        return Err(EmitError::at(
+            id,
+            "'in' over a record set needs a record-valued point",
+        ));
+    };
+    if parts.len() != sets.len() {
+        return Err(EmitError::at(
+            id,
+            "'in' over a record set: the point and the set have different fields",
+        ));
+    }
+    let mut members = Vec::with_capacity(sets.len());
+    for &(name, set) in sets {
+        let field = e.resolve(name).to_owned();
+        let Some((_, part)) = parts.iter().find(|(n, _)| *n == field) else {
+            return Err(EmitError::at(
+                id,
+                format!("'in' over a record set: the point has no field `{field}`"),
+            ));
+        };
+        let set = e.resolve_ref_one(set);
+        let member = match (record_set_fields(e, set), part) {
+            (Some(inner), part) => record_value_membership(e, id, part.clone(), &inner)?,
+            (None, Lowered::Tensor(value)) => tensor_membership(e, id, value.clone(), set)?,
+            (None, Lowered::Record(_)) => {
+                return Err(EmitError::at(
+                    id,
+                    format!("'in' over a record set: field `{field}` is a record, its set is not"),
+                ));
+            }
+        };
+        members.push(member);
+    }
+    members
+        .into_iter()
+        .reduce(|a, b| e.and(&a, &b))
+        .ok_or_else(|| EmitError::at(id, "'in' over an empty record set is unsupported"))
+}
+
+/// `in` for a tensor point against a non-record set.
+fn tensor_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v: Value,
+    set_id: NodeId,
+) -> Result<Value, EmitError> {
     if let Node::Call(c) = e.node(set_id)
         && matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "cartprod")
         && c.named.is_empty()
