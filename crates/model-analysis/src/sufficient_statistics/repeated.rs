@@ -20,9 +20,19 @@ enum Plan {
 }
 
 struct Column {
-    values: Vec<NodeId>,
+    /// The literal cells: element nodes, or a packed vector's buffer.
+    values: Result<Vec<NodeId>, flatppl_core::Packed>,
     keys: Vec<Atom>,
     real: bool,
+}
+
+fn packed_atom(value: Scalar) -> Option<Atom> {
+    match value {
+        Scalar::Int(value) => Some(Atom::Integer(value)),
+        Scalar::Real(value) if value.is_finite() => Some(Atom::Real(value.to_bits())),
+        Scalar::Bool(value) => Some(Atom::Boolean(value)),
+        _ => None,
+    }
 }
 
 fn atom(m: &Module, r: &Reducer, id: NodeId, depth: usize) -> Option<Atom> {
@@ -92,6 +102,21 @@ impl Predictor {
             .filter(|&id| matches!(m.type_of(id), Some(Type::Scalar(_))))
         {
             Plan::Scalar(scalar)
+        } else if let Node::Packed(p) = m.node(id) {
+            let Type::Array { shape, elem } = m.type_of(id)? else {
+                return None;
+            };
+            if shape.as_ref() != [Dim::Static(count)] || p.len() != count as usize {
+                return None;
+            }
+            let keys = p.iter().map(packed_atom).collect::<Option<Vec<_>>>()?;
+            let column = self.columns.len();
+            self.columns.push(Column {
+                values: Err(p.clone()),
+                keys,
+                real: **elem == Type::Scalar(ScalarType::Real),
+            });
+            Plan::Column(column)
         } else if let Some(c) = call(m, id, "vector") {
             let Type::Array { shape, elem } = m.type_of(id)? else {
                 return None;
@@ -106,7 +131,7 @@ impl Predictor {
                 .collect::<Option<Vec<_>>>()?;
             let column = self.columns.len();
             self.columns.push(Column {
-                values: c.args.to_vec(),
+                values: Ok(c.args.to_vec()),
                 keys,
                 real: **elem == Type::Scalar(ScalarType::Real),
             });
@@ -163,11 +188,25 @@ impl Predictor {
             Plan::Scalar(id) => *id,
             Plan::Column(column) => {
                 let column = &self.columns[*column];
-                let values = rows.iter().map(|&i| match column.keys[i] {
-                    Atom::Integer(value) if column.real => Expr::Number(value as f64),
-                    _ => Expr::Node(column.values[i]),
-                });
-                materialize(m, op("vector", values))
+                match &column.values {
+                    Ok(nodes) => {
+                        let values = rows.iter().map(|&i| match column.keys[i] {
+                            Atom::Integer(value) if column.real => Expr::Number(value as f64),
+                            _ => Expr::Node(nodes[i]),
+                        });
+                        materialize(m, op("vector", values))
+                    }
+                    Err(packed) => {
+                        let values = rows
+                            .iter()
+                            .map(|&i| match packed.get(i).expect("row within the column") {
+                                Scalar::Int(value) if column.real => Scalar::Real(value as f64),
+                                value => value,
+                            })
+                            .collect::<Vec<_>>();
+                        m.alloc_literals(&values).expect("a row is selected")
+                    }
+                }
             }
             Plan::Apply(name, args) => {
                 let args = args

@@ -280,6 +280,12 @@ impl Module {
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id]
     }
+
+    /// Replace a node in place with an equal-valued spelling: references,
+    /// spans and annotations keep pointing at it.
+    pub(crate) fn respell_node(&mut self, id: NodeId, node: Node) {
+        *self.nodes.get_mut(id) = node;
+    }
     pub fn binding(&self, id: BindingId) -> &Binding {
         &self.bindings[id]
     }

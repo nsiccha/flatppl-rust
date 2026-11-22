@@ -19,6 +19,7 @@ pub mod graph;
 pub mod id;
 mod module;
 pub mod node;
+mod packed;
 pub mod query;
 pub mod text;
 pub mod ty;
@@ -30,6 +31,7 @@ pub use module::{Binding, Doc, Markup, Module, Span};
 pub use node::{
     Axis, Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar, Variance,
 };
+pub use packed::{Literals, Packed};
 pub use ty::{Dim, Mass, Phase, ScalarType, Type, ValueSet};
 
 /// The FlatPPL language version this toolchain targets — the string stamped into

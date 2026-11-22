@@ -70,7 +70,7 @@ fn packed_arrays_round_trip_and_bind_externals() -> Result<(), Box<dyn std::erro
         bound.constant("x")?,
         Constant::Array {
             shape: vec![2, 2],
-            data: [1.0, 2.0, 3.0, 4.0].map(Constant::Real).to_vec()
+            data: [1.0, 2.0, 3.0, 4.0].map(Constant::Real).to_vec().into()
         }
     );
     // A marker or a reference is not a value to bind.

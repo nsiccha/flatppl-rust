@@ -445,6 +445,7 @@ fn copy(
 ) -> Result<NodeId> {
     let node = match source.node(id) {
         Node::Lit(value) => Node::Lit(value.clone()),
+        Node::Packed(values) => Node::Packed(values.clone()),
         Node::Const(name) if bindings.contains(&source.resolve(*name)) => {
             return Ok(b.self_ref(source.resolve(*name)));
         }

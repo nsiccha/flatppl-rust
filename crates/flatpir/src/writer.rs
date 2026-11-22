@@ -160,6 +160,22 @@ fn render_node(module: &Module, id: NodeId) -> String {
             },
             RenderStep::Node(id) => match module.node(id) {
                 Node::Lit(lit) => out.push_str(&render_scalar(lit)),
+                // The same `vector` call of literals; elements carry no `%meta`.
+                Node::Packed(p) => {
+                    let meta = render_meta(module, id);
+                    if let Some(triple) = &meta {
+                        out.push_str(&format!("(%meta {triple} "));
+                    }
+                    out.push_str("(vector");
+                    for value in p.iter() {
+                        out.push(' ');
+                        out.push_str(&render_scalar(&value));
+                    }
+                    out.push(')');
+                    if meta.is_some() {
+                        out.push(')');
+                    }
+                }
                 Node::Const(sym) => out.push_str(module.resolve(*sym)),
                 Node::Hole => out.push('_'),
                 Node::Ref(r) => out.push_str(&render_ref(module, r)),

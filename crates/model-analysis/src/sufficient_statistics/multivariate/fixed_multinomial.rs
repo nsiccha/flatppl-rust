@@ -2,6 +2,7 @@
 
 use super::super::histogram::fixed_scalar;
 use super::{Expr, Module, NodeId, Reducer, Scalar, call, num, op, resolve, vector};
+use flatppl_core::Node;
 
 pub(super) struct Summaries {
     center: Vec<i64>,
@@ -44,6 +45,22 @@ pub(super) fn summaries(
     if call(m, source, "vector").is_none() && call(m, source, "splitblocks").is_none() {
         return None;
     }
+    // A row or the cell vector may be packed; its entries read as their literals.
+    let counts = |id: NodeId| -> Option<Vec<i64>> {
+        let id = resolve(m, id, &reducer.boundary);
+        match m.node(id) {
+            Node::Packed(flatppl_core::Packed::Int(v)) => Some(v.to_vec()),
+            Node::Packed(_) => None,
+            _ => call(m, id, "vector")?
+                .args
+                .iter()
+                .map(|&cell| match fixed_scalar(m, cell, reducer)? {
+                    Scalar::Int(k) => Some(k),
+                    _ => None,
+                })
+                .collect(),
+        }
+    };
     let mut result = Summaries {
         center: vec![0; width],
         valid: 0,
@@ -53,17 +70,12 @@ pub(super) fn summaries(
     // The caller bounds trials to 63 and the total count to the target integer range.
     let mut frequency = vec![0i64; trials as usize + 1];
     let mut row = Vec::with_capacity(width);
-    let mut add = |cells: &[NodeId]| {
+    let mut add = |cells: &[i64]| {
         if cells.len() != width {
             return None;
         }
         row.clear();
-        for &id in cells {
-            let Scalar::Int(k) = fixed_scalar(m, id, reducer)? else {
-                return None;
-            };
-            row.push(k);
-        }
+        row.extend_from_slice(cells);
         if row.iter().all(|k| (0..=trials).contains(k)) && row.iter().sum::<i64>() == trials {
             if result.valid == 0 {
                 result.center.copy_from_slice(&row);
@@ -81,7 +93,7 @@ pub(super) fn summaries(
             return None;
         }
         for &item in &table.args {
-            add(&call(m, resolve(m, item, &reducer.boundary), "vector")?.args)?;
+            add(&counts(item)?)?;
         }
     } else {
         let [data, block] = *call(m, source, "splitblocks")?.args else {
@@ -90,7 +102,7 @@ pub(super) fn summaries(
         if fixed_scalar(m, block, reducer)? != Scalar::Int(width as i64) {
             return None;
         }
-        let cells = &call(m, resolve(m, data, &reducer.boundary), "vector")?.args;
+        let cells = counts(data)?;
         if cells.len() != rows.checked_mul(width)? {
             return None;
         }

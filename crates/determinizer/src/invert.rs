@@ -620,6 +620,11 @@ fn has_static_zero(m: &Module, a: NodeId) -> bool {
         };
         node = m.binding(b).rhs;
     }
+    if let Node::Packed(p) = m.node(node) {
+        return p
+            .iter()
+            .any(|e| matches!(e, Scalar::Real(x) if x == 0.0) || e == Scalar::Int(0));
+    }
     match expect_builtin_call(m, node, "vector") {
         Some(c) => c.args.iter().any(|&e| static_real(m, e) == Some(0.0)),
         None => static_real(m, node) == Some(0.0),

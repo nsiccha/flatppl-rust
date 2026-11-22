@@ -258,7 +258,7 @@ impl Emitter<'_> {
                     return false;
                 }
                 Node::Hole | Node::Axis(_) => return false,
-                Node::Lit(_) | Node::Const(_) | Node::Ref(_) => {}
+                Node::Lit(_) | Node::Const(_) | Node::Ref(_) | Node::Packed(_) => {}
             }
         }
         true
@@ -339,8 +339,10 @@ impl Emitter<'_> {
 
     pub(crate) fn inf_like(&mut self, v: &Value) -> Value {
         let out = self.const_lit_like(pos_inf_literal(self.dtype), v);
-        self.constants
-            .insert(out.ssa.clone(), [Scalar::Real(f64::INFINITY)].into());
+        self.constants.insert(
+            out.ssa.clone(),
+            flatppl_core::Packed::Real([f64::INFINITY].into()),
+        );
         out
     }
 

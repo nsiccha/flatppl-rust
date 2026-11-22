@@ -54,6 +54,10 @@ fn written_sizes(e: &Emitter, id: NodeId, node: NodeId, head: &str) -> Result<Ve
         Node::Call(c) if matches!(c.head, CallHead::Builtin(h) if e.resolve(h) == "vector") => {
             c.args.iter().map(|&a| one(a)).collect::<Option<Vec<_>>>()
         }
+        Node::Packed(flatppl_core::Packed::Int(v)) => v
+            .iter()
+            .map(|&k| (k > 0).then(|| u64::try_from(k).ok()).flatten())
+            .collect::<Option<Vec<_>>>(),
         _ => one(node).map(|k| vec![k]),
     };
     sizes.ok_or_else(|| {

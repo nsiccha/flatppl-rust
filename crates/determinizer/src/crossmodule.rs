@@ -339,6 +339,8 @@ fn graft_node(
 ) -> Result<NodeId, String> {
     let node = match src.node(id).clone() {
         Node::Lit(s) => Node::Lit(s),
+        // Shares the buffer.
+        Node::Packed(p) => Node::Packed(p),
         Node::Hole => Node::Hole,
         Node::Const(s) => Node::Const(host.intern(src.resolve(s))),
         Node::Axis(Axis { name, variance }) => Node::Axis(Axis {

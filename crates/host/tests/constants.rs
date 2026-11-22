@@ -9,7 +9,7 @@ fn simultaneous_sizes_and_nested_table_constants_keep_column_values()
     )?;
     let column = |x| Constant::Array {
         shape: vec![1],
-        data: vec![Constant::Integer(x)],
+        data: vec![Constant::Integer(x)].into(),
     };
     let bound = context.set(
         &module,
@@ -131,11 +131,11 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
             "cartpow(reals, 2)",
             Constant::Array {
                 shape: vec![2],
-                data: vec![Constant::Integer(1), Constant::Integer(2)],
+                data: vec![Constant::Integer(1), Constant::Integer(2)].into(),
             },
             Constant::Array {
                 shape: vec![3],
-                data: vec![Constant::Real(1.0); 3],
+                data: vec![Constant::Real(1.0); 3].into(),
             },
             "[1.0, 2.0]",
         ),
@@ -143,11 +143,11 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
             "cartprod(reals, posintegers)",
             Constant::Array {
                 shape: vec![2],
-                data: vec![Constant::Real(0.5), Constant::Integer(2)],
+                data: vec![Constant::Real(0.5), Constant::Integer(2)].into(),
             },
             Constant::Array {
                 shape: vec![2],
-                data: vec![Constant::Real(0.5), Constant::Real(2.5)],
+                data: vec![Constant::Real(0.5), Constant::Real(2.5)].into(),
             },
             "[0.5, 2.0]",
         ),
@@ -159,7 +159,8 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
                     Constant::Real(0.5),
                     Constant::Integer(1),
                     Constant::Real(2.5),
-                ],
+                ]
+                .into(),
             },
             // Strictly increasing: a tie is outside the set.
             Constant::Array {
@@ -168,7 +169,8 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
                     Constant::Real(0.0),
                     Constant::Real(0.0),
                     Constant::Real(1.0),
-                ],
+                ]
+                .into(),
             },
             "[0.5, 1.0, 2.5]",
         ),
@@ -285,7 +287,7 @@ fn packed_f32_constants_use_their_source_precision() -> Result<(), Box<dyn std::
     let bound = context.set(&module, &[("x".into(), single)])?;
     let double = Constant::Array {
         shape: vec![3],
-        data: values.map(Constant::Real).to_vec(),
+        data: values.map(Constant::Real).to_vec().into(),
     };
     assert_eq!(bound.constant("x")?, double);
     assert!(context.set(&module, &[("x".into(), double)]).is_err());
@@ -302,7 +304,7 @@ fn fixed_vector_equalities_handle_finite_overflow() -> Result<(), Box<dyn std::e
     let module = context.parse("x = external(zerosum(4))", None, None)?;
     let vector = |values: [f64; 4]| Constant::Array {
         shape: vec![4],
-        data: values.map(Constant::Real).to_vec(),
+        data: values.map(Constant::Real).to_vec().into(),
     };
     let valid = vector([f64::MAX, f64::MAX, -f64::MAX, -f64::MAX]);
     let bound = context.set(&module, &[("x".into(), valid.clone())])?;
@@ -335,7 +337,7 @@ fn an_empty_array_is_refused_with_the_source_rule() -> Result<(), Box<dyn std::e
     )?;
     let empty = Constant::Array {
         shape: vec![0],
-        data: vec![],
+        data: vec![].into(),
     };
     let Err(error) = context.set(&module, &[("data".into(), empty)]) else {
         panic!("an empty array was bound");

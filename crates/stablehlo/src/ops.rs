@@ -2968,6 +2968,32 @@ fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     Ok(e.vector(&elems))
 }
 
+/// A packed literal vector lowers exactly as its `vector` call of literals:
+/// one dense constant, or element by element when an entry has no constant
+/// form at the node's kind.
+pub(crate) fn lower_packed(
+    e: &mut Emitter,
+    id: NodeId,
+    packed: &flatppl_core::Packed,
+) -> Result<Value, EmitError> {
+    if packed.is_empty() {
+        return Err(EmitError::at(id, "vector: expected at least one element"));
+    }
+    let target = e.node_kind(id);
+    if let Some(value) = e.packed_vector(packed, target) {
+        return Ok(value);
+    }
+    let elems: Vec<Value> = packed
+        .iter()
+        .map(|value| e.lower_literal(id, &value))
+        .collect::<Result<_, _>>()?;
+    let elems: Vec<Value> = elems.iter().map(|v| e.convert(v, target)).collect();
+    if let Some(value) = e.contiguous_rows(&elems) {
+        return Ok(value);
+    }
+    Ok(e.vector(&elems))
+}
+
 // ---- get / get0 ---------------------------------------------------------------
 
 fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {

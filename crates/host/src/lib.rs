@@ -25,7 +25,7 @@ pub use compiler::{
     BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position,
     PreparedLikelihood,
 };
-pub use constants::Constant;
+pub use constants::{ArrayData, Constant};
 pub use data::{DataError, load_fixed_data, resolve_data_sources};
 pub use export::{Export, Field, RuntimeStatus, Schema};
 pub use flatppl_determinizer::PreparationOptions;

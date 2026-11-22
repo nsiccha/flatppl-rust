@@ -212,6 +212,20 @@ pub enum ValueSet {
 }
 
 impl ValueSet {
+    /// The value set inference gives a literal: an integer's sign class, a
+    /// real's singleton interval, `booleans`; a string is unconstrained.
+    pub fn of_literal(s: &crate::Scalar) -> Self {
+        use crate::Scalar;
+        match s {
+            Scalar::Int(n) if *n > 0 => ValueSet::PosIntegers,
+            Scalar::Int(n) if *n == 0 => ValueSet::NonNegIntegers,
+            Scalar::Int(_) => ValueSet::Integers,
+            Scalar::Real(r) => ValueSet::Interval(*r, *r),
+            Scalar::Bool(_) => ValueSet::Booleans,
+            Scalar::Str(_) => ValueSet::Unknown,
+        }
+    }
+
     /// The **natural extent** of a type: the maximal set its values inhabit
     /// (`(%scalar real)` → `reals`, a 1-D real array → `cartpow(reals, n)`,
     /// a measure → its domain's extent). `Unknown` for non-value types

@@ -43,6 +43,33 @@ pub(crate) fn literal_type(s: &Scalar) -> Type {
     }
 }
 
+/// A packed vector has the type of its `vector` call of literals.
+pub(crate) fn packed_type(p: &flatppl_core::Packed) -> Type {
+    Type::Array {
+        shape: Box::new([Dim::Static(p.len() as u32)]),
+        elem: Box::new(Type::Scalar(p.scalar_type())),
+    }
+}
+
+/// The value set `vector` gives its literal elements (`join_scalar_sets` over
+/// each element's `literal_valueset`), computed from the buffer directly.
+pub(crate) fn packed_valueset(p: &flatppl_core::Packed) -> ValueSet {
+    use flatppl_core::Packed;
+    let elem = match p {
+        Packed::Int(v) if v.iter().all(|&n| n > 0) => ValueSet::PosIntegers,
+        Packed::Int(v) if v.iter().all(|&n| n >= 0) => ValueSet::NonNegIntegers,
+        Packed::Int(_) => ValueSet::Integers,
+        Packed::Bool(_) => ValueSet::Booleans,
+        // NaN compares unequal and outside every bound, so it widens to `reals`.
+        Packed::Real(v) if v.iter().all(|&x| x == v[0]) => ValueSet::Interval(v[0], v[0]),
+        Packed::Real(v) if v.iter().all(|&x| (0.0..=1.0).contains(&x)) => ValueSet::UnitInterval,
+        Packed::Real(v) if v.iter().all(|&x| x > 0.0) => ValueSet::PosReals,
+        Packed::Real(v) if v.iter().all(|&x| x >= 0.0) => ValueSet::NonNegReals,
+        Packed::Real(_) => ValueSet::Reals,
+    };
+    ValueSet::CartPow(Box::new(elem), Dim::Static(p.len() as u32))
+}
+
 /// Built-in constants in value position. Sets and ops-as-values have no
 /// first-class `Type` (they are resolved structurally where consumed:
 /// `elementof` reads its set argument's *node*, `broadcast` its head).
@@ -4416,6 +4443,7 @@ fn disintegrate_type(inf: &mut Inferencer<'_, '_>, call: &Call, args: &[ArgInfo]
                 let selector = resolve_binding_refs(inf, call.args[0]);
                 let selected = match inf.module.node(selector) {
                     Node::Lit(Scalar::Int(_)) => Some(1),
+                    Node::Packed(p @ flatppl_core::Packed::Int(_)) => Some(p.len()),
                     Node::Call(c)
                         if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
                             && c.args.iter().all(|n| {
@@ -4853,7 +4881,7 @@ fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
         },
         // Literals and named constants are fixed; anything else (holes,
         // cross-module refs) is conservatively non-stochastic.
-        Node::Lit(_) | Node::Const(_) => Phase::Fixed,
+        Node::Lit(_) | Node::Const(_) | Node::Packed(_) => Phase::Fixed,
         _ => Phase::Parametric,
     }
 }
@@ -5185,11 +5213,15 @@ fn ksuperpose_type(
         (None, None) => true,
         _ => false,
     };
-    fn literal_cells(inf: &Inferencer<'_, '_>, node: NodeId, out: &mut Vec<NodeId>) -> bool {
+    fn literal_cells(inf: &Inferencer<'_, '_>, node: NodeId, out: &mut Vec<Scalar>) -> bool {
         let node = resolve_binding_refs(inf, node);
         match inf.module.node(node) {
-            Node::Lit(_) => {
-                out.push(node);
+            Node::Lit(s) => {
+                out.push(s.clone());
+                true
+            }
+            Node::Packed(p) => {
+                out.extend(p.iter());
                 true
             }
             Node::Call(call) if matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector") => {
@@ -5205,7 +5237,7 @@ fn ksuperpose_type(
     }
     let mut literals = Vec::new();
     let literal_unit =
-        literal_cells(inf, *weights, &mut literals) && literal_weights_sum_to_one(inf, &literals);
+        literal_cells(inf, *weights, &mut literals) && literal_weights_sum_to_one(&literals);
     let mass = ksuperpose_mass(
         ksuperpose_component_mass(inf, args[0].0, &args[0].1),
         weights_ty,
@@ -8136,16 +8168,24 @@ fn written_size_check(
     }
     // A written size vector contributes one axis per element; a scalar size is
     // the single axis. Either way the elements are read as written.
-    let axes: Vec<NodeId> = match inf.module.node(size_node).clone() {
+    // A packed element has no node of its own, so the vector carries its blame.
+    let axes: Vec<(NodeId, Option<i64>)> = match inf.module.node(size_node).clone() {
         Node::Call(c) if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector") => {
-            c.args.to_vec()
+            c.args.iter().map(|&a| (a, written_int(inf, a))).collect()
         }
-        _ => vec![size_node],
+        Node::Packed(p) => p
+            .iter()
+            .map(|s| match s {
+                Scalar::Int(n) => (size_node, Some(n)),
+                _ => (size_node, None),
+            })
+            .collect(),
+        _ => vec![(size_node, written_int(inf, size_node))],
     };
     let multi = axes.len() > 1;
     let mut refused = false;
-    for (i, axis) in axes.iter().enumerate() {
-        let Some(n) = written_int(inf, *axis) else {
+    for (i, (axis, n)) in axes.iter().enumerate() {
+        let Some(n) = *n else {
             continue;
         };
         if n > 0 {
@@ -8246,6 +8286,19 @@ fn non_increasing_written_edges(
         Node::Ref(r) if r.ns == RefNs::SelfMod => {
             let binding = inf.module.binding_by_name(r.name)?;
             non_increasing_written_edges(inf, inf.module.binding(binding).rhs, hops + 1)
+        }
+        Node::Packed(p) => {
+            let values = p.iter().map(|s| match s {
+                Scalar::Real(x) => Some(x),
+                Scalar::Int(n) => Some(n as f64),
+                Scalar::Bool(b) => Some(f64::from(b)),
+                Scalar::Str(_) => None,
+            });
+            let values: Vec<Option<f64>> = values.collect();
+            values
+                .windows(2)
+                .any(|pair| matches!(pair, [Some(lo), Some(hi)] if hi <= lo))
+                .then_some(node)
         }
         Node::Call(c) => {
             let CallHead::Builtin(op) = c.head else {
@@ -8474,6 +8527,7 @@ fn written_vector_is_string(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<bo
                 let binding = inf.module.binding_by_name(r.name)?;
                 node = inf.module.binding(binding).rhs;
             }
+            Node::Packed(_) => return Some(false),
             Node::Call(call) if matches!(call.head, CallHead::Builtin(head) if inf.module.resolve(head) == "vector") =>
             {
                 let mut kind = None;
@@ -9459,6 +9513,22 @@ fn refuse_bad_rng_seed(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo
         // A written byte vector is checked element by element; any other vector
         // is a run-time value this pass cannot read.
         let literal = resolve_binding_refs(inf, *node);
+        if let Node::Packed(p) = inf.module.node(literal)
+            && let Some(byte) = p.iter().find_map(|s| match s {
+                Scalar::Int(n) if !(0..=255).contains(&n) => Some(n),
+                _ => None,
+            })
+        {
+            inf.diags.push(crate::Diagnostic::error_at(
+                literal,
+                format!(
+                    "`rnginit` byte-vector seed has element {byte}, outside 0..255: spec \
+                     §07 `rnginit` states that a byte-vector seed contains integers in \
+                     $\\{{0, \\ldots, 255\\}}$"
+                ),
+            ));
+            return Some(Type::Failed("rnginit: seed byte out of range".into()));
+        }
         if let Node::Call(call) = inf.module.node(literal)
             && matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
         {
@@ -10970,15 +11040,8 @@ fn param_dim(inf: &Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo], kw
 // =====================================================================
 
 pub(crate) fn literal_valueset(s: &Scalar) -> ValueSet {
-    match s {
-        Scalar::Int(n) if *n > 0 => ValueSet::PosIntegers,
-        Scalar::Int(n) if *n == 0 => ValueSet::NonNegIntegers,
-        Scalar::Int(_) => ValueSet::Integers,
-        // A real literal is its own singleton interval.
-        Scalar::Real(r) => ValueSet::Interval(*r, *r),
-        Scalar::Bool(_) => ValueSet::Booleans,
-        Scalar::Str(_) => ValueSet::Unknown,
-    }
+    // A real literal is its own singleton interval.
+    ValueSet::of_literal(s)
 }
 
 pub(crate) fn const_valueset(name: &str) -> ValueSet {
@@ -11706,7 +11769,14 @@ fn superpose_is_provably_normalized(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) 
         }
         weights.push(weight);
     }
-    literal_weights_sum_to_one(inf, &weights)
+    let literal = weights
+        .iter()
+        .map(|&w| match inf.module.node(w) {
+            Node::Lit(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    literal.is_some_and(|w| literal_weights_sum_to_one(&w))
         || complement_pair(inf, &weights)
         || simplex_weights_cover_vector(inf, &weights)
 }
@@ -11804,12 +11874,9 @@ pub(crate) fn resolve_binding_refs(inf: &Inferencer<'_, '_>, node: NodeId) -> No
 /// So the proof is exact rational arithmetic over what the model says, never
 /// over what a particular float width does with it — FlatPPL mandates no
 /// precision, and this verdict must not move with the engine's.
-fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> bool {
-    fn exact_sum_is_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> Option<bool> {
-        let parsed: Option<Vec<(i128, u32)>> = weights
-            .iter()
-            .map(|&w| decimal_literal(inf.module.node(w)))
-            .collect();
+fn literal_weights_sum_to_one(weights: &[Scalar]) -> bool {
+    fn exact_sum_is_one(weights: &[Scalar]) -> Option<bool> {
+        let parsed: Option<Vec<(i128, u32)>> = weights.iter().map(decimal_literal).collect();
         let parsed = parsed?;
         // A negative weight makes the component a signed measure, not a measure.
         if parsed.iter().any(|&(mantissa, _)| mantissa < 0) {
@@ -11824,7 +11891,7 @@ fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> b
         }
         Some(total == unit)
     }
-    exact_sum_is_one(inf, weights).unwrap_or(false)
+    exact_sum_is_one(weights).unwrap_or(false)
 }
 
 /// A built-in whose value is a property of the NODE rather than of the expression:
@@ -11881,10 +11948,10 @@ fn contains_opaque_value_source(inf: &Inferencer<'_, '_>, node: NodeId) -> bool 
 /// A numeric literal as its declared decimal value: `(mantissa, scale)` denotes
 /// `mantissa / 10^scale`. `None` for a non-literal, and for a magnitude whose
 /// digits would overflow the exact sum.
-fn decimal_literal(node: &Node) -> Option<(i128, u32)> {
-    match node {
-        Node::Lit(Scalar::Int(n)) => Some((*n as i128, 0)),
-        Node::Lit(Scalar::Real(r)) if r.is_finite() => {
+fn decimal_literal(value: &Scalar) -> Option<(i128, u32)> {
+    match value {
+        Scalar::Int(n) => Some((*n as i128, 0)),
+        Scalar::Real(r) if r.is_finite() => {
             // `{}` on an f64 is the shortest decimal that round-trips, i.e. what
             // the model wrote, and never exponent notation.
             let text = format!("{r}");

@@ -471,7 +471,8 @@ impl<'m> Emitter<'m> {
         // Finiteness predicates compare fixed values against infinity.
         // Arithmetic folds still reject non-finite results.
         if x.is_infinite() {
-            self.constants.insert(ssa.clone(), [Scalar::Real(x)].into());
+            self.constants
+                .insert(ssa.clone(), flatppl_core::Packed::Real([x].into()));
         }
         Value {
             ssa,
@@ -519,33 +520,62 @@ impl<'m> Emitter<'m> {
         if args.iter().any(|id| self.memo.contains_key(id)) {
             return None;
         }
-        let literals = args
+        let m: &Module = self.m;
+        let values = args
             .iter()
-            .map(|&id| match (self.m.node(id), elem) {
-                (Node::Lit(Scalar::Bool(b)), ElemKind::Bool) => Some(b.to_string()),
-                (Node::Lit(Scalar::Int(i)), ElemKind::Int) if self.int_fits(*i) => {
-                    Some(i.to_string())
-                }
-                (Node::Lit(Scalar::Real(x)), ElemKind::Real) if x.is_finite() => {
-                    Some(render_float_literal(*x))
-                }
+            .map(|&id| match m.node(id) {
+                Node::Lit(x) => Some(x),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        let ty = MlirTy::Ranked(vec![Some(args.len() as u64)]);
+        let packed = flatppl_core::Packed::from_scalars(values)?;
+        self.packed_vector(&packed, elem)
+    }
+
+    /// One dense constant for a packed literal vector, written straight from
+    /// its buffer and remembered without copying it. `None` when an element
+    /// has no constant form at `elem` (a kind mismatch, a non-finite real, an
+    /// integer outside the dtype): the element-wise path handles those.
+    pub(crate) fn packed_vector(
+        &mut self,
+        packed: &flatppl_core::Packed,
+        elem: ElemKind,
+    ) -> Option<Value> {
+        use flatppl_core::Packed;
+        use std::fmt::Write;
+        let representable = match (packed, elem) {
+            (Packed::Bool(_), ElemKind::Bool) => true,
+            (Packed::Int(v), ElemKind::Int) => v.iter().all(|&i| self.int_fits(i)),
+            (Packed::Real(v), ElemKind::Real) => v.iter().all(|x| x.is_finite()),
+            _ => false,
+        };
+        if !representable || packed.is_empty() {
+            return None;
+        }
+        let ty = MlirTy::Ranked(vec![Some(packed.len() as u64)]);
         let ty_text = ty.render(self.dtype, elem);
-        let ssa = self.pure(format!(
-            "stablehlo.constant dense<[{}]> : {ty_text}",
-            literals.join(", ")
-        ));
-        let data = args
-            .iter()
-            .map(|&id| match self.m.node(id) {
-                Node::Lit(x) => x.clone(),
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-        self.remember_constant(&ssa, data);
+        let mut text = String::with_capacity(packed.len() * 4 + ty_text.len() + 32);
+        text.push_str("stablehlo.constant dense<[");
+        for i in 0..packed.len() {
+            if i != 0 {
+                text.push_str(", ");
+            }
+            match packed {
+                Packed::Bool(v) => text.push_str(if v[i] { "true" } else { "false" }),
+                Packed::Int(v) => write!(text, "{}", v[i]).expect("write to String"),
+                Packed::Real(v) => {
+                    // `render_float_literal` without allocating each token.
+                    let start = text.len();
+                    write!(text, "{}", v[i]).expect("write to String");
+                    if !text[start..].contains(['.', 'e', 'E']) {
+                        text.push_str(".0");
+                    }
+                }
+            }
+        }
+        write!(text, "]> : {ty_text}").expect("write to String");
+        let ssa = self.pure(text);
+        self.remember_packed(&ssa, packed);
         Some(Value { ssa, ty, elem })
     }
 
@@ -877,10 +907,10 @@ impl<'m> Emitter<'m> {
     /// strictly inside (0, 1).
     fn fixed_logit(&mut self, p: &Value) -> Option<Value> {
         let data = self.constants.get(&p.ssa)?;
-        let Some(Scalar::Real(k)) = data.first().cloned() else {
+        let Some(Scalar::Real(k)) = data.get(0) else {
             return None;
         };
-        if !(0.0 < k && k < 1.0) || data.iter().any(|x| *x != Scalar::Real(k)) {
+        if !(0.0 < k && k < 1.0) || data.iter().any(|x| x != Scalar::Real(k)) {
             return None;
         }
         Some(self.constant_like((k / (1.0 - k)).ln(), p))
@@ -1771,7 +1801,7 @@ impl<'m> Emitter<'m> {
             .and_then(|data| {
                 data.iter()
                     .map(|value| match value {
-                        Scalar::Int(value) => u64::try_from(*value)
+                        Scalar::Int(value) => u64::try_from(value)
                             .ok()
                             .filter(|&v| Some(v) < operand_dims[axis]),
                         _ => None,
@@ -5173,6 +5203,17 @@ impl<'m> Emitter<'m> {
     /// arms below stay free to call back into `&mut self` (e.g. `self.add`,
     /// `self.lower_node`) while still holding a node/child reference derived
     /// from it.
+    /// A scalar literal; `id` is blamed for one without a tensor form.
+    pub(crate) fn lower_literal(&mut self, id: NodeId, value: &Scalar) -> Result<Value, EmitError> {
+        match value {
+            Scalar::Int(i) if !self.int_fits(*i) => Err(wide_integer(id, *i)),
+            Scalar::Int(i) => Ok(self.int_value_const(*i)),
+            Scalar::Real(x) => Ok(self.constant(*x, MlirTy::Scalar)),
+            Scalar::Bool(b) => Ok(self.bool_value_const(*b)),
+            Scalar::Str(_) => Err(EmitError::at(id, "string literal has no tensor form")),
+        }
+    }
+
     fn lower_node_uncached(&mut self, id: NodeId) -> Result<Value, EmitError> {
         let m: &'m Module = self.m;
         if let Some(i) = self.negated_wide_literal(id) {
@@ -5183,13 +5224,7 @@ impl<'m> Emitter<'m> {
             };
         }
         match m.node(id) {
-            Node::Lit(Scalar::Int(i)) if !self.int_fits(*i) => Err(wide_integer(id, *i)),
-            Node::Lit(Scalar::Int(i)) => Ok(self.int_value_const(*i)),
-            Node::Lit(Scalar::Real(x)) => Ok(self.constant(*x, MlirTy::Scalar)),
-            Node::Lit(Scalar::Bool(b)) => Ok(self.bool_value_const(*b)),
-            Node::Lit(Scalar::Str(_)) => {
-                Err(EmitError::at(id, "string literal has no tensor form"))
-            }
+            Node::Lit(value) => self.lower_literal(id, value),
             // A bare built-in constant (`inf`, `pi`, ...) — dispatched through
             // the same builtin-head map as a zero-arg call, so `inf`'s entry
             // there is the single source of truth for both spellings.
@@ -5200,6 +5235,7 @@ impl<'m> Emitter<'m> {
             Node::Ref(r) => self.lower_ref(id, *r),
             Node::Hole => Err(EmitError::at(id, "bare hole has no tensor form")),
             Node::Axis(_) => Err(EmitError::at(id, "axis label has no tensor form")),
+            Node::Packed(p) => crate::ops::lower_packed(self, id, p),
             Node::Call(call) => match call.head {
                 CallHead::Builtin(sym) => {
                     let name = m.resolve(sym).to_string();

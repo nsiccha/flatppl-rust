@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 
 use flatppl_core::graph::{build_call, fold_add};
-use flatppl_core::{Call, CallHead, Idx, Module, NamedArg, NamedKind, Node, NodeId, Scalar, Type};
+use flatppl_core::{
+    Call, CallHead, Idx, Module, NamedArg, NamedKind, Node, NodeId, Scalar, ScalarType, Type,
+};
 
 /// Sum `terms` (at least one), vectorizing each class of same-shape terms.
 pub(super) fn sum_terms(m: &mut Module, terms: &[NodeId]) -> NodeId {
@@ -79,6 +81,15 @@ fn shape(m: &Module, id: NodeId, memo: &mut HashMap<NodeId, String>) -> String {
         Node::Lit(Scalar::Str(s)) => format!("s{s:?}"),
         Node::Const(symbol) => format!("c{}", m.resolve(*symbol)),
         Node::Ref(_) => "ref".into(),
+        // The key of its `vector` call of literals.
+        Node::Packed(p) => {
+            let cell = match p.scalar_type() {
+                ScalarType::Real => "r,",
+                ScalarType::Integer => "i,",
+                _ => "b,",
+            };
+            format!("vector({})", cell.repeat(p.len()))
+        }
         Node::Call(call) if call.inputs.is_none() => match call.head {
             CallHead::Builtin(head) => {
                 let mut key = format!("{}(", m.resolve(head));

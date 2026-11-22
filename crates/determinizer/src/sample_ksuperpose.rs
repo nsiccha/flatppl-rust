@@ -187,6 +187,11 @@ fn literal_zero_weights(m: &Module, weights: NodeId) -> bool {
             )
     };
     let resolved = resolve_ref_chain(m, weights).0;
+    if let Node::Packed(p) = m.node(resolved) {
+        return p
+            .iter()
+            .all(|w| matches!(w, Scalar::Real(x) if x == 0.0) || w == Scalar::Int(0));
+    }
     match expect_builtin_call(m, resolved, "vector") {
         Some(c) => c.args.iter().all(|&x| zero(x)),
         None => zero(resolved),

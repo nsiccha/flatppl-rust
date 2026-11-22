@@ -72,7 +72,7 @@ impl Emitter<'_> {
         if let Some(data) = self.constants.get(&value.ssa) {
             return data
                 .iter()
-                .all(|x| matches!(x, Scalar::Real(z) if *z == 0.0) || matches!(x, Scalar::Int(0)));
+                .all(|x| matches!(x, Scalar::Real(z) if z == 0.0) || matches!(x, Scalar::Int(0)));
         }
         match self.pointwise.get(&value.ssa).map(|record| &record.op) {
             Some(Pointwise::Reshape(input) | Pointwise::Broadcast(input, _)) => {

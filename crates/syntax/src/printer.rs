@@ -453,6 +453,17 @@ impl<'m> Printer<'m> {
             Node::Ref(r) => self.ref_form(r, &expr.lambda),
             Node::Axis(a) => (print_axis(self.module, a), ATOM),
             Node::Call(call) => return self.call_parts(expr, call),
+            // The same array literal as its `vector` call of literals.
+            Node::Packed(p) => (
+                format!(
+                    "[{}]",
+                    p.iter()
+                        .map(|s| print_scalar(&s))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ATOM,
+            ),
         };
         (vec![PrintPiece::text(text)], prec)
     }

@@ -2,10 +2,11 @@
 //! literal bindings read back as host values.
 
 use flatppl_core::{
-    Call, CallHead, Dim, Module, NamedArg, NamedKind, Node, NodeId, RefNs, Scalar, ScalarType,
-    Symbol, Type, ValueSet,
+    Call, CallHead, Dim, Module, NamedArg, NamedKind, Node, NodeId, Packed, RefNs, Scalar,
+    ScalarType, Symbol, Type, ValueSet,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::Arc;
 
 /// A fixed value. JSON writes infinite reals as `"inf"` and `"-inf"`, and an
 /// array as one typed flat list, `{"shape", "dtype", "data"}`.
@@ -26,7 +27,7 @@ pub enum Constant {
     )]
     Array {
         shape: Vec<u32>,
-        data: Vec<Constant>,
+        data: ArrayData,
     },
     Record(Vec<(String, Constant)>),
     Table(Vec<(String, Constant)>),
@@ -35,6 +36,152 @@ pub enum Constant {
     Fixed(Box<Constant>),
     /// A reference to another binding read from source. It binds no external.
     Reference(String),
+}
+
+/// An array's entries in C order: one shared buffer per scalar kind, so a
+/// large array costs its entries' bytes. Arrays of arrays keep their entries as
+/// values. Entries read back as scalar [`Constant`]s.
+#[derive(Clone, Debug)]
+pub enum ArrayData {
+    Bool(Arc<[bool]>),
+    Integer(Arc<[i64]>),
+    Real(Arc<[f64]>),
+    /// Preserve binary32 source precision until fixed-data validation.
+    Real32(Arc<[f32]>),
+    Complex(Arc<[(f64, f64)]>),
+    /// Entries that are not scalars of one kind, such as the vectors of a
+    /// vector of vectors.
+    Values(Vec<Constant>),
+}
+
+impl ArrayData {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bool(v) => v.len(),
+            Self::Integer(v) => v.len(),
+            Self::Real(v) => v.len(),
+            Self::Real32(v) => v.len(),
+            Self::Complex(v) => v.len(),
+            Self::Values(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Entry `i` in C order.
+    pub fn get(&self, i: usize) -> Option<Constant> {
+        Some(match self {
+            Self::Bool(v) => Constant::Bool(*v.get(i)?),
+            Self::Integer(v) => Constant::Integer(*v.get(i)?),
+            Self::Real(v) => Constant::Real(*v.get(i)?),
+            Self::Real32(v) => Constant::Real32(*v.get(i)?),
+            Self::Complex(v) => {
+                let (re, im) = *v.get(i)?;
+                Constant::Complex(re, im)
+            }
+            Self::Values(v) => v.get(i)?.clone(),
+        })
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Constant> + '_ {
+        (0..self.len()).map(|i| self.get(i).expect("index below len"))
+    }
+
+    /// Entries `start..start + len`, shared by the view, not copied.
+    fn view(&self, start: usize, len: usize) -> ArrayView<'_> {
+        ArrayView {
+            data: self,
+            start,
+            len,
+        }
+    }
+}
+
+/// Scalars of one kind become one buffer; anything else stays values.
+impl From<Vec<Constant>> for ArrayData {
+    fn from(values: Vec<Constant>) -> Self {
+        fn all<T>(values: &[Constant], pick: impl Fn(&Constant) -> Option<T>) -> Option<Arc<[T]>> {
+            values.iter().map(pick).collect()
+        }
+        let packed = match values.first() {
+            Some(Constant::Bool(_)) => all(&values, |v| match v {
+                Constant::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .map(Self::Bool),
+            Some(Constant::Integer(_)) => all(&values, |v| match v {
+                Constant::Integer(i) => Some(*i),
+                _ => None,
+            })
+            .map(Self::Integer),
+            Some(Constant::Real(_)) => all(&values, |v| match v {
+                Constant::Real(x) => Some(*x),
+                _ => None,
+            })
+            .map(Self::Real),
+            Some(Constant::Real32(_)) => all(&values, |v| match v {
+                Constant::Real32(x) => Some(*x),
+                _ => None,
+            })
+            .map(Self::Real32),
+            Some(Constant::Complex(..)) => all(&values, |v| match v {
+                Constant::Complex(re, im) => Some((*re, *im)),
+                _ => None,
+            })
+            .map(Self::Complex),
+            _ => None,
+        };
+        packed.unwrap_or(Self::Values(values))
+    }
+}
+
+impl FromIterator<Constant> for ArrayData {
+    fn from_iter<I: IntoIterator<Item = Constant>>(iter: I) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+/// Equal entries, whatever the storage: an empty array equals any other.
+impl PartialEq for ArrayData {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Integer(a), Self::Integer(b)) => a == b,
+            (Self::Real(a), Self::Real(b)) => a == b,
+            (Self::Real32(a), Self::Real32(b)) => a == b,
+            (Self::Complex(a), Self::Complex(b)) => a == b,
+            _ => self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b),
+        }
+    }
+}
+
+/// A contiguous run of an array's entries.
+#[derive(Clone, Copy)]
+struct ArrayView<'a> {
+    data: &'a ArrayData,
+    start: usize,
+    len: usize,
+}
+
+impl<'a> ArrayView<'a> {
+    fn get(&self, i: usize) -> Option<Constant> {
+        (i < self.len).then(|| self.data.get(self.start + i))?
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Constant> + 'a {
+        let view = *self;
+        (0..view.len).map(move |i| view.get(i).expect("index below len"))
+    }
+
+    fn sub(&self, start: usize, len: usize) -> Option<Self> {
+        (start.checked_add(len)? <= self.len).then_some(Self {
+            data: self.data,
+            start: self.start + start,
+            len,
+        })
+    }
 }
 
 mod real {
@@ -98,69 +245,24 @@ mod packed {
 
     pub fn serialize<S: Serializer>(
         shape: &[u32],
-        data: &[Constant],
+        data: &ArrayData,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let fail = || serde::ser::Error::custom("array elements must be scalars of one kind");
-        let packed = match data.first() {
-            Some(Constant::Bool(_)) | None => data
-                .iter()
-                .map(|x| {
-                    if let Constant::Bool(v) = x {
-                        Some(*v)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Option<_>>()
-                .map(Data::Bool),
-            Some(Constant::Integer(_)) => data
-                .iter()
-                .map(|x| {
-                    if let Constant::Integer(v) = x {
-                        Some(*v)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Option<_>>()
-                .map(Data::Integer),
-            Some(Constant::Real(_)) => data
-                .iter()
-                .map(|x| {
-                    if let Constant::Real(v) = x {
-                        Some(Real(*v))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Option<_>>()
-                .map(Data::Real),
-            Some(Constant::Real32(_)) => data
-                .iter()
-                .map(|x| {
-                    if let Constant::Real32(v) = x {
-                        Some(Real32(*v))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Option<_>>()
-                .map(Data::Real32),
-            Some(Constant::Complex(_, _)) => data
-                .iter()
-                .map(|x| {
-                    if let Constant::Complex(re, im) = x {
-                        Some(Complex(*re, *im))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Option<_>>()
-                .map(Data::Complex),
-            Some(_) => None,
-        }
-        .ok_or_else(fail)?;
+        let packed = match data {
+            ArrayData::Bool(v) => Data::Bool(v.to_vec()),
+            ArrayData::Integer(v) => Data::Integer(v.to_vec()),
+            ArrayData::Real(v) => Data::Real(v.iter().map(|&x| Real(x)).collect()),
+            ArrayData::Real32(v) => Data::Real32(v.iter().map(|&x| Real32(x)).collect()),
+            ArrayData::Complex(v) => {
+                Data::Complex(v.iter().map(|&(re, im)| Complex(re, im)).collect())
+            }
+            ArrayData::Values(v) if v.is_empty() => Data::Bool(Vec::new()),
+            ArrayData::Values(_) => {
+                return Err(serde::ser::Error::custom(
+                    "array elements must be scalars of one kind",
+                ));
+            }
+        };
         Array {
             shape: shape.to_vec(),
             data: packed,
@@ -170,23 +272,18 @@ mod packed {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<(Vec<u32>, Vec<Constant>), D::Error> {
+    ) -> Result<(Vec<u32>, ArrayData), D::Error> {
         let Array { shape, data } = Array::deserialize(deserializer)?;
         let data = match data {
-            Data::Bool(values) => values.into_iter().map(Constant::Bool).collect(),
-            Data::Integer(values) => values.into_iter().map(Constant::Integer).collect(),
-            Data::Real(values) => values
-                .into_iter()
-                .map(|Real(v)| Constant::Real(v))
-                .collect(),
-            Data::Real32(values) => values
-                .into_iter()
-                .map(|Real32(v)| Constant::Real32(v))
-                .collect(),
-            Data::Complex(values) => values
-                .into_iter()
-                .map(|Complex(re, im)| Constant::Complex(re, im))
-                .collect(),
+            Data::Bool(values) => ArrayData::Bool(values.into()),
+            Data::Integer(values) => ArrayData::Integer(values.into()),
+            Data::Real(values) => ArrayData::Real(values.into_iter().map(|Real(v)| v).collect()),
+            Data::Real32(values) => {
+                ArrayData::Real32(values.into_iter().map(|Real32(v)| v).collect())
+            }
+            Data::Complex(values) => {
+                ArrayData::Complex(values.into_iter().map(|Complex(re, im)| (re, im)).collect())
+            }
         };
         Ok((shape, data))
     }
@@ -250,12 +347,32 @@ impl Constant {
                     .zip(expected.iter())
                     .all(|(&n, &d)| d == Dim::Static(n) || d == Dim::Dynamic) =>
             {
-                Ok(Self::Array {
-                    shape: shape.clone(),
-                    data: data
+                use ScalarType::{Boolean, Complex, Integer, Real};
+                // Whole-buffer conversions for the scalar rules above.
+                let data = match (data, elem.as_ref()) {
+                    (data, Type::Any)
+                    | (data @ ArrayData::Bool(_), Type::Scalar(Boolean))
+                    | (data @ ArrayData::Integer(_), Type::Scalar(Integer))
+                    | (data @ (ArrayData::Real(_) | ArrayData::Real32(_)), Type::Scalar(Real))
+                    | (data @ ArrayData::Complex(_), Type::Scalar(Complex)) => data.clone(),
+                    (ArrayData::Bool(v), Type::Scalar(Integer)) => {
+                        ArrayData::Integer(v.iter().map(|&b| i64::from(b)).collect())
+                    }
+                    (ArrayData::Bool(v), Type::Scalar(Real)) => {
+                        ArrayData::Real(v.iter().map(|&b| f64::from(b)).collect())
+                    }
+                    (ArrayData::Integer(v), Type::Scalar(Real)) => {
+                        ArrayData::Real(v.iter().map(|&i| i as f64).collect())
+                    }
+                    (data, elem) => data
                         .iter()
                         .map(|v| v.normalized(module, elem))
-                        .collect::<Result<_, _>>()?,
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into(),
+                };
+                Ok(Self::Array {
+                    shape: shape.clone(),
+                    data,
                 })
             }
             (Self::Record(fields), Type::Record(expected)) => {
@@ -328,7 +445,9 @@ impl Constant {
             (_, Deferred | Unknown) => {
                 return Err("external domain cannot be resolved after substitution".into());
             }
-            (Self::Array { shape, data }, _) => array_in_set(module, shape, data, set)?,
+            (Self::Array { shape, data }, _) => {
+                array_in_set(module, shape, data.view(0, data.len()), set)?
+            }
             (Self::Record(fields), RecordSet(sets)) => {
                 fields.len() == sets.len()
                     && fields
@@ -397,11 +516,27 @@ impl Constant {
                 if shape.is_empty() || size != Some(data.len()) {
                     return Err("constant array shape must match its nonempty flat data".into());
                 }
-                let values = data
-                    .iter()
-                    .map(|x| x.alloc(module))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let values = call(module, "vector", values, vec![]);
+                // Scalars of one kind become one packed node sharing the
+                // buffer, not a node each.
+                let packed = match data {
+                    ArrayData::Bool(v) => Some(Packed::Bool(v.clone())),
+                    ArrayData::Integer(v) => Some(Packed::Int(v.clone())),
+                    ArrayData::Real(v) => Some(Packed::Real(v.clone())),
+                    ArrayData::Real32(v) => {
+                        Some(Packed::Real(v.iter().map(|&x| f64::from(x)).collect()))
+                    }
+                    ArrayData::Complex(_) | ArrayData::Values(_) => None,
+                };
+                let values = match packed.filter(|p| p.len() >= Packed::MIN_LEN) {
+                    Some(packed) => module.alloc(Node::Packed(packed)),
+                    None => {
+                        let values = data
+                            .iter()
+                            .map(|x| x.alloc(module))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        call(module, "vector", values, vec![])
+                    }
+                };
                 if shape.len() == 1 {
                     return Ok(values);
                 }
@@ -484,6 +619,14 @@ impl Constant {
             Node::Lit(Scalar::Int(v)) => Ok(Self::Integer(*v)),
             Node::Lit(Scalar::Real(v)) => Ok(Self::Real(*v)),
             Node::Lit(Scalar::Str(v)) => Ok(Self::String(v.to_string())),
+            Node::Packed(p) => Ok(Self::Array {
+                shape: vec![u32::try_from(p.len()).map_err(|_| "vector is too long")?],
+                data: match p {
+                    Packed::Bool(v) => ArrayData::Bool(v.clone()),
+                    Packed::Int(v) => ArrayData::Integer(v.clone()),
+                    Packed::Real(v) => ArrayData::Real(v.clone()),
+                },
+            }),
             Node::Const(s) if name(*s) == "inf" => Ok(Self::Real(f64::INFINITY)),
             Node::Const(s) if name(*s) == "pi" => Ok(Self::Real(std::f64::consts::PI)),
             Node::Const(s) if name(*s) == "im" => Ok(Self::Complex(0.0, 1.0)),
@@ -525,7 +668,7 @@ impl Constant {
                     ("table", 0, _) => Ok(Self::Table(fields()?)),
                     ("vector", n, true) => Ok(Self::Array {
                         shape: vec![u32::try_from(n).map_err(|_| "vector is too long")?],
-                        data: scalars(args()?)?,
+                        data: scalars(args()?)?.into(),
                     }),
                     ("array", 3, true) => read_array(module, &c.args),
                     (other, _, _) => Err(format!("`{other}(...)` is not a literal")),
@@ -553,7 +696,7 @@ fn scalars(values: Vec<Constant>) -> Result<Vec<Constant>, String> {
 fn read_array(module: &Module, args: &[NodeId]) -> Result<Constant, String> {
     let integers = |node| match Constant::read(module, node)? {
         Constant::Array { data, .. } => data
-            .into_iter()
+            .iter()
             .map(|v| match v {
                 Constant::Integer(v) => u32::try_from(v).map_err(|_| "negative array extent"),
                 _ => Err("array extents must be integers"),
@@ -600,28 +743,37 @@ fn normalize_fields(
 fn array_in_set(
     module: &Module,
     shape: &[u32],
-    data: &[Constant],
+    data: ArrayView<'_>,
     set: &ValueSet,
 ) -> Result<bool, String> {
     use ValueSet::*;
     if shape.is_empty() {
-        return data[0].in_set(module, set);
+        return data
+            .get(0)
+            .ok_or("an array entry is missing")?
+            .in_set(module, set);
     }
     match set {
         CartPow(elem, Dim::Static(n)) if *n == shape[0] => {
             if *n == 0 {
-                return Ok(data.is_empty());
+                return Ok(data.len == 0);
             }
-            let width = data.len() / *n as usize;
-            for row in data.chunks(width) {
+            let width = data.len / *n as usize;
+            // Rows as `chunks(width)` cuts them, the last one possibly short.
+            let mut start = 0;
+            while start < data.len {
+                let row = data
+                    .sub(start, width.min(data.len - start))
+                    .expect("row within the data");
                 if !array_in_set(module, &shape[1..], row, elem)? {
                     return Ok(false);
                 }
+                start += width.max(1);
             }
             Ok(true)
         }
         StdSimplex(Dim::Static(n)) if shape == [*n] => {
-            for value in data {
+            for value in data.iter() {
                 if !value.real_value().is_some_and(|v| v >= 0.0) {
                     return Ok(false);
                 }
@@ -649,7 +801,7 @@ fn array_in_set(
             let mut offset = 0;
             for part in parts {
                 let width = product_width(part).ok_or("unresolved Cartesian product domain")?;
-                let Some(values) = data.get(offset..offset + width) else {
+                let Some(values) = data.sub(offset, width) else {
                     return Ok(false);
                 };
                 let dims = match part {
@@ -663,7 +815,7 @@ fn array_in_set(
                 }
                 offset += width;
             }
-            Ok(offset == data.len())
+            Ok(offset == data.len)
         }
         Deferred
         | Unknown
@@ -681,10 +833,10 @@ fn array_in_set(
 /// Fixed-data acceptance only: |sum(x) - target| <= 8 n u sum(|x|).
 /// The factor eight allows a short producing chain per entry. Scaling avoids
 /// overflow without changing the stored values; mixed reals promote to f64.
-fn sum_matches(data: &[Constant], target: f64) -> bool {
+fn sum_matches(data: ArrayView<'_>, target: f64) -> bool {
     let mut scale = 0.0_f64;
     let mut epsilon = f64::from(f32::EPSILON);
-    for value in data {
+    for value in data.iter() {
         let Some(number) = value.real_value().filter(|v| v.is_finite()) else {
             return false;
         };
@@ -697,12 +849,12 @@ fn sum_matches(data: &[Constant], target: f64) -> bool {
         return target == 0.0;
     }
     let (mut sum, mut abs_sum) = (0.0, 0.0);
-    for value in data {
+    for value in data.iter() {
         let number = value.real_value().unwrap() / scale;
         sum += number;
         abs_sum += number.abs();
     }
-    (sum - target / scale).abs() <= 8.0 * data.len() as f64 * (epsilon / 2.0) * abs_sum
+    (sum - target / scale).abs() <= 8.0 * data.len as f64 * (epsilon / 2.0) * abs_sum
 }
 
 /// Fixed-data acceptance for a row-major n×n `corrcholesky(n)` value: finite
@@ -710,13 +862,13 @@ fn sum_matches(data: &[Constant], target: f64) -> bool {
 /// norms, |sum_j L_ij^2 - 1| <= 8 n u, with the unit roundoff `u` of
 /// [`sum_matches`] (f32 unless an entry is a real). The entries are at most one
 /// in magnitude, so the squares need no scaling.
-fn corr_cholesky_matches(data: &[Constant], n: usize) -> bool {
+fn corr_cholesky_matches(data: ArrayView<'_>, n: usize) -> bool {
     if n == 0 {
-        return data.is_empty();
+        return data.len == 0;
     }
     let mut epsilon = f64::from(f32::EPSILON);
-    let mut values = Vec::with_capacity(data.len());
-    for value in data {
+    let mut values = Vec::with_capacity(data.len);
+    for value in data.iter() {
         let Some(number) = value.real_value().filter(|v| v.is_finite()) else {
             return false;
         };

@@ -143,6 +143,10 @@ fn const_eval(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> ConstEv
             }
         }
         Node::Call(c) => eval_call(inf, node, &c, depth),
+        // As its `vector` call of literals: integers are shape values.
+        Node::Packed(flatppl_core::Packed::Int(v)) => ConstEval::Val(FixedValue::Vec(
+            v.iter().map(|&n| FixedValue::Int(n)).collect(),
+        )),
         _ => ConstEval::Dynamic,
     }
 }
@@ -542,6 +546,8 @@ fn real_vector(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option
             .iter()
             .map(|&a| real_number(inf, a, depth + 1))
             .collect(),
+        Node::Packed(flatppl_core::Packed::Real(v)) => Some(v.to_vec()),
+        Node::Packed(flatppl_core::Packed::Int(v)) => Some(v.iter().map(|&n| n as f64).collect()),
         _ => None,
     }
 }
@@ -722,6 +728,10 @@ pub(crate) fn count_dims_with_zero(
             })
             .collect();
         return (dims, zero);
+    }
+    if let Node::Packed(flatppl_core::Packed::Int(v)) = inf.module.node(node).clone() {
+        let dims = v.iter().map(|&n| size_dim(inf, node, n)).collect();
+        return (dims, v.contains(&0));
     }
     if inf.level >= Level::Shape {
         match const_eval(inf, node, 0) {
