@@ -1678,7 +1678,7 @@ fn odesolve_type(
                 // An element type still being decided (a callback reading a
                 // record parameter, a branch) is checked again at emission.
                 Some(Type::Array { shape, elem })
-                    if Some(&shape) == state_shape(&state)
+                    if Some(&*shape) == state_shape(&state)
                         && matches!(
                             *elem,
                             Type::Scalar(ScalarType::Integer)
@@ -1724,9 +1724,9 @@ fn real_vector_len(ty: &Type) -> Result<Option<Dim>, ()> {
     }
 }
 
-fn state_shape(ty: &Type) -> Option<&Box<[Dim]>> {
+fn state_shape(ty: &Type) -> Option<&[Dim]> {
     match ty {
-        Type::Array { shape, .. } => Some(shape),
+        Type::Array { shape, .. } => Some(shape.as_ref()),
         _ => None,
     }
 }
