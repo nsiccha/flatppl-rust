@@ -123,6 +123,44 @@ fn record_parameter_branch_and_two_input_callback_lower() {
     }
 }
 
+/// The operation that defines SSA value `name` in `ir`.
+fn defining_op<'a>(ir: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{name} = ");
+    ir.lines()
+        .map(str::trim_start)
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .and_then(|rhs| rhs.split([' ', '(']).next())
+        .unwrap_or_else(|| panic!("no definition of {name}\n{ir}"))
+}
+
+/// Both step-size factors are computed on every step and one is selected, so
+/// each `power` must read a clamped error estimate: an unclamped
+/// `err^(-1/3)` is infinite at a zero estimate (a steady state), and reverse
+/// mode then multiplies the unselected branch's zero cotangent by an infinite
+/// slope, giving NaN gradients.
+#[test]
+fn step_size_factors_read_a_clamped_error_estimate() {
+    for dtype in [Dtype::F32, Dtype::F64] {
+        // These callbacks contain no `pow`, so every power is the controller's.
+        for src in [LOTKA_VOLTERRA, DECAY, TWO_POOL] {
+            let ir = emit(src, Target::Cpu, dtype).expect("emit odesolve");
+            let powers: Vec<&str> = ir
+                .lines()
+                .filter_map(|line| line.split_once("= stablehlo.power ").map(|(_, rhs)| rhs))
+                .collect();
+            assert_eq!(powers.len(), 2, "{ir}");
+            for rhs in powers {
+                let base = rhs.split(',').next().unwrap().trim();
+                assert_eq!(
+                    defining_op(&ir, base),
+                    "stablehlo.maximum",
+                    "power base {base} is not clamped\n{ir}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn unknown_keyword_and_non_vector_state_are_refused() {
     let unknown = LOTKA_VOLTERRA.replace("max_steps = 500", "method = 1");
