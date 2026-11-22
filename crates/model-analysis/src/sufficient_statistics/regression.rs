@@ -1,7 +1,7 @@
 //! Fixed-design Gaussian residuals, expressed with portable array operations.
 
 use super::multivariate::{
-    entry, finite_data, get, held_cells, real_shape, residual_factor, vector,
+    entry, finite_data, get, held_cells, real_shape, record_field, residual_factor, vector,
 };
 use super::{
     Expr, Reducer, data_only, local_ref, map, materialize, num, op, per_cell_with_invariants,
@@ -39,7 +39,12 @@ struct Term {
 struct Design {
     terms: Vec<Term>,
     offsets: Vec<(NodeId, f64)>,
+    /// A fixed column or offset whose finiteness has no proof stopped it.
+    unproven: bool,
 }
+
+/// The retained reason when only the finiteness proof of the data failed.
+const UNPROVEN: &str = "regression data need fixed finite values or a bounded value set";
 
 fn arithmetic(m: &Module, id: NodeId) -> Option<(&str, &[NodeId])> {
     let Node::Call(c) = m.node(id) else {
@@ -75,6 +80,9 @@ pub(super) fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, 
         Node::Lit(Scalar::Int(x)) => return Some((*x as f64, *x as f64)),
         _ => {}
     }
+    if let Some(field) = record_field(m, id, reducer) {
+        return bounds(m, field, reducer);
+    }
     let mut set = m.valueset_of(id);
     while let Some(ValueSet::CartPow(cell, _)) = set {
         set = Some(cell);
@@ -91,6 +99,14 @@ pub(super) fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, 
     let (name, args) = arithmetic(m, id)?;
     match (name, args) {
         ("get" | "get0" | "fill", [array, ..]) => bounds(m, *array, reducer),
+        // A fixed array literal is bounded by its flat values.
+        ("array", [values, ..]) => bounds(m, *values, reducer),
+        ("ones", _) => Some((1.0, 1.0)),
+        ("zeros", _) => Some((0.0, 0.0)),
+        ("ifelse", [_, a, b]) => {
+            let (a, b) = (bounds(m, *a, reducer)?, bounds(m, *b, reducer)?);
+            Some((a.0.min(b.0), a.1.max(b.1)))
+        }
         ("neg", [value]) => bounds(m, *value, reducer).map(|(lo, hi)| (-hi, -lo)),
         ("vector" | "rowstack" | "colstack" | "cat", values) => values
             .iter()
@@ -188,6 +204,7 @@ fn collect(
     let id = resolve(m, id, &reducer.boundary);
     if data_only(m, id, &reducer.allowed, &reducer.boundary) {
         if !finite_data(m, id, reducer) {
+            design.unproven = true;
             return None;
         }
         let value = if scalar(m, id) {
@@ -237,8 +254,11 @@ fn collect(
                 && *rows == count
                 && m.type_of(b).and_then(real_shape).as_deref() == Some(&[*columns])
                 && data_only(m, a, &reducer.allowed, &reducer.boundary)
-                && finite_data(m, a, reducer)
             {
+                if !finite_data(m, a, reducer) {
+                    design.unproven = true;
+                    return None;
+                }
                 for j in 0..*columns {
                     let column = materialize(
                         m,
@@ -267,8 +287,11 @@ fn collect(
             };
             if m.type_of(column).and_then(data_shape).as_deref() != Some(&[count])
                 || !data_only(m, column, &reducer.allowed, &reducer.boundary)
-                || !finite_data(m, column, reducer)
             {
+                return None;
+            }
+            if !finite_data(m, column, reducer) {
+                design.unproven = true;
                 return None;
             }
             design.terms.push(Term {
@@ -346,7 +369,6 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
     let f = per_cell_with_invariants(m, id, &reducer.boundary)?;
     if m.resolve(f.constructor) != "Normal"
         || !data_only(m, f.observed, &reducer.allowed, &reducer.boundary)
-        || !finite_data(m, f.observed, reducer)
     {
         return None;
     }
@@ -368,12 +390,30 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
         .iter()
         .find(|(name, _)| m.resolve(*name) == "sigma")?
         .1;
+    if !finite_data(m, f.observed, reducer) {
+        // Name the data proof only for a mean this rule could otherwise take,
+        // judged on a copy so the refused factor leaves the module unchanged.
+        let mut probe = m.clone();
+        let mut design = Design::default();
+        if m.type_of(mu).and_then(real_shape).as_deref() == Some(&[count])
+            && (collect(reducer, &mut probe, mu, count, 1.0, &mut design).is_some()
+                || design.unproven)
+        {
+            reducer.fallback = UNPROVEN;
+        }
+        return None;
+    }
     let (sigma, row_scales) = row_scales(reducer, m, sigma, count)?;
     if m.type_of(mu).and_then(real_shape).as_deref() != Some(&[count]) {
         return None;
     }
     let mut design = Design::default();
-    collect(reducer, m, mu, count, 1.0, &mut design)?;
+    if collect(reducer, m, mu, count, 1.0, &mut design).is_none() {
+        if design.unproven {
+            reducer.fallback = UNPROVEN;
+        }
+        return None;
+    }
     if design.terms.is_empty() {
         return None;
     }
