@@ -173,7 +173,9 @@ the design and observations, for example `--data-input X --data-input y`.
 The reduced score uses a scaled QR factor and a data-derived coefficient
 reference. Runtime regression and InverseWishart data require explicit
 preparation to amortize QR setup. Parameter-dependent designs and varying sigmas retain
-ordinary scoring.
+ordinary scoring. The design and observations must be finite: fixed data,
+including `load_data` declared on `reals` or `posreals`, are checked by their
+values once read, while runtime data need a bounded value set.
 
 InverseGamma, Pareto, fixed-shape Weibull and fixed-dispersion NegativeBinomial
 likelihoods also support summaries. Real observations need positive finite

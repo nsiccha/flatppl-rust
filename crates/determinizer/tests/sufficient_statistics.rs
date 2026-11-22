@@ -851,6 +851,54 @@ fn weighted_regression_keeps_unproved_scale_products_and_ranges_unchanged() {
 }
 
 #[test]
+fn regression_proves_finite_data_from_materialized_literals() {
+    use flatppl_determinizer::{
+        ReductionOutcome, ReductionReport, sufficient_statistics_with_report,
+    };
+    let outcome = |source: &str| {
+        let mut module = lower(source, false);
+        let mut report = ReductionReport::default();
+        sufficient_statistics_with_report(&mut module, &mut report);
+        assert_eq!(report.decisions.len(), 1, "{source}");
+        report.decisions[0].outcome.clone()
+    };
+    let unproven = ReductionOutcome::Retained {
+        reason: "regression data need fixed finite values or a bounded value set",
+    };
+    let prefix = "beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\ninputs=(beta,sigma)\noutputs=logdensityof(Normal.(X*beta,sigma),y)\n";
+    // The forms `load_data` leaves behind for data declared on `reals` or
+    // `posreals`: an `array` matrix, record fields with an intercept, and an
+    // indicator column of fixed labels.
+    for data in [
+        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3.0],[5,2],[1,2])\ny=[0.1,-0.7,1.9,0.4,2.5]",
+        "data=record(x=[0.5,1.5,2.0,0.25,3.0],y=[0.1,-0.7,1.9,0.4,2.5])\nX=colstack([ones(5),data.x])\ny=data.y",
+        "g=[1,2,2,1,3]\nX=colstack([ones(5),ifelse.(g .== 2,1.0,0.0)])\ny=[0.1,-0.7,1.9,0.4,2.5]",
+    ] {
+        let source = format!("{prefix}{data}");
+        assert!(
+            matches!(
+                outcome(&source),
+                ReductionOutcome::Reduced {
+                    rule: "regression statistics",
+                    ..
+                }
+            ),
+            "{source}"
+        );
+    }
+    // Values outside the float32 headroom and unbounded runtime data name the
+    // missing proof instead of the grouped rule's gather requirement.
+    for data in [
+        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3.0],[5,2],[1,2])\ny=[0.1,-0.7,1.9,0.4,2e38]",
+        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3e38],[5,2],[1,2])\ny=[0.1,-0.7,1.9,0.4,2.5]",
+        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3.0],[5,2],[1,2])\ny=external(cartpow(reals,5))",
+    ] {
+        let source = format!("{prefix}{data}");
+        assert_eq!(outcome(&source), unproven, "{source}");
+    }
+}
+
+#[test]
 fn repeated_factors_share_preparation_and_parameter_dependent_observations_stay_live() {
     let prefix = "a=elementof(reals)\ny=external(cartpow(reals,3))\ninputs=(a,y)\n";
     let one = lower(
