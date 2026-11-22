@@ -273,7 +273,7 @@ impl LoadedModule {
     }
 
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
-        self.compile_export(options, None)
+        self.compile_export(options, None, false)
     }
 
     /// Compile independent calls over explicit host batch axes.
@@ -282,20 +282,58 @@ impl LoadedModule {
         options: &EmitOptions,
         batch: &BatchSpec,
     ) -> Result<Export, Diagnostic> {
-        self.compile_export(options, Some(batch))
+        self.compile_export(options, Some(batch), false)
+    }
+
+    /// Compile like [`Self::compile`], but move the data-only likelihood
+    /// summaries of fixed data into [`Export::preparation`], which a host runs
+    /// once. Each call then scores with the prepared summaries instead of
+    /// repeating their setup. A query without such summaries, or one whose
+    /// summaries cannot be split, compiles as [`Self::compile`] does.
+    pub fn compile_prepared(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
+        self.compile_export(options, None, true)
+    }
+
+    /// [`Self::compile_prepared`] over explicit host batch axes. `batch`
+    /// gives an axis entry for every argument leaf, the prepared leaves
+    /// included; prepared leaves are shared by all batch cells and stay
+    /// unmapped.
+    pub fn compile_batched_prepared(
+        &self,
+        options: &EmitOptions,
+        batch: &BatchSpec,
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, Some(batch), true)
     }
 
     fn compile_export(
         &self,
         options: &EmitOptions,
         batch: Option<&BatchSpec>,
+        prepare: bool,
     ) -> Result<Export, Diagnostic> {
         let typed = &self.typed;
-        let lowered = self.lower_query(options, None)?;
-        emit_query(lowered, typed, options, batch).map_err(|e| {
+        let fail = |e: flatppl_stablehlo::EmitError| {
             let node = e.node.filter(|id| id.index() < typed.node_count());
             Diagnostic::new("stablehlo", self.source_name(), e.msg).at(typed, node, self.source())
-        })
+        };
+        let lowered = self.lower_query(options, None)?;
+        if prepare && options.sufficient_statistics {
+            // Some reductions match fixed data only before `load_data` becomes
+            // literals, so preparation splits the ordinarily reduced query.
+            // Its data are literals, so no data input is named. A refusal
+            // means there is nothing to split; ordinary emission is the same
+            // query with its summaries inline.
+            if let Ok(prepared) = flatppl_determinizer::prepare_likelihood_with_options(
+                &lowered,
+                &[],
+                &flatppl_determinizer::PreparationOptions::default(),
+                None,
+            ) {
+                return crate::export::emit_prepared(prepared, typed, options, batch).map_err(fail);
+            }
+        }
+        emit_query(lowered, typed, options, batch).map_err(fail)
     }
 
     pub(crate) fn may_have_posteriors(&self) -> bool {

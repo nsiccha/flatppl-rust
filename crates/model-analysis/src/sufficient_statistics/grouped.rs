@@ -558,7 +558,7 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
         .into_iter()
         .map(|term| materialize(&mut candidate, term))
         .collect::<Vec<_>>();
-    let result = flatppl_core::graph::fold_add(&mut candidate, &terms);
+    let result = super::vectorize::sum_terms(&mut candidate, &terms);
     *m = candidate;
     *r = reducer;
     r.rule = Some(("grouped scalar summaries", Some(partition)));

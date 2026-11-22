@@ -751,7 +751,10 @@ impl NativeModule {
         Ok(serde_json::to_string(&self.inner.math(format)).expect("rows contain only JSON values"))
     }
 
-    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", sufficient_statistics=true))]
+    /// `prepare_fixed_data` moves data-only likelihood summaries into the
+    /// export's `preparation`, which the caller runs once and passes after the
+    /// declared input leaves (`LoadedModule::compile_prepared`).
+    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", sufficient_statistics=true, prepare_fixed_data=false))]
     #[allow(clippy::too_many_arguments)]
     fn export(
         &self,
@@ -762,6 +765,7 @@ impl NativeModule {
         batch: Option<BatchArguments>,
         target: &str,
         sufficient_statistics: bool,
+        prepare_fixed_data: bool,
     ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
@@ -786,11 +790,15 @@ impl NativeModule {
             sufficient_statistics,
         };
         let exported = py
-            .detach(|| match batch {
-                Some((shape, input_axes)) => self
+            .detach(|| match (batch, prepare_fixed_data) {
+                (Some((shape, input_axes)), false) => self
                     .inner
                     .compile_batched(&options, &BatchSpec { shape, input_axes }),
-                None => self.inner.compile(&options),
+                (Some((shape, input_axes)), true) => self
+                    .inner
+                    .compile_batched_prepared(&options, &BatchSpec { shape, input_axes }),
+                (None, false) => self.inner.compile(&options),
+                (None, true) => self.inner.compile_prepared(&options),
             })
             .map_err(error)?;
         Ok(serde_json::to_string(&exported).expect("exports contain only JSON values"))

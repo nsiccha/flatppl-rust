@@ -890,3 +890,36 @@ fn a_promoted_fixed_value_never_becomes_a_baked_statistic() {
     assert_eq!(inputs(&prepared.preparation), ["y"]);
     assert!(!inputs(&prepared.score).iter().any(|name| name == "y"));
 }
+
+fn occurrences(module: &Module, text: &str) -> usize {
+    flatppl_syntax::print(module).matches(text).count()
+}
+
+#[test]
+fn fixed_partitions_score_same_shape_groups_as_one_broadcast() {
+    // Twelve groups of three fixed observations and two singleton groups.
+    let mut g: Vec<usize> = (0..36).map(|i| i / 3 + 1).collect();
+    g.extend([13, 14]);
+    let y: Vec<String> = (0..g.len())
+        .map(|i| format!("{:.4}", (0.7 * i as f64).sin()))
+        .collect();
+    let g: Vec<String> = g.iter().map(ToString::to_string).collect();
+    let source = format!(
+        "mu=elementof(cartpow(reals,14))\nsigma=elementof(posreals)\ng=[{}]\ninputs=(mu,sigma)\noutputs=logdensityof(Normal.(mu[g],sigma),[{}])",
+        g.join(","),
+        y.join(",")
+    );
+    let reduced = lower(&source, true);
+    assert!(summary_count(&reduced) > 0);
+    // One family term per group shape, not one per group.
+    let scores = occurrences(&reduced, "builtin_logdensityof");
+    assert!((1..=2).contains(&scores), "{scores} scores");
+    assert!(flatppl_determinizer::is_flatpdl(&reduced).is_ok());
+    // Explicit preparation scores the same way; its summaries are unchanged.
+    let prepared = prepare_unpacked(&lower(&source, false), &[]);
+    let score = occurrences(&prepared.score, "builtin_logdensityof");
+    assert!((1..=2).contains(&score), "{score} scores");
+    assert!(flatppl_determinizer::is_flatpdl(&prepared.score).is_ok());
+    let serialized = flatppl_flatpir::try_write(&prepared.score).unwrap();
+    assert!(flatppl_flatpir::read(&serialized).is_ok());
+}
