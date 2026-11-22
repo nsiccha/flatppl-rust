@@ -1,4 +1,6 @@
 //! Hermitian cyclic Jacobi iteration with ascending, orthonormal eigenpairs.
+//! An unbatched real input rotates only the two affected rows and columns of
+//! each pair, in the same cyclic order, instead of masking the whole matrix.
 
 use super::*;
 
@@ -63,6 +65,209 @@ impl Emitter<'_> {
         let zero = self.constant_like(0.0, &column);
         let value = self.select(&selected, &column, &zero);
         self.reduce_sum_last_axis(&value)
+    }
+
+    /// A tensor known to hold only zeros, such as the imaginary part of a real input.
+    fn known_zero(&self, value: &Value) -> bool {
+        if let Some(data) = self.constants.get(&value.ssa) {
+            return data
+                .iter()
+                .all(|x| matches!(x, Scalar::Real(z) if *z == 0.0) || matches!(x, Scalar::Int(0)));
+        }
+        match self.pointwise.get(&value.ssa).map(|record| &record.op) {
+            Some(Pointwise::Reshape(input) | Pointwise::Broadcast(input, _)) => {
+                self.known_zero(input)
+            }
+            _ => false,
+        }
+    }
+
+    /// A static `rows` x `cols` window of an unbatched matrix at runtime offsets.
+    fn matrix_window(
+        &mut self,
+        matrix: &Value,
+        row: &Value,
+        col: &Value,
+        rows: u64,
+        cols: u64,
+    ) -> Value {
+        let ty = matrix.ty.render(self.dtype, matrix.elem);
+        let index_ty = row.ty.render(self.dtype, row.elem);
+        let window = MlirTy::Ranked(vec![Some(rows), Some(cols)]);
+        let window_ty = window.render(self.dtype, matrix.elem);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_slice {}, {}, {}, sizes = [{rows}, {cols}] : ({ty}, {index_ty}, {index_ty}) -> {window_ty}",
+            matrix.ssa, row.ssa, col.ssa,
+        ));
+        Value {
+            ssa,
+            ty: window,
+            elem: matrix.elem,
+        }
+    }
+
+    /// Write `update` into an unbatched matrix at runtime offsets.
+    fn matrix_write(&mut self, matrix: &Value, update: &Value, row: &Value, col: &Value) -> Value {
+        let ty = matrix.ty.render(self.dtype, matrix.elem);
+        let update_ty = update.ty.render(self.dtype, update.elem);
+        let index_ty = row.ty.render(self.dtype, row.elem);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_update_slice {}, {}, {}, {} : ({ty}, {update_ty}, {index_ty}, {index_ty}) -> {ty}",
+            matrix.ssa, update.ssa, row.ssa, col.ssa,
+        ));
+        let result = Value {
+            ssa,
+            ..matrix.clone()
+        };
+        self.axes_view(&result, self.axes_of(matrix))
+    }
+
+    /// Entry `index` of a static rank-1 integer table.
+    fn table_entry(&mut self, table: &Value, index: &Value) -> Value {
+        let ty = table.ty.render(self.dtype, table.elem);
+        let index_ty = index.ty.render(self.dtype, index.elem);
+        let one = MlirTy::Ranked(vec![Some(1)]);
+        let one_ty = one.render(self.dtype, table.elem);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_slice {}, {}, sizes = [1] : ({ty}, {index_ty}) -> {one_ty}",
+            table.ssa, index.ssa,
+        ));
+        let entry = Value {
+            ssa,
+            ty: one,
+            elem: table.elem,
+        };
+        self.reshape(&entry, MlirTy::Scalar)
+    }
+
+    /// Cyclic Jacobi for an unbatched real symmetric matrix: the same pairs,
+    /// order and rotations as the general loop, visiting only `p < q` and
+    /// updating only columns and rows `p` and `q`, so each pair costs O(n)
+    /// instead of O(n^2). Returns the real and imaginary parts of the rotated
+    /// matrix and, when requested, of the vectors.
+    fn symmetric_jacobi(
+        &mut self,
+        n: u64,
+        a: Value,
+        vectors: Option<Value>,
+        epsilon: f64,
+    ) -> Vec<Value> {
+        let pairs: Vec<(i64, i64)> = (0..n as i64)
+            .flat_map(|p| (p + 1..n as i64).map(move |q| (p, q)))
+            .collect();
+        let has_vectors = vectors.is_some();
+        let mut initial = vec![a];
+        initial.extend(vectors);
+        let result = if pairs.is_empty() {
+            initial
+        } else {
+            let table = |e: &mut Self, values: Vec<i64>| {
+                let ty = MlirTy::Ranked(vec![Some(values.len() as u64)]);
+                let text = values
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let rendered = ty.render(e.dtype, ElemKind::Int);
+                let ssa = e.pure(format!("stablehlo.constant dense<[{text}]> : {rendered}"));
+                Value {
+                    ssa,
+                    ty,
+                    elem: ElemKind::Int,
+                }
+            };
+            let ps = table(self, pairs.iter().map(|pair| pair.0).collect());
+            let qs = table(self, pairs.iter().map(|pair| pair.1).collect());
+            let count = pairs.len() as u64;
+            self.matrix_loop(32, 0, &initial, |e, _, state| {
+                e.matrix_loop(count, 0, state, |e, k, state| {
+                    let a = state[0].clone();
+                    let p = e.table_entry(&ps, k);
+                    let q = e.table_entry(&qs, k);
+                    let origin = e.int_value_const(0);
+                    let entry = |e: &mut Self, row: &Value, col: &Value| {
+                        let window = e.matrix_window(&a, row, col, 1, 1);
+                        e.reshape(&window, MlirTy::Scalar)
+                    };
+                    let alpha = entry(e, &p, &p);
+                    let beta = entry(e, &q, &q);
+                    let gamma = entry(e, &p, &q);
+                    let zero = e.scalar(0.0);
+                    let one = e.scalar(1.0);
+                    let gamma_scale = e.abs(&gamma);
+                    let nonzero = e.compare("GT", &gamma_scale, &zero);
+                    let safe = e.select(&nonzero, &gamma_scale, &one);
+                    let gr = e.div(&gamma, &safe);
+                    let norm2 = e.mul(&gr, &gr);
+                    let absolute = e.svd_safe_sqrt(&norm2);
+                    let absolute = e.mul(&absolute, &gamma_scale);
+                    let eps = e.scalar(epsilon);
+                    let active = e.compare("GT", &absolute, &eps);
+                    let safe_gamma = e.select(&active, &absolute, &one);
+                    let difference = e.sub(&beta, &alpha);
+                    let two = e.scalar(2.0);
+                    let twice_gamma = e.mul(&two, &safe_gamma);
+                    let magnitude = e.abs(&difference);
+                    let rotation_scale = e.max(&magnitude, &twice_gamma);
+                    let d = e.div(&magnitude, &rotation_scale);
+                    let g = e.div(&twice_gamma, &rotation_scale);
+                    let d2 = e.mul(&d, &d);
+                    let g2 = e.mul(&g, &g);
+                    let radius = e.add(&d2, &g2);
+                    let radius = e.sqrt(&radius);
+                    let denominator = e.add(&d, &radius);
+                    let tangent = e.div(&g, &denominator);
+                    let negative = e.compare("LT", &difference, &zero);
+                    let minus_tangent = e.neg(&tangent);
+                    let tangent = e.select(&negative, &minus_tangent, &tangent);
+                    let tangent = e.select(&active, &tangent, &zero);
+                    let t2 = e.mul(&tangent, &tangent);
+                    let norm = e.add(&one, &t2);
+                    let norm = e.sqrt(&norm);
+                    let cosine = e.div(&one, &norm);
+                    let sine = e.mul(&cosine, &tangent);
+                    let phase = e.div(&gamma, &safe_gamma);
+                    let w = e.mul(&sine, &phase);
+                    // p' = c p - w q; q' = w p + c q, as the general rotation with real phase.
+                    let rotate = |e: &mut Self, x: &Value, y: &Value| {
+                        let cx = e.mul(&cosine, x);
+                        let wy = e.mul(&w, y);
+                        let wx = e.mul(&w, x);
+                        let cy = e.mul(&cosine, y);
+                        (e.sub(&cx, &wy), e.add(&wx, &cy))
+                    };
+                    let columns = |e: &mut Self, m: &Value| {
+                        let cp = e.matrix_window(m, &origin, &p, n, 1);
+                        let cq = e.matrix_window(m, &origin, &q, n, 1);
+                        let (np, nq) = rotate(e, &cp, &cq);
+                        let m = e.matrix_write(m, &np, &origin, &p);
+                        e.matrix_write(&m, &nq, &origin, &q)
+                    };
+                    // A' = G^T (A G): columns first, then rows of the result.
+                    let a = columns(e, &a);
+                    let rp = e.matrix_window(&a, &p, &origin, 1, n);
+                    let rq = e.matrix_window(&a, &q, &origin, 1, n);
+                    let (np, nq) = rotate(e, &rp, &rq);
+                    let a = e.matrix_write(&a, &np, &p, &origin);
+                    let a = e.matrix_write(&a, &nq, &q, &origin);
+                    let mut next = vec![a];
+                    if has_vectors {
+                        next.push(columns(e, &state[1]));
+                    }
+                    next
+                })
+            })
+        };
+        let mut result = result.into_iter();
+        let a = result.next().unwrap();
+        let zero = self.constant_like(0.0, &a);
+        let mut out = vec![a, zero];
+        if has_vectors {
+            let v = result.next().unwrap();
+            let zero = self.constant_like(0.0, &v);
+            out.extend([v, zero]);
+        }
+        out
     }
 
     pub(super) fn matrix_hermitian(
@@ -139,82 +344,89 @@ impl Emitter<'_> {
         let im = self.add(&scaled.1, &adjoint.1);
         let re = self.mul(&half, &re);
         let im = self.mul(&half, &im);
+        let real = batch == 0 && self.known_zero(&input.1);
         let mut initial = vec![re, im];
         if vectors {
             initial.extend([identity.clone(), zero_matrix]);
         }
-        let result = self.matrix_loop(32, 0, &initial, |e, _, state| {
-            e.matrix_loop(n * n, 0, state, |e, index, state| {
-                let state: Vec<_> = state.iter().map(|v| e.axes_view(v, axes.clone())).collect();
-                let size = e.int_value_const(n as i64);
-                let p = e.trunc_div(index, &size);
-                let q = e.rem(index, &size);
-                let a = (state[0].clone(), state[1].clone());
-                let alpha = e.hermitian_entry(&a.0, &p, &p);
-                let beta = e.hermitian_entry(&a.0, &q, &q);
-                let gamma = (
-                    e.hermitian_entry(&a.0, &p, &q),
-                    e.hermitian_entry(&a.1, &p, &q),
-                );
-                let gr = e.abs(&gamma.0);
-                let gi = e.abs(&gamma.1);
-                let gamma_scale = e.max(&gr, &gi);
-                let nonzero = e.compare("GT", &gamma_scale, &zero);
-                let safe = e.select(&nonzero, &gamma_scale, &one);
-                let gr = e.div(&gamma.0, &safe);
-                let gi = e.div(&gamma.1, &safe);
-                let gr2 = e.mul(&gr, &gr);
-                let gi2 = e.mul(&gi, &gi);
-                let norm2 = e.add(&gr2, &gi2);
-                let absolute = e.svd_safe_sqrt(&norm2);
-                let absolute = e.mul(&absolute, &gamma_scale);
-                let eps = e.scalar(epsilon);
-                let correlated = e.compare("GT", &absolute, &eps);
-                let ordered = e.compare("LT", &p, &q);
-                let active = e.and(&ordered, &correlated);
-                let safe_gamma = e.select(&active, &absolute, &one);
-                let difference = e.sub(&beta, &alpha);
-                let two = e.scalar(2.0);
-                let twice_gamma = e.mul(&two, &safe_gamma);
-                let magnitude = e.abs(&difference);
-                let rotation_scale = e.max(&magnitude, &twice_gamma);
-                let d = e.div(&magnitude, &rotation_scale);
-                let g = e.div(&twice_gamma, &rotation_scale);
-                let d2 = e.mul(&d, &d);
-                let g2 = e.mul(&g, &g);
-                let radius = e.add(&d2, &g2);
-                let radius = e.sqrt(&radius);
-                let denominator = e.add(&d, &radius);
-                let tangent = e.div(&g, &denominator);
-                let negative = e.compare("LT", &difference, &zero);
-                let minus_tangent = e.neg(&tangent);
-                let tangent = e.select(&negative, &minus_tangent, &tangent);
-                let tangent = e.select(&active, &tangent, &zero);
-                let t2 = e.mul(&tangent, &tangent);
-                let norm = e.add(&one, &t2);
-                let norm = e.sqrt(&norm);
-                let cosine = e.div(&one, &norm);
-                let sine = e.mul(&cosine, &tangent);
-                let phase = (e.div(&gamma.0, &safe_gamma), e.div(&gamma.1, &safe_gamma));
-                let right = e.svd_rotate(&a, &p, &q, &cosine, &sine, &phase);
-                let adjoint = e.hermitian_adjoint(&right);
-                let both = e.svd_rotate(&adjoint, &p, &q, &cosine, &sine, &phase);
-                let both = e.hermitian_adjoint(&both);
-                let mut next = vec![both.0, both.1];
-                if vectors {
-                    let v = e.svd_rotate(
-                        &(state[2].clone(), state[3].clone()),
-                        &p,
-                        &q,
-                        &cosine,
-                        &sine,
-                        &phase,
+        let result = if real {
+            let vectors = vectors.then(|| initial[2].clone());
+            self.symmetric_jacobi(n, initial[0].clone(), vectors, epsilon)
+        } else {
+            self.matrix_loop(32, 0, &initial, |e, _, state| {
+                e.matrix_loop(n * n, 0, state, |e, index, state| {
+                    let state: Vec<_> =
+                        state.iter().map(|v| e.axes_view(v, axes.clone())).collect();
+                    let size = e.int_value_const(n as i64);
+                    let p = e.trunc_div(index, &size);
+                    let q = e.rem(index, &size);
+                    let a = (state[0].clone(), state[1].clone());
+                    let alpha = e.hermitian_entry(&a.0, &p, &p);
+                    let beta = e.hermitian_entry(&a.0, &q, &q);
+                    let gamma = (
+                        e.hermitian_entry(&a.0, &p, &q),
+                        e.hermitian_entry(&a.1, &p, &q),
                     );
-                    next.extend([v.0, v.1]);
-                }
-                next
+                    let gr = e.abs(&gamma.0);
+                    let gi = e.abs(&gamma.1);
+                    let gamma_scale = e.max(&gr, &gi);
+                    let nonzero = e.compare("GT", &gamma_scale, &zero);
+                    let safe = e.select(&nonzero, &gamma_scale, &one);
+                    let gr = e.div(&gamma.0, &safe);
+                    let gi = e.div(&gamma.1, &safe);
+                    let gr2 = e.mul(&gr, &gr);
+                    let gi2 = e.mul(&gi, &gi);
+                    let norm2 = e.add(&gr2, &gi2);
+                    let absolute = e.svd_safe_sqrt(&norm2);
+                    let absolute = e.mul(&absolute, &gamma_scale);
+                    let eps = e.scalar(epsilon);
+                    let correlated = e.compare("GT", &absolute, &eps);
+                    let ordered = e.compare("LT", &p, &q);
+                    let active = e.and(&ordered, &correlated);
+                    let safe_gamma = e.select(&active, &absolute, &one);
+                    let difference = e.sub(&beta, &alpha);
+                    let two = e.scalar(2.0);
+                    let twice_gamma = e.mul(&two, &safe_gamma);
+                    let magnitude = e.abs(&difference);
+                    let rotation_scale = e.max(&magnitude, &twice_gamma);
+                    let d = e.div(&magnitude, &rotation_scale);
+                    let g = e.div(&twice_gamma, &rotation_scale);
+                    let d2 = e.mul(&d, &d);
+                    let g2 = e.mul(&g, &g);
+                    let radius = e.add(&d2, &g2);
+                    let radius = e.sqrt(&radius);
+                    let denominator = e.add(&d, &radius);
+                    let tangent = e.div(&g, &denominator);
+                    let negative = e.compare("LT", &difference, &zero);
+                    let minus_tangent = e.neg(&tangent);
+                    let tangent = e.select(&negative, &minus_tangent, &tangent);
+                    let tangent = e.select(&active, &tangent, &zero);
+                    let t2 = e.mul(&tangent, &tangent);
+                    let norm = e.add(&one, &t2);
+                    let norm = e.sqrt(&norm);
+                    let cosine = e.div(&one, &norm);
+                    let sine = e.mul(&cosine, &tangent);
+                    let phase = (e.div(&gamma.0, &safe_gamma), e.div(&gamma.1, &safe_gamma));
+                    let right = e.svd_rotate(&a, &p, &q, &cosine, &sine, &phase);
+                    let adjoint = e.hermitian_adjoint(&right);
+                    let both = e.svd_rotate(&adjoint, &p, &q, &cosine, &sine, &phase);
+                    let both = e.hermitian_adjoint(&both);
+                    let mut next = vec![both.0, both.1];
+                    if vectors {
+                        let v = e.svd_rotate(
+                            &(state[2].clone(), state[3].clone()),
+                            &p,
+                            &q,
+                            &cosine,
+                            &sine,
+                            &phase,
+                        );
+                        next.extend([v.0, v.1]);
+                    }
+                    next
+                })
             })
-        });
+        };
         let state: Vec<_> = result
             .iter()
             .map(|v| self.axes_view(v, axes.clone()))
