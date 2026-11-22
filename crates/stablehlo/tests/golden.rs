@@ -2231,7 +2231,10 @@ fn lower_in_corrcholesky_checks_triangle_diagonal_and_row_norms() {
 #[test]
 fn lower_in_corrcholesky_refuses_mismatched_points() {
     let err = lower_in_corrcholesky(2, 3, 3).unwrap_err();
-    assert!(err.contains("corrcholesky(2)") && err.contains("3x3"), "{err}");
+    assert!(
+        err.contains("corrcholesky(2)") && err.contains("3x3"),
+        "{err}"
+    );
     let err = lower_in_corrcholesky(2, 2, 3).unwrap_err();
     assert!(err.contains("2x3") && err.contains("not square"), "{err}");
 

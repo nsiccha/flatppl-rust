@@ -242,7 +242,10 @@ fn bound_set(module: &Module, source: &Ref) -> (ValueSet, Option<Type>) {
         return (ValueSet::Unknown, None);
     };
     (
-        module.valueset_of(rhs).cloned().unwrap_or(ValueSet::Unknown),
+        module
+            .valueset_of(rhs)
+            .cloned()
+            .unwrap_or(ValueSet::Unknown),
         module.type_of(rhs).cloned(),
     )
 }

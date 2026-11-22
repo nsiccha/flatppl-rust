@@ -128,11 +128,23 @@ fn powers_of_array_sets_chart_each_element() -> Result<(), Box<dyn std::error::E
     )?;
     assert_eq!(
         shapes(&free),
-        [json!([2]), json!([3, 2]), json!([3]), json!([3]), json!([3, 4])]
+        [
+            json!([2]),
+            json!([3, 2]),
+            json!([3]),
+            json!([3]),
+            json!([3, 4])
+        ]
     );
     assert_eq!(
         shapes(&input),
-        [json!([3]), json!([3, 3]), json!([3]), json!([3]), json!([3, 4])]
+        [
+            json!([3]),
+            json!([3, 3]),
+            json!([3]),
+            json!([3]),
+            json!([3, 4])
+        ]
     );
     // The array of vectors is its own chart: free and constrained types agree.
     assert_eq!(free["fields"][4], input["fields"][4]);

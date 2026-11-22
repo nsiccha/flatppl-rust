@@ -259,11 +259,7 @@ fn fixed_correlation_cholesky_factors_allow_roundoff_in_row_norms()
         matrix([0.5, 0.0, 0.0, 0.6, 0.8, 0.0, 0.3, 0.4, last]),
         matrix([f64::NAN, 0.0, 0.0, 0.6, 0.8, 0.0, 0.3, 0.4, last]),
     ] {
-        assert!(
-            context
-                .set(&module, &[("x".into(), invalid)])
-                .is_err()
-        );
+        assert!(context.set(&module, &[("x".into(), invalid)]).is_err());
     }
     // The same value under the unconstrained matrix domain is accepted too.
     let reals = context.parse("x = external(cartpow(reals, [3, 3]))", None, None)?;

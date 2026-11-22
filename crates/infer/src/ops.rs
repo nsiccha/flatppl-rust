@@ -11040,9 +11040,7 @@ pub(crate) fn call_valueset(
         // §03): its value-set is the set it denotes. (Its TYPE is `%any` — a set
         // is not a value type — set in the `cartprod`/`interval`/… type arms.)
         "interval" | "stdsimplex" | "ordered" | "zerosum" | "corrcholesky" | "cartpow"
-        | "cartprod" => {
-            set_call_valueset(inf, call)
-        }
+        | "cartprod" => set_call_valueset(inf, call),
         // Parameters / loaded sets.
         "elementof" | "external" => set_expr_valueset(inf, args.first().map(|a| a.0)),
         "ksuperpose" => args
