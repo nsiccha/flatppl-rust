@@ -827,11 +827,12 @@ impl<'m> Emitter<'m> {
     /// `exp(-z)` and is zero from `z` ≈ 17 in f32 and ≈ 37 in f64, so
     /// `log(1 - p)` is `-inf` with a NaN derivative.
     ///
-    /// The logistic commutes with reshapes, slices and transposes, which are
-    /// replayed on `z`. A select whose other branch is a fixed probability `k`
-    /// in (0, 1), such as a likelihood summary's stand-in 0.5 for an empty
-    /// group, selects `logit(k)` instead. Anything else is `None`, and the
-    /// density scores `p` itself.
+    /// The logistic commutes with reshapes, slices, transposes and static cell
+    /// selections, which are replayed on `z`. Stacked group probabilities
+    /// select their cells this way. A select whose other branch is a fixed
+    /// probability `k` in (0, 1), such as a likelihood summary's stand-in 0.5
+    /// for an empty group, selects `logit(k)` instead. Anything else is
+    /// `None`, and the density scores `p` itself.
     pub(crate) fn invlogit_operand(&mut self, p: &Value) -> Option<Value> {
         match self.pointwise.get(&p.ssa)?.op.clone() {
             Pointwise::Unary(op, z) if op == "stablehlo.logistic" => Some(z),
@@ -843,6 +844,18 @@ impl<'m> Emitter<'m> {
             Pointwise::Slice(a, starts, limits, strides) => {
                 let z = self.invlogit_operand(&a)?;
                 Some(self.slice(&z, &starts, &limits, &strides))
+            }
+            // A selection along a batch axis is not a cell gather; leave it.
+            Pointwise::Gather(a, axis, indices) => {
+                let cell_axis = axis.checked_sub(self.batch_rank(&a))?;
+                let z = self.invlogit_operand(&a)?;
+                let cells = indices
+                    .iter()
+                    .map(|&i| i64::try_from(i).ok().map(Scalar::Int))
+                    .collect::<Option<Vec<_>>>()?;
+                let ty = MlirTy::Ranked(vec![Some(cells.len() as u64)]);
+                let idx = self.folded_constant(cells, ty, Axes::default())?;
+                Some(self.gather_axis(&z, &idx, 0, cell_axis))
             }
             Pointwise::Transpose(a, perm) => {
                 let z = self.invlogit_operand(&a)?;
