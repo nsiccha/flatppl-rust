@@ -123,6 +123,77 @@ fn record_parameter_branch_and_two_input_callback_lower() {
     }
 }
 
+/// The operands of the IR line that defines `name`.
+fn definition<'a>(ir: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{name} = ");
+    ir.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no definition of {name}"))
+}
+
+/// The IR lines other than its definition that read `name`.
+fn uses<'a>(ir: &'a str, name: &str) -> Vec<&'a str> {
+    let prefix = format!("{name} = ");
+    ir.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with(&prefix))
+        .filter(|line| {
+            line.split(|c: char| !(c == '%' || c == '_' || c.is_ascii_alphanumeric()))
+                .any(|token| token == name)
+        })
+        .collect()
+}
+
+fn defined_name(line: &str) -> &str {
+    line.split(" = ").next().unwrap()
+}
+
+/// The step-size controller reads the error norm only as
+/// `floor(err * 2^64) / 2^64`: the same value without a derivative, so step
+/// sizes are not differentiated.
+#[test]
+fn step_size_controller_reads_the_error_norm_without_its_derivative() {
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let ir = emit(LOTKA_VOLTERRA, Target::Cpu, dtype).expect("emit odesolve");
+        let norms = ir
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("applies stablehlo.maximum"))
+            .collect::<Vec<_>>();
+        assert_eq!(norms.len(), 1, "{ir}");
+        let norm = defined_name(norms[0]);
+        let [scaled] = uses(&ir, norm)[..] else {
+            panic!("the error norm {norm} must have one use: {ir}");
+        };
+        assert!(scaled.contains("stablehlo.multiply"), "{scaled}");
+        let scale = scaled
+            .split([',', ' '])
+            .find(|token| {
+                token.starts_with('%') && *token != norm && *token != defined_name(scaled)
+            })
+            .unwrap();
+        assert!(
+            definition(&ir, scale).contains("dense<18446744073709552000.0>"),
+            "{}",
+            definition(&ir, scale)
+        );
+        let [whole] = uses(&ir, defined_name(scaled))[..] else {
+            panic!("{ir}");
+        };
+        assert!(whole.contains("stablehlo.floor"), "{whole}");
+        let [frozen] = uses(&ir, defined_name(whole))[..] else {
+            panic!("{ir}");
+        };
+        assert!(
+            frozen.contains("stablehlo.divide") && frozen.contains(scale),
+            "{frozen}"
+        );
+        // The controller (accept test, shrink and growth factors) reads it.
+        assert!(uses(&ir, defined_name(frozen)).len() >= 3, "{ir}");
+    }
+}
+
 #[test]
 fn unknown_keyword_and_non_vector_state_are_refused() {
     let unknown = LOTKA_VOLTERRA.replace("max_steps = 500", "method = 1");

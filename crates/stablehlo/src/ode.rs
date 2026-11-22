@@ -28,6 +28,19 @@
 //! One difference remains: Boost accepts a step whose error estimate is NaN,
 //! this lowering rejects it; either way the solution becomes NaN.
 //!
+//! Derivatives treat the step sizes as fixed. The step-size controller reads
+//! the error norm only through [`Emitter::without_derivative`], so the step
+//! sizes, step times and accept/reject decisions carry no derivative, and
+//! differentiating the solution integrates its forward sensitivities with the
+//! Dormand–Prince stages of the steps the value took. Stan does not
+//! differentiate its step sizes either. Differentiating through the controller
+//! instead adds the derivative of each step size with respect to the
+//! parameters, a term the ODE's solution does not have: on Lotka–Volterra at
+//! rtol 1e-5, atol 1e-3 it put the gradient up to 44% from the exact one, and
+//! at a steady state, where the error estimate is exactly zero, reverse mode
+//! returned NaN. Unlike Stan, the sensitivities are not part of the error
+//! estimate, so their accuracy follows from the steps the value needs.
+//!
 //! One `stablehlo.while` of steps per output time is nested in a counted loop
 //! over `ts`. The step loop's trip count depends on the inputs, so it is not a
 //! counted loop. Enzyme-JAX's reverse mode refuses it today ("WhileOp does not
@@ -516,6 +529,7 @@ impl Emitter<'_> {
                 let ratio = e.div(&error, &scale);
                 let (ratio, _) = e.broadcast_pair(&ratio, y);
                 let err = e.reduce_max(&ratio);
+                let err = e.without_derivative(&err);
                 let one = e.scalar(1.0);
                 let accept = e.compare("LE", &err, &one);
                 let shrink = {
@@ -567,6 +581,26 @@ impl Emitter<'_> {
             },
         )?;
         Ok(Step::from_values(&results[..Step::LEN]))
+    }
+
+    /// The step-size controller's view of the error norm `err`: the same value,
+    /// with no derivative. StableHLO has no stop-gradient operation (JAX
+    /// removes `stop_gradient` before lowering), so the value is rebuilt from
+    /// `floor`, whose derivative is zero in every AD system:
+    /// `floor(err * 2^64) / 2^64`.
+    ///
+    /// The controller cannot tell the result from `err`. For `err >= 2^-12`,
+    /// `err * 2^64 >= 2^52` is a whole number, so `floor` keeps it and both
+    /// scalings by a power of two are exact. Below `2^-12` the result is in
+    /// `[0, err]`, so it stays below the growth floor `5^-5` and both
+    /// thresholds, as `err` does. Where `err * 2^64` overflows, the result is
+    /// infinite: such a step is rejected with the smallest shrink factor
+    /// either way. Zero and NaN are kept.
+    fn without_derivative(&mut self, err: &Value) -> Value {
+        let scale = self.scalar(2f64.powi(64));
+        let scaled = self.mul(err, &scale);
+        let whole = self.floor(&scaled);
+        self.div(&whole, &scale)
     }
 }
 
