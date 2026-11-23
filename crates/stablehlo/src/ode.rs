@@ -16,7 +16,12 @@
 //! - error `max_i |err_i| / (atol + rtol (|y_i| + |h| |f_i|))` (infinity norm,
 //!   `default_error_checker` with `a_x = a_dxdt = 1`); a step is rejected when
 //!   it exceeds 1 and `h` shrinks by `max(0.9 err^(-1/3), 0.2)`; an accepted
-//!   step with `err < 0.5` grows `h` by `0.9 max(err, 5^-5)^(-1/5)`;
+//!   step with `err < 0.5` grows `h` by `0.9 max(err, 5^-5)^(-1/5)`. Both
+//!   factors are computed on every step and one is selected, so the shrink
+//!   factor reads `max(err, 1)`, which is `err` wherever a step is rejected:
+//!   at a zero error estimate (a steady state) the unclamped `err^(-1/3)` is
+//!   infinite, and reverse mode would turn the unselected branch's zero
+//!   cotangent into NaN;
 //! - stages, solution and interpolant are summed in Boost's order,
 //!   `y + (h a_1) k_1 + (h a_2) k_2 + ...`;
 //! - `max_steps` bounds the accepted steps between consecutive output times
@@ -532,9 +537,13 @@ impl Emitter<'_> {
                 let err = e.without_derivative(&err);
                 let one = e.scalar(1.0);
                 let accept = e.compare("LE", &err, &one);
+                // A rejected step has `err > 1`, where `max(err, 1)` is `err`;
+                // the clamp keeps the factor finite when it is not selected
+                // (a zero error estimate; see the module docs).
                 let shrink = {
+                    let x = e.max(&err, &one);
                     let p = e.scalar(-1.0 / 3.0);
-                    let f = e.pow(&err, &p);
+                    let f = e.pow(&x, &p);
                     let nine = e.scalar(0.9);
                     let f = e.mul(&nine, &f);
                     let floor = e.scalar(0.2);
