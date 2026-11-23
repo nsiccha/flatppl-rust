@@ -7,11 +7,23 @@ use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, Scalar, ScalarType, Type, ValueSet,
 };
 
+/// Fixed observations in either literal spelling.
+enum Observed {
+    Nodes(Vec<NodeId>),
+    Packed(flatppl_core::Packed),
+}
+
 // A small selector evaluator. It never follows a promoted query input's RHS.
 pub(super) fn fixed_indices(m: &Module, id: NodeId, r: &Reducer) -> Option<Vec<i64>> {
     let id = resolve(m, id, &r.boundary);
     if let Node::Lit(Scalar::Int(i)) = m.node(id) {
         return Some(vec![*i]);
+    }
+    if let Node::Packed(p) = m.node(id) {
+        return match p {
+            flatppl_core::Packed::Int(v) => Some(v.to_vec()),
+            _ => None,
+        };
     }
     if let Some(c) = call(m, id, "vector") {
         return c
@@ -373,7 +385,10 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
         return None;
     }
     let root = resolve(m, f.observed, &r.boundary);
-    let literal = call(m, root, "vector").map(|c| c.args.to_vec());
+    let literal = match m.node(root) {
+        Node::Packed(p) => Some(Observed::Packed(p.clone())),
+        _ => call(m, root, "vector").map(|c| Observed::Nodes(c.args.to_vec())),
+    };
     r.fallback = "parameters need shared scalars or fixed, in-range gather selectors";
     let parameters = f
         .parameters
@@ -449,15 +464,23 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
                         array, elem, set, ..
                     } => {
                         let index = key.next()?;
-                        if let Some(c) = call(
-                            &candidate,
-                            resolve(&candidate, *array, &reducer.boundary),
-                            "vector",
-                        ) {
+                        let resolved = resolve(&candidate, *array, &reducer.boundary);
+                        if let Some(c) = call(&candidate, resolved, "vector") {
                             let value = c.args[usize::try_from(index - 1).ok()?];
                             if candidate.type_of(value) == Some(elem) {
                                 return Some((*name, value));
                             }
+                        }
+                        // The packed spelling's element, typed as its literal would be.
+                        if let Node::Packed(p) = candidate.node(resolved)
+                            && let Some(value) = p.get(usize::try_from(index - 1).ok()?)
+                            && Type::Scalar(p.scalar_type()) == *elem
+                        {
+                            let set = ValueSet::of_literal(&value);
+                            let value = candidate.alloc(Node::Lit(value));
+                            candidate.set_type(value, elem.clone());
+                            candidate.set_valueset(value, set);
+                            return Some((*name, value));
                         }
                         let value = materialize(
                             &mut candidate,
@@ -471,7 +494,20 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
                 Some((*name, value))
             })
             .collect::<Option<Vec<_>>>()?;
-        let observed = if let Some(items) = &literal {
+        let observed = if let Some(Observed::Packed(p)) = &literal {
+            // Select the group's cells into a new buffer, promoted to the
+            // observed element type as `real(cell)` would be.
+            let real = matches!(elem.as_ref(), Type::Scalar(ScalarType::Real));
+            let selected = positions
+                .iter()
+                .map(|&i| match p.get(i)? {
+                    Scalar::Int(n) if real => Some(Scalar::Real(n as f64)),
+                    Scalar::Bool(b) if real => Some(Scalar::Real(f64::from(u8::from(b)))),
+                    value => Some(value),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            candidate.alloc_literals(&selected)?
+        } else if let Some(Observed::Nodes(items)) = &literal {
             let items = positions
                 .iter()
                 .map(|&i| {
@@ -558,7 +594,7 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
         .into_iter()
         .map(|term| materialize(&mut candidate, term))
         .collect::<Vec<_>>();
-    let result = flatppl_core::graph::fold_add(&mut candidate, &terms);
+    let result = super::vectorize::sum_terms(&mut candidate, &terms);
     *m = candidate;
     *r = reducer;
     r.rule = Some(("grouped scalar summaries", Some(partition)));

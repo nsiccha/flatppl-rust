@@ -4926,8 +4926,11 @@ fn set_element_kind(set: &ValueSet) -> Option<VariateKind> {
         | Booleans | Complexes | Interval(..) => Some(VariateKind::Scalar),
         // §03: a positional `cartprod`'s members are `cat`s of one element per
         // component — "a set of arrays, not a set of tuples"; `stdsimplex(n)`,
-        // `ordered(n)` and `zerosum(n)` are sets of n-vectors.
-        CartProd(_) | StdSimplex(_) | Ordered(_) | ZeroSum(_) => Some(VariateKind::Vector),
+        // `ordered(n)` and `zerosum(n)` are sets of n-vectors; `corrcholesky(n)`
+        // is a set of n×n matrices, as `cartpow(reals, [n, n])` is.
+        CartProd(_) | StdSimplex(_) | Ordered(_) | ZeroSum(_) | CorrCholesky(_) => {
+            Some(VariateKind::Vector)
+        }
         // §03 keyword form: "produces a set of records".
         RecordSet(_) => Some(VariateKind::Record),
         // §03: "When `S` is a record set, the power is the set of tables" — but
@@ -5801,6 +5804,9 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<GetProjection> {
 /// it is not a non-empty positional vector of integer literals. The index-keyed
 /// counterpart of [`string_literal_vector`].
 fn int_literal_vector(m: &Module, node: NodeId) -> Option<Vec<i64>> {
+    if let Node::Packed(flatppl_core::Packed::Int(v)) = m.node(node) {
+        return Some(v.to_vec());
+    }
     let vec = expect_builtin_call(m, node, "vector")?;
     if !vec.named.is_empty() || vec.args.is_empty() {
         return None;
@@ -7256,7 +7262,9 @@ fn broadcast_bin_masses(
     // Numerical masses need static bin edges. Their batched integral runs the
     // lanes in sequence and was slower than one adaptive loop per bin.
     let mass = bin_mass(m, intensity, lo, hi, None, &mut Vec::new())?;
-    let (lower, upper) = if expect_builtin_call(m, resolved, "vector").is_some() {
+    let written = expect_builtin_call(m, resolved, "vector").is_some()
+        || matches!(m.node(resolved), Node::Packed(_));
+    let (lower, upper) = if written {
         (
             build_call(m, "vector", &edges[..count]),
             build_call(m, "vector", &edges[1..]),
@@ -7339,8 +7347,8 @@ fn intensity_has_atom(m: &Module, measure: NodeId) -> bool {
 /// `get0` of each position of a static-length vector.
 fn bin_edges(m: &mut Module, bins: NodeId) -> Option<Vec<NodeId>> {
     let (resolved, _) = resolve_ref_chain(m, bins);
-    if let Some(c) = expect_builtin_call(m, resolved, "vector") {
-        return Some(c.args.to_vec());
+    if let Some(edges) = m.vector_elements(resolved) {
+        return Some(edges);
     }
     let len = static_array_variate_len(m, bins)?;
     Some(
@@ -7946,14 +7954,18 @@ fn recognize_polynomial_over_interval(
             _ => return None,
         }
         let (coeff_node, _) = resolve_ref_chain(m, p.args[0]);
-        let v = expect_builtin_call(m, coeff_node, "vector")?;
-        if v.args.is_empty()
-            || !v.named.is_empty()
-            || v.args.iter().any(|&c| references_ref(m, c, arg_ref))
-        {
-            return None;
+        if matches!(m.node(coeff_node), Node::Packed(_)) {
+            m.vector_elements(coeff_node)?
+        } else {
+            let v = expect_builtin_call(m, coeff_node, "vector")?;
+            if v.args.is_empty()
+                || !v.named.is_empty()
+                || v.args.iter().any(|&c| references_ref(m, c, arg_ref))
+            {
+                return None;
+            }
+            v.args.to_vec()
         }
-        v.args.to_vec()
     };
 
     Some(PolynomialOverInterval {
@@ -9122,6 +9134,8 @@ pub(crate) fn name_construct(m: &Module, id: NodeId) -> String {
         },
         Node::Hole => "`_`".to_string(),
         Node::Axis(_) => "axis label".to_string(),
+        // Its source spelling is a `vector` literal.
+        Node::Packed(_) => "vector".to_string(),
     }
 }
 

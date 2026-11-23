@@ -181,6 +181,8 @@ fn mass_and_valueset_strictness() {
         "(%module (%bind x (%meta ((%scalar real) %fixed (stdsimplex)) (add 1 2))))",
         "(%module (%bind x (%meta ((%scalar real) %fixed (ordered)) (add 1 2))))",
         "(%module (%bind x (%meta ((%scalar real) %fixed (zerosum 2 3)) (add 1 2))))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed (corrcholesky)) (add 1 2))))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed (corrcholesky 2 2)) (add 1 2))))",
         "(%module (%bind x (%meta ((%scalar real) %fixed (cartpow reals)) (add 1 2))))",
     ];
     for src in cases {
@@ -197,7 +199,9 @@ fn valueset_forms_roundtrip() {
   (%bind c (%meta ((%scalar real) %fixed (cartpow posintegers 4)) (add 1.0 2.0)))
   (%bind d (%meta ((%scalar real) %fixed anything) (add 1.0 2.0)))
   (%bind e (%meta ((%scalar real) %fixed (ordered 3)) (add 1.0 2.0)))
-  (%bind f (%meta ((%scalar real) %fixed (zerosum %dynamic)) (add 1.0 2.0))))"#;
+  (%bind f (%meta ((%scalar real) %fixed (zerosum %dynamic)) (add 1.0 2.0)))
+  (%bind g (%meta ((%scalar real) %fixed (corrcholesky 3)) (add 1.0 2.0)))
+  (%bind h (%meta ((%scalar real) %fixed (corrcholesky %dynamic)) (add 1.0 2.0))))"#;
     let m = read(src).unwrap();
     let out = write(&m);
     for needle in [
@@ -207,6 +211,8 @@ fn valueset_forms_roundtrip() {
         " anything)",
         "(ordered 3)",
         "(zerosum %dynamic)",
+        "(corrcholesky 3)",
+        "(corrcholesky %dynamic)",
     ] {
         assert!(out.contains(needle), "missing {needle} in:\n{out}");
     }

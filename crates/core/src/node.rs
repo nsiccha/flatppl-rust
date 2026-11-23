@@ -30,6 +30,11 @@ pub enum Node {
     Axis(Axis),
     /// A built-in operation or user-callable application.
     Call(Call),
+    /// A literal vector held as one typed buffer: the value of
+    /// `(vector lit_1 … lit_n)` over its elements, with no child nodes. Fixed
+    /// data takes this form; read either spelling through
+    /// [`Module::literals`](crate::Module::literals).
+    Packed(crate::Packed),
 }
 
 /// A primitive scalar literal.

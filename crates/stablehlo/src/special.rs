@@ -636,8 +636,11 @@ impl Emitter<'_> {
                     (data.len() != 1
                         && data.len() / width * selected.len() <= constants::MAX_FOLDED_ELEMENTS)
                         .then(|| {
-                            data.chunks_exact(width)
-                                .flat_map(|row| selected.iter().map(|&i| row[i as usize].clone()))
+                            (0..data.len() / width)
+                                .flat_map(|row| {
+                                    selected.iter().map(move |&i| row * width + i as usize)
+                                })
+                                .map(|i| data.get(i).expect("index within the rows"))
                                 .collect()
                         })
                 });

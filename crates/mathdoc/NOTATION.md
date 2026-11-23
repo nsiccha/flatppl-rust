@@ -149,6 +149,7 @@ the same rules (`.mu` → μ).
 | `stdsimplex(n)` | Δ^{n−1} |
 | `ordered(n)` | ℝⁿ_↑, the strictly increasing real n-vectors |
 | `zerosum(n)` | 𝟏ₙ^⊥, the orthogonal complement of the all-ones n-vector, of dimension n−1 |
+| `corrcholesky(n)` | corrcholesky(n), named as written: the fork-only set of n×n Cholesky factors of correlation matrices has no conventional symbol |
 | `c = fixed(x)` | the row `c = x` would have, "fixed" joined to its annotation; inside a record `fixed(x)` stays in roman |
 
 ## Operators and functions

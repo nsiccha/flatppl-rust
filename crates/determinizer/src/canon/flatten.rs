@@ -45,7 +45,9 @@ pub(crate) fn flatten_structural(m: &mut Module) -> bool {
                 } else {
                     rebuild_with_children(m, id, &replacements)
                 });
-            } else if let Some(replacement) = project(m, id, &promoted) {
+            } else if let Some(replacement) =
+                project(m, id, &promoted).or_else(|| project_packed(m, id))
+            {
                 mapped[id.index()] = Some(replacement);
             } else {
                 pending.push((id, true));
@@ -104,6 +106,29 @@ pub(crate) fn project(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) -> Opt
         }
         _ => None,
     }
+}
+
+/// `get0` of a packed vector at a literal index: the element as a new literal,
+/// as [`project`] gives the element of the `vector` call.
+fn project_packed(m: &mut Module, id: NodeId) -> Option<NodeId> {
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if m.resolve(sym) != "get0" || c.args.len() != 2 {
+        return None;
+    }
+    let (container, idx) = (c.args[0], c.args[1]);
+    let Node::Lit(Scalar::Int(i)) = m.node(idx) else {
+        return None;
+    };
+    if !matches!(m.node(container), Node::Packed(_)) {
+        return None;
+    }
+    let i = usize::try_from(*i).ok()?;
+    m.literal_element(container, i)
 }
 
 /// Resolve a compile-time object tuple without changing canonical RNG tuple

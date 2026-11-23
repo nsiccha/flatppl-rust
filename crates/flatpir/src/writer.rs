@@ -160,6 +160,22 @@ fn render_node(module: &Module, id: NodeId) -> String {
             },
             RenderStep::Node(id) => match module.node(id) {
                 Node::Lit(lit) => out.push_str(&render_scalar(lit)),
+                // The same `vector` call of literals; elements carry no `%meta`.
+                Node::Packed(p) => {
+                    let meta = render_meta(module, id);
+                    if let Some(triple) = &meta {
+                        out.push_str(&format!("(%meta {triple} "));
+                    }
+                    out.push_str("(vector");
+                    for value in p.iter() {
+                        out.push(' ');
+                        out.push_str(&render_scalar(&value));
+                    }
+                    out.push(')');
+                    if meta.is_some() {
+                        out.push(')');
+                    }
+                }
                 Node::Const(sym) => out.push_str(module.resolve(*sym)),
                 Node::Hole => out.push('_'),
                 Node::Ref(r) => out.push_str(&render_ref(module, r)),
@@ -290,8 +306,8 @@ fn render_mass(mass: Mass) -> &'static str {
 }
 
 /// A value set renders as its FlatPPL set expression (bare set constants,
-/// `(stdsimplex n)`, `(ordered n)`, `(zerosum n)`, `(interval lo hi)`,
-/// `(cartpow set n)`, `(cartprod set...)` and the keyword `(cartprod (%field name set)...)`).
+/// `(stdsimplex n)`, `(ordered n)`, `(zerosum n)`, `(corrcholesky n)`,
+/// `(interval lo hi)`, `(cartpow set n)`, `(cartprod set...)` and the keyword `(cartprod (%field name set)...)`).
 fn render_valueset(module: &Module, set: &ValueSet) -> String {
     match set {
         ValueSet::Deferred => "%deferred".to_string(),
@@ -310,6 +326,7 @@ fn render_valueset(module: &Module, set: &ValueSet) -> String {
         ValueSet::StdSimplex(n) => format!("(stdsimplex {})", render_dim(*n)),
         ValueSet::Ordered(n) => format!("(ordered {})", render_dim(*n)),
         ValueSet::ZeroSum(n) => format!("(zerosum {})", render_dim(*n)),
+        ValueSet::CorrCholesky(n) => format!("(corrcholesky {})", render_dim(*n)),
         ValueSet::Interval(lo, hi) => {
             format!("(interval {} {})", render_real(*lo), render_real(*hi))
         }

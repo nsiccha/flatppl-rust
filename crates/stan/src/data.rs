@@ -66,6 +66,12 @@ fn literal_json(m: &Module, id: NodeId, loaded: bool) -> Option<Value> {
         Node::Lit(Scalar::Int(n)) => Some(Value::from(*n)),
         Node::Lit(Scalar::Real(x)) => Some(real(*x)),
         Node::Lit(Scalar::Bool(b)) => Some(Value::from(i64::from(*b))),
+        // As its `vector` call of literals.
+        Node::Packed(p) => Some(Value::Array(match p {
+            flatppl_core::Packed::Int(v) => v.iter().map(|&n| Value::from(n)).collect(),
+            flatppl_core::Packed::Real(v) => v.iter().map(|&x| real(x)).collect(),
+            flatppl_core::Packed::Bool(v) => v.iter().map(|&b| Value::from(i64::from(b))).collect(),
+        })),
         Node::Call(c) => match head(m, id)? {
             // The host installs typed complex cells as `complex(re, im)`.
             // Stan's JSON format puts each component pair at the last axis.

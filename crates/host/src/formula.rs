@@ -380,11 +380,9 @@ fn constants(data: flatppl_formula::DataDocument) -> Vec<(String, Constant)> {
         .map(|(name, value)| {
             let values = match value {
                 DataValue::Integer(value) => return (name, Constant::Integer(value)),
-                DataValue::Real32(values) => {
-                    values.into_iter().map(Constant::Real32).collect::<Vec<_>>()
-                }
-                DataValue::Real64(values) => values.into_iter().map(Constant::Real).collect(),
-                DataValue::Integers(values) => values.into_iter().map(Constant::Integer).collect(),
+                DataValue::Real32(values) => crate::ArrayData::Real32(values.into()),
+                DataValue::Real64(values) => crate::ArrayData::Real(values.into()),
+                DataValue::Integers(values) => crate::ArrayData::Integer(values.into()),
             };
             (
                 name,

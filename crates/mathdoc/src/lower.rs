@@ -1044,6 +1044,17 @@ impl<'m> Lowerer<'m> {
             }
             Node::Axis(axis) => Math::ident(self.m.resolve(axis.name), None),
             Node::Call(call) => self.call(id, call),
+            // As its `vector` call of literals.
+            Node::Packed(p) => Math::paren(
+                p.iter()
+                    .map(|s| match s {
+                        Scalar::Int(i) => Math::int(i),
+                        Scalar::Real(r) => Math::real(r),
+                        Scalar::Bool(b) => Math::text(if b { "true" } else { "false" }),
+                        Scalar::Str(s) => Math::Str(s.to_string()),
+                    })
+                    .collect(),
+            ),
         }
     }
 

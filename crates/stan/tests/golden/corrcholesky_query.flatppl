@@ -1,0 +1,9 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+L ~ LKJCholesky(2, 4.0)
+y ~ Normal(L[2, 1], 1.0)
+prior = lawof(record(L = L))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), L = L), record(y = 0.4)), prior)
+p_L = elementof(corrcholesky(2))
+inputs = p_L
+outputs = logdensityof(post, record(L = p_L))

@@ -153,6 +153,11 @@ pub(super) fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
         }
         Node::Lit(Scalar::Real(x)) => x.is_finite() && (2.0 * *x as f32).is_finite(),
         Node::Lit(Scalar::Int(_)) => true,
+        // Element by element, as its `vector` call of literals.
+        Node::Packed(flatppl_core::Packed::Real(v)) => v
+            .iter()
+            .all(|x| x.is_finite() && (2.0 * *x as f32).is_finite()),
+        Node::Packed(flatppl_core::Packed::Int(_)) => true,
         Node::Call(c) if matches!(c.head, flatppl_core::CallHead::Builtin(h) if matches!(m.resolve(h), "vector" | "rowstack" | "colstack" | "cat" | "fill" | "neg")) => {
             c.args.iter().all(|&child| finite(child))
         }

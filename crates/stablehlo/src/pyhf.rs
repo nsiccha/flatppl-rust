@@ -599,6 +599,14 @@ impl Emitter<'_> {
     }
 
     fn literals(&self, id: NodeId) -> Option<Vec<f64>> {
+        match self.node(self.resolve_ref_one(id)) {
+            Node::Packed(flatppl_core::Packed::Real(v)) => return Some(v.to_vec()),
+            Node::Packed(flatppl_core::Packed::Int(v)) => {
+                return Some(v.iter().map(|&n| n as f64).collect());
+            }
+            Node::Packed(_) => return None,
+            _ => {}
+        }
         self.call_args(id, "vector")?
             .iter()
             .map(|&arg| self.literal(arg))

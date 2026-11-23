@@ -154,7 +154,7 @@ impl Emitter<'_> {
         // A fixed splat is shared even when spelled as a full parameter vector.
         if axes.batch == 0
             && let Some(data) = self.constants.get(&value.ssa)
-            && let Some(first) = data.first()
+            && let Some(first) = data.get(0)
             && data.iter().all(|x| x == first)
         {
             return Ok(Some(match first.clone() {
@@ -236,9 +236,9 @@ impl Emitter<'_> {
         if count as u64 > exact_limit || (data.len() != 1 && data.len() != count) {
             return Ok(None);
         }
-        let real = |x: &Scalar| match x {
-            Scalar::Real(x) => Some(*x),
-            Scalar::Int(x) => Some(*x as f64),
+        let real = |x: Scalar| match x {
+            Scalar::Real(x) => Some(x),
+            Scalar::Int(x) => Some(x as f64),
             _ => None,
         };
         let values = || data.iter();
@@ -288,7 +288,7 @@ impl Emitter<'_> {
         };
         let result = match ctor.as_str() {
             "Normal" => {
-                let center = real(&data[0]).unwrap();
+                let center = real(data.get(0).unwrap()).unwrap();
                 let mut offsets = Sum::default();
                 for x in values() {
                     offsets.add(real(x).unwrap() - center);
@@ -408,7 +408,7 @@ impl Emitter<'_> {
                 let Some(trials) = self
                     .constants
                     .get(&params[0].ssa)
-                    .and_then(|v| v.first())
+                    .and_then(|v| v.get(0))
                     .and_then(real)
                 else {
                     return Ok(None);

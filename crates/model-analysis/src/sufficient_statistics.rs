@@ -35,6 +35,7 @@ mod runtime_partition;
 mod scalar;
 mod sorted;
 mod structural;
+mod vectorize;
 use flatppl_core::graph::{build_call, build_record};
 pub use report::{GroupPartition, ReductionDecision, ReductionOutcome, ReductionReport};
 pub use structural::{IidNormalPlan, plan_iid_normal};
@@ -1464,6 +1465,17 @@ fn weighted_bernoulli(m: &mut Module, p_name: Symbol, p: Expr, count: Expr, succ
 
 fn fixed_values(m: &Module, root: NodeId, boundary: &HashSet<Symbol>) -> Option<Vec<f64>> {
     let id = resolve(m, root, boundary);
+    if let Node::Packed(p) = m.node(id) {
+        return p
+            .iter()
+            .map(|s| match s {
+                Scalar::Real(x) => Some(x),
+                Scalar::Int(x) => Some(x as f64),
+                Scalar::Bool(x) => Some(if x { 1.0 } else { 0.0 }),
+                Scalar::Str(_) => None,
+            })
+            .collect();
+    }
     let c = call(m, id, "vector")?;
     c.args
         .iter()

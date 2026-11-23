@@ -2184,6 +2184,71 @@ fn lower_in_vector_set_refuses_length_mismatch() {
     );
 }
 
+/// Lower `in(L, corrcholesky(n))` for a static `rows`×`cols` point.
+fn lower_in_corrcholesky(n: i64, rows: u64, cols: u64) -> Result<String, String> {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "L");
+    let n = int(&mut m, n);
+    let set = call(&mut m, "corrcholesky", &[n]);
+    let node = call(&mut m, "in", &[v, set]);
+
+    let ty = MlirTy::Ranked(vec![Some(rows), Some(cols)]);
+    let mut e = unrestricted_emitter(&m, Dtype::F64);
+    bind_arg(&mut e, v, "%arg0", ty.clone());
+    let result = e.lower_node(node).map_err(|err| err.msg)?;
+    assert_eq!(result.ty, MlirTy::Scalar, "the gate predicate is scalar");
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), ty, ElemKind::Real)],
+        &[&result],
+    );
+    assert!(is_delimiter_balanced(&out));
+    Ok(out)
+}
+
+/// The fork's `corrcholesky(n)`, LKJCholesky's support: the upper triangle is
+/// masked and compared with zero, the diagonal with `> 0`, and each row's sum
+/// of squares with one, all-reduced to one `i1`.
+#[test]
+fn lower_in_corrcholesky_checks_triangle_diagonal_and_row_norms() {
+    let out = lower_in_corrcholesky(3, 3, 3).unwrap();
+    assert!(out.contains("stablehlo.iota"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare GT"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare EQ"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare LE"), "in:\n{out}");
+    // Row norms: a sum over the last axis of the squared matrix.
+    assert!(out.contains("stablehlo.multiply"), "in:\n{out}");
+    assert!(
+        out.contains("applies stablehlo.add across dimensions = [1]"),
+        "in:\n{out}"
+    );
+    assert!(out.contains("applies stablehlo.and"), "in:\n{out}");
+    assert!(out.contains("-> tensor<i1>"), "in:\n{out}");
+}
+
+/// A literal size that disagrees with the point, and a non-square or
+/// non-matrix point, refuse with the shapes named.
+#[test]
+fn lower_in_corrcholesky_refuses_mismatched_points() {
+    let err = lower_in_corrcholesky(2, 3, 3).unwrap_err();
+    assert!(
+        err.contains("corrcholesky(2)") && err.contains("3x3"),
+        "{err}"
+    );
+    let err = lower_in_corrcholesky(2, 2, 3).unwrap_err();
+    assert!(err.contains("2x3") && err.contains("not square"), "{err}");
+
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "L");
+    let n = int(&mut m, 3);
+    let set = call(&mut m, "corrcholesky", &[n]);
+    let node = call(&mut m, "in", &[v, set]);
+    let mut e = unrestricted_emitter(&m, Dtype::F64);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Ranked(vec![Some(3)]));
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("rank-2"), "{}", err.msg);
+}
+
 /// §07 `gt`/`lt` ($a > b$ / $a < b$) — one `stablehlo.compare` each, in the
 /// matching direction. The open-image gate conjoins them
 /// (`lo < y && y < hi`), so a swapped direction would silently invert the

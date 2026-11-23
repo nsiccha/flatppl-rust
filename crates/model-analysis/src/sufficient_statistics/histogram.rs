@@ -37,7 +37,6 @@ fn has_rank(m: &Module, id: NodeId, rank: usize) -> bool {
 
 pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, f: &Factor) -> Option<Expr> {
     let observed = resolve(m, f.observed, &reducer.boundary);
-    let observations = &call(m, observed, "vector")?.args;
     let Some(Type::Array { elem, .. }) = m.type_of(f.observed).or_else(|| m.type_of(observed))
     else {
         return None;
@@ -46,24 +45,46 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, f: &Factor) -> Optio
         return None;
     };
     let element = *element;
+    // A packed element has no node: it gets a literal once the value is known
+    // to recur, so a large vector never costs a node per element.
+    let observations: Vec<(Scalar, Option<NodeId>)> = match m.node(observed) {
+        Node::Packed(p) => p
+            .iter()
+            .map(|value| match value {
+                Scalar::Real(x) if x.is_nan() => None,
+                value => Some((value, None)),
+            })
+            .collect::<Option<_>>()?,
+        _ => call(m, observed, "vector")?
+            .args
+            .iter()
+            .map(|&point| Some((fixed_scalar(m, point, reducer)?, Some(point))))
+            .collect::<Option<_>>()?,
+    };
     if observations.len() < 2 {
         return None;
     }
-    let mut histogram: Vec<(Scalar, NodeId, usize)> = Vec::new();
-    for point in observations.iter().copied() {
-        let value = fixed_scalar(m, point, reducer)?;
-        if let Some((_, _, count)) = histogram.iter_mut().find(|(x, _, _)| identical(x, &value)) {
+    let mut histogram: Vec<(Scalar, Option<NodeId>, usize)> = Vec::new();
+    for (value, point) in &observations {
+        if let Some((_, _, count)) = histogram.iter_mut().find(|(x, _, _)| identical(x, value)) {
             *count += 1;
         } else {
             if histogram.len() == 64 {
                 return None;
             }
-            histogram.push((value, point, 1));
+            histogram.push((value.clone(), *point, 1));
         }
     }
     if histogram.len() * 2 > observations.len() {
         return None;
     }
+    let histogram: Vec<(Scalar, NodeId, usize)> = histogram
+        .into_iter()
+        .map(|(value, point, count)| {
+            let point = point.unwrap_or_else(|| m.alloc(Node::Lit(value.clone())));
+            (value, point, count)
+        })
+        .collect();
 
     let constructor = m.resolve(f.constructor);
     let names = flatppl_infer::distribution_param_names(constructor)?;

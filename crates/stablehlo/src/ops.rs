@@ -56,7 +56,7 @@
 use flatppl_core::{CallHead, Dim, Node, NodeId, Scalar, Symbol, Type};
 
 use crate::emitter::{Axes, Emitter, IntegralKind, elem_rank};
-use crate::mlir::{ElemKind, MlirTy, Value};
+use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 
 /// Lower one FlatPDL builtin call to a [`Value`]. `id` is the call (or
@@ -2968,6 +2968,32 @@ fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     Ok(e.vector(&elems))
 }
 
+/// A packed literal vector lowers exactly as its `vector` call of literals:
+/// one dense constant, or element by element when an entry has no constant
+/// form at the node's kind.
+pub(crate) fn lower_packed(
+    e: &mut Emitter,
+    id: NodeId,
+    packed: &flatppl_core::Packed,
+) -> Result<Value, EmitError> {
+    if packed.is_empty() {
+        return Err(EmitError::at(id, "vector: expected at least one element"));
+    }
+    let target = e.node_kind(id);
+    if let Some(value) = e.packed_vector(packed, target) {
+        return Ok(value);
+    }
+    let elems: Vec<Value> = packed
+        .iter()
+        .map(|value| e.lower_literal(id, &value))
+        .collect::<Result<_, _>>()?;
+    let elems: Vec<Value> = elems.iter().map(|v| e.convert(v, target)).collect();
+    if let Some(value) = e.contiguous_rows(&elems) {
+        return Ok(value);
+    }
+    Ok(e.vector(&elems))
+}
+
 // ---- get / get0 ---------------------------------------------------------------
 
 fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
@@ -3299,9 +3325,12 @@ fn lower_membership(
     // §03: a record lies in `cartprod(name = S, …)` when each field lies in the set
     // of the same name, so the record needs no tensor form.
     if let Some(sets) = record_set_fields(e, set_id) {
-        let fields = record_fields(e, v_id).ok_or_else(|| {
-            EmitError::at(id, "'in' over a record set needs a written record point")
-        })?;
+        let Some(fields) = record_fields(e, v_id) else {
+            // A record-valued point that is not written out (a record input,
+            // a field of one, a bound record) is tested on its lowered fields.
+            let point = e.lower_value(v_id)?;
+            return record_value_membership(e, id, point, &sets);
+        };
         if fields.len() != sets.len() {
             return Err(EmitError::at(
                 id,
@@ -3328,7 +3357,64 @@ fn lower_membership(
     }
 
     let v = e.lower_node(v_id)?;
+    tensor_membership(e, id, v, set_id)
+}
 
+/// `in` for a lowered record point against the fields of a record set, field
+/// by field and recursively through nested record sets (§03).
+fn record_value_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    point: Lowered,
+    sets: &[(Symbol, NodeId)],
+) -> Result<Value, EmitError> {
+    let Lowered::Record(parts) = point else {
+        return Err(EmitError::at(
+            id,
+            "'in' over a record set needs a record-valued point",
+        ));
+    };
+    if parts.len() != sets.len() {
+        return Err(EmitError::at(
+            id,
+            "'in' over a record set: the point and the set have different fields",
+        ));
+    }
+    let mut members = Vec::with_capacity(sets.len());
+    for &(name, set) in sets {
+        let field = e.resolve(name).to_owned();
+        let Some((_, part)) = parts.iter().find(|(n, _)| *n == field) else {
+            return Err(EmitError::at(
+                id,
+                format!("'in' over a record set: the point has no field `{field}`"),
+            ));
+        };
+        let set = e.resolve_ref_one(set);
+        let member = match (record_set_fields(e, set), part) {
+            (Some(inner), part) => record_value_membership(e, id, part.clone(), &inner)?,
+            (None, Lowered::Tensor(value)) => tensor_membership(e, id, value.clone(), set)?,
+            (None, Lowered::Record(_)) => {
+                return Err(EmitError::at(
+                    id,
+                    format!("'in' over a record set: field `{field}` is a record, its set is not"),
+                ));
+            }
+        };
+        members.push(member);
+    }
+    members
+        .into_iter()
+        .reduce(|a, b| e.and(&a, &b))
+        .ok_or_else(|| EmitError::at(id, "'in' over an empty record set is unsupported"))
+}
+
+/// `in` for a tensor point against a non-record set.
+fn tensor_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v: Value,
+    set_id: NodeId,
+) -> Result<Value, EmitError> {
     if let Node::Call(c) = e.node(set_id)
         && matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "cartprod")
         && c.named.is_empty()
@@ -3385,6 +3471,10 @@ fn lower_membership(
 
     if let Some((set, n_id)) = vector_set_parts(e, set_id) {
         return vector_set_membership(e, id, &v, set, n_id);
+    }
+
+    if let Some(n_id) = corr_cholesky_size(e, set_id) {
+        return corr_cholesky_membership(e, id, &v, n_id);
     }
 
     let set = classify_elem_set(e, id, set_id)?;
@@ -3513,6 +3603,80 @@ fn vector_set_membership(
     }
     let declared_size = e.lower_node(n_id)?;
     let point_size = e.int_value_const(len as i64);
+    let size_matches = e.compare("EQ", &declared_size, &point_size);
+    Ok(e.and(&membership, &size_matches))
+}
+
+/// The size argument of the fork's `corrcholesky(n)`; `None` for any other set.
+fn corr_cholesky_size(e: &Emitter, set_id: NodeId) -> Option<NodeId> {
+    let Node::Call(c) = e.node(set_id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    match &c.args[..] {
+        [n] if e.resolve(sym) == "corrcholesky" && c.named.is_empty() => Some(*n),
+        _ => None,
+    }
+}
+
+/// Membership of an n×n point in `corrcholesky(n)`, the support of §08
+/// LKJCholesky: one `i1` per batch cell, all-reduced over the matrix.
+///
+/// The predicate is LKJCholesky's own support check
+/// ([`crate::registry::corr_cholesky_support`]), so `in`, `Lebesgue(support =
+/// corrcholesky(n))` and the LKJCholesky density agree on every point: an
+/// exactly zero upper triangle, a positive diagonal and unit row norms within
+/// a precision-scaled rounding tolerance. Unlike the affine vector sets, the
+/// unit-norm equality is checked (to that tolerance): the density's diagonal
+/// is read from the point, so a point off the manifold would score as if on it.
+fn corr_cholesky_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v: &Value,
+    n_id: NodeId,
+) -> Result<Value, EmitError> {
+    let n = match e.cell_ty(v) {
+        MlirTy::Ranked(dims) if dims.len() == 2 => match (dims[0], dims[1]) {
+            (Some(rows), Some(cols)) if rows == cols => rows,
+            (Some(rows), Some(cols)) => {
+                return Err(EmitError::at(
+                    id,
+                    format!("'in' over corrcholesky: the point is {rows}x{cols}, not square"),
+                ));
+            }
+            _ => {
+                return Err(EmitError::at(
+                    id,
+                    "'in' over corrcholesky: the point's shape must be static",
+                ));
+            }
+        },
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "'in' over corrcholesky: only a rank-2 (matrix) point is supported, got {other:?}"
+                ),
+            ));
+        }
+    };
+    if let Node::Lit(Scalar::Int(size)) = e.node(n_id)
+        && (*size < 0 || *size as u64 != n)
+    {
+        return Err(EmitError::at(
+            id,
+            format!("'in' over corrcholesky({size}): the point is {n}x{n}"),
+        ));
+    }
+    let coordinates = e.convert(v, ElemKind::Real);
+    let (membership, _) = crate::registry::corr_cholesky_support(e, &coordinates, n);
+    if matches!(e.node(n_id), Node::Lit(Scalar::Int(_))) {
+        return Ok(membership);
+    }
+    let declared_size = e.lower_node(n_id)?;
+    let point_size = e.int_value_const(n as i64);
     let size_matches = e.compare("EQ", &declared_size, &point_size);
     Ok(e.and(&membership, &size_matches))
 }
@@ -3652,7 +3816,7 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
             id,
             "'in': only an interval(lo, hi), reals, complexes, posreals, nonnegreals, unitinterval, \
              integers, posintegers or nonnegintegers set is supported (optionally under one \
-             cartpow), or stdsimplex(n), ordered(n) or zerosum(n)",
+             cartpow), or stdsimplex(n), ordered(n), zerosum(n) or corrcholesky(n)",
         )
     };
     match e.node(set_id) {

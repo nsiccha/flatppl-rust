@@ -4,9 +4,10 @@
 
 use super::*;
 use std::fmt::Write;
-use std::sync::Arc;
 
-pub(super) type Constant = Arc<[Scalar]>;
+/// The remembered elements of a fixed tensor, of one kind. A packed literal
+/// shares its buffer here instead of being copied.
+pub(super) type Constant = flatppl_core::Packed;
 
 // Bound newly materialized fixed tables and remembered index vectors.
 pub(super) const MAX_FOLDED_ELEMENTS: usize = 4096;
@@ -59,7 +60,7 @@ impl Emitter<'_> {
             return None;
         }
         if let Some(data) = self.constants.get(&value.ssa) {
-            return data.get(if data.len() == 1 { 0 } else { index }).cloned();
+            return data.get(if data.len() == 1 { 0 } else { index });
         }
         let at = |input: &Value, coordinates: &[usize]| {
             self.fixed_scalar_at(input, flat_index(&input.ty, coordinates)?)
@@ -224,8 +225,8 @@ impl Emitter<'_> {
         for i in 0..n {
             for j in 0..n {
                 let x = match data.get(if data.len() == 1 { 0 } else { i * n + j })? {
-                    Scalar::Real(x) => *x,
-                    Scalar::Int(x) => *x as f64,
+                    Scalar::Real(x) => x,
+                    Scalar::Int(x) => x as f64,
                     _ => return None,
                 };
                 if i == j {
@@ -254,7 +255,7 @@ impl Emitter<'_> {
             self.constants
                 .get(&value.ssa)?
                 .iter()
-                .all(|value| matches!(value, Scalar::Int(n) if *n >= lower && *n as u64 <= upper)),
+                .all(|value| matches!(value, Scalar::Int(n) if n >= lower && n as u64 <= upper)),
         )
     }
 
@@ -268,7 +269,7 @@ impl Emitter<'_> {
         let data = self.constants.get(&value.ssa)?;
         (0..usize::try_from(*n).ok()?)
             .map(|i| match data.get(if data.len() == 1 { 0 } else { i })? {
-                Scalar::Int(n) => Some(*n),
+                Scalar::Int(n) => Some(n),
                 _ => None,
             })
             .collect()
@@ -286,8 +287,8 @@ impl Emitter<'_> {
         let data = self.constants.get(&value.ssa)?;
         (0..usize::try_from(*n).ok()?)
             .map(|i| match data.get(if data.len() == 1 { 0 } else { i })? {
-                Scalar::Real(x) => Some(*x),
-                Scalar::Int(n) => Some(*n as f64),
+                Scalar::Real(x) => Some(x),
+                Scalar::Int(n) => Some(n as f64),
                 _ => None,
             })
             .collect()
@@ -309,8 +310,8 @@ impl Emitter<'_> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
             return None;
         }
-        match self.constants.get(&value.ssa)?.as_ref() {
-            [Scalar::Real(x)] => Some(*x),
+        match self.constants.get(&value.ssa)? {
+            Constant::Real(v) if v.len() == 1 => Some(v[0]),
             _ => None,
         }
     }
@@ -320,8 +321,8 @@ impl Emitter<'_> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
             return None;
         }
-        match self.constants.get(&value.ssa)?.as_ref() {
-            [Scalar::Int(n)] => Some(*n),
+        match self.constants.get(&value.ssa)? {
+            Constant::Int(v) if v.len() == 1 => Some(v[0]),
             _ => None,
         }
     }
@@ -330,8 +331,8 @@ impl Emitter<'_> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
             return None;
         }
-        match self.constants.get(&value.ssa)?.as_ref() {
-            [Scalar::Int(n)] => u64::try_from(*n).ok(),
+        match self.constants.get(&value.ssa)? {
+            Constant::Int(v) if v.len() == 1 => u64::try_from(v[0]).ok(),
             _ => None,
         }
     }
@@ -360,7 +361,7 @@ impl Emitter<'_> {
             if element_count(&elem.ty) != Some(data.len()) {
                 return None;
             }
-            values.extend(data.iter().cloned());
+            values.extend(data.iter());
         }
         self.folded_constant(values, ty, axes)
     }
@@ -389,8 +390,25 @@ impl Emitter<'_> {
             .into_iter()
             .map(|v| self.rounded_constant(v))
             .collect::<Option<Vec<_>>>()
+            && let Some(values) = Constant::from_scalars(&values)
         {
-            self.constants.insert(ssa.to_owned(), values.into());
+            self.constants.insert(ssa.to_owned(), values);
+        }
+    }
+
+    /// Remember a packed literal at the target precision, sharing its buffer
+    /// whenever rounding leaves every element unchanged.
+    pub(super) fn remember_packed(&mut self, ssa: &str, packed: &Constant) {
+        let unchanged = match packed {
+            Constant::Real(v) => {
+                matches!(self.dtype, Dtype::F64) || v.iter().all(|&x| f64::from(x as f32) == x)
+            }
+            Constant::Int(_) | Constant::Bool(_) => true,
+        };
+        if unchanged && packed.iter().all(|v| self.rounded_constant(v).is_some()) {
+            self.constants.insert(ssa.to_owned(), packed.clone());
+        } else {
+            self.remember_constant(ssa, packed.iter());
         }
     }
 
@@ -438,7 +456,9 @@ impl Emitter<'_> {
             format!("stablehlo.constant dense<{literal}> : {rendered}"),
             axes,
         );
-        self.constants.insert(ssa.clone(), values.into());
+        if let Some(values) = Constant::from_scalars(&values) {
+            self.constants.insert(ssa.clone(), values);
+        }
         Some(Value { ssa, ty, elem })
     }
 
@@ -447,7 +467,7 @@ impl Emitter<'_> {
         let values = data
             .iter()
             .map(|v| match v {
-                Scalar::Real(x) => real_unary(op, *x, self.dtype).map(Scalar::Real),
+                Scalar::Real(x) => real_unary(op, x, self.dtype).map(Scalar::Real),
                 Scalar::Int(x) => match op {
                     "stablehlo.negate" => x.checked_neg(),
                     "stablehlo.abs" => x.checked_abs(),
@@ -546,28 +566,28 @@ impl Emitter<'_> {
         let values = (0..n)
             .map(|i| {
                 match (
-                    &aa[if aa.len() == 1 { 0 } else { i }],
-                    &bb[if bb.len() == 1 { 0 } else { i }],
+                    aa.get(if aa.len() == 1 { 0 } else { i })?,
+                    bb.get(if bb.len() == 1 { 0 } else { i })?,
                 ) {
                     (Scalar::Real(x), Scalar::Real(y)) => {
-                        real_binary(op, *x, *y, self.dtype).map(Scalar::Real)
+                        real_binary(op, x, y, self.dtype).map(Scalar::Real)
                     }
                     (Scalar::Bool(x), Scalar::Bool(y)) => match op {
-                        "stablehlo.and" => Some(Scalar::Bool(*x && *y)),
-                        "stablehlo.or" => Some(Scalar::Bool(*x || *y)),
+                        "stablehlo.and" => Some(Scalar::Bool(x && y)),
+                        "stablehlo.or" => Some(Scalar::Bool(x || y)),
                         "stablehlo.xor" => Some(Scalar::Bool(x != y)),
                         _ => None,
                     },
                     (Scalar::Int(x), Scalar::Int(y)) => match op {
-                        "stablehlo.add" => x.checked_add(*y),
-                        "stablehlo.subtract" => x.checked_sub(*y),
-                        "stablehlo.multiply" => x.checked_mul(*y),
-                        "stablehlo.maximum" => Some((*x).max(*y)),
-                        "stablehlo.minimum" => Some((*x).min(*y)),
+                        "stablehlo.add" => x.checked_add(y),
+                        "stablehlo.subtract" => x.checked_sub(y),
+                        "stablehlo.multiply" => x.checked_mul(y),
+                        "stablehlo.maximum" => Some(x.max(y)),
+                        "stablehlo.minimum" => Some(x.min(y)),
                         // StableHLO integer divide and remainder truncate toward zero,
                         // as Rust's do. A zero divisor stays a run-time op.
-                        "stablehlo.divide" => x.checked_div(*y),
-                        "stablehlo.remainder" => x.checked_rem(*y),
+                        "stablehlo.divide" => x.checked_div(y),
+                        "stablehlo.remainder" => x.checked_rem(y),
                         _ => None,
                     }
                     .map(Scalar::Int),
@@ -588,10 +608,10 @@ impl Emitter<'_> {
         if count > MAX_FOLDED_ELEMENTS {
             return None;
         }
-        (0..count)
+        let values = (0..count)
             .map(|i| self.fixed_scalar_at(value, i))
-            .collect::<Option<Vec<_>>>()
-            .map(Into::into)
+            .collect::<Option<Vec<_>>>()?;
+        Constant::from_scalars(&values)
     }
 
     /// Gather outer cells from fixed data, reading broadcast sources lazily.
@@ -652,7 +672,7 @@ impl Emitter<'_> {
             return None;
         }
         let values = (0..n)
-            .map(|i| compare_scalars(dir, &aa[i % aa.len()], &bb[i % bb.len()]))
+            .map(|i| compare_scalars(dir, &aa.get(i % aa.len())?, &bb.get(i % bb.len())?))
             .collect::<Option<Vec<_>>>()?;
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
@@ -662,14 +682,14 @@ impl Emitter<'_> {
             return None;
         }
         let cc = self.fixed_operand(c)?;
-        let Scalar::Bool(first) = cc.first()? else {
+        let Scalar::Bool(first) = cc.get(0)? else {
             return None;
         };
         if cc
             .iter()
             .all(|v| matches!(v, Scalar::Bool(v) if v == first))
         {
-            return Some(if *first { a.clone() } else { b.clone() });
+            return Some(if first { a.clone() } else { b.clone() });
         }
         let aa = self.fixed_operand(a)?;
         let bb = self.fixed_operand(b)?;
@@ -681,9 +701,9 @@ impl Emitter<'_> {
             return None;
         }
         let values = (0..n)
-            .map(|i| match cc[i % cc.len()] {
-                Scalar::Bool(true) => Some(aa[i % aa.len()].clone()),
-                Scalar::Bool(false) => Some(bb[i % bb.len()].clone()),
+            .map(|i| match cc.get(i % cc.len())? {
+                Scalar::Bool(true) => aa.get(i % aa.len()),
+                Scalar::Bool(false) => bb.get(i % bb.len()),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
@@ -923,8 +943,8 @@ mod tests {
             let powers = e.fold_binary("stablehlo.power", &a, &b).unwrap();
             let sums = e.reduce_sum_last_axis(&powers);
             assert_eq!(
-                e.fixed_operand(&sums).unwrap().as_ref(),
-                &[Scalar::Real(1.), Scalar::Real(7.)]
+                e.fixed_operand(&sums).unwrap().iter().collect::<Vec<_>>(),
+                [Scalar::Real(1.), Scalar::Real(7.)]
             );
             assert_eq!(
                 e.axes_of(&sums),
@@ -1034,8 +1054,11 @@ mod tests {
             );
             if width == 2 {
                 assert_eq!(
-                    e.fixed_operand(&result.unwrap()).unwrap().as_ref(),
-                    &[Scalar::Real(0.), Scalar::Real(0.)]
+                    e.fixed_operand(&result.unwrap())
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    [Scalar::Real(0.), Scalar::Real(0.)]
                 );
             } else {
                 assert!(result.is_none());
@@ -1058,15 +1081,15 @@ mod tests {
         let folded = e.fold_unary("stablehlo.negate", &view).unwrap();
         let values = e.fixed_operand(&folded).unwrap();
         assert_eq!(
-            values.as_ref(),
-            &[-1., -2., -1., -2., -1., -2.].map(Scalar::Real)
+            values.iter().collect::<Vec<_>>(),
+            [-1., -2., -1., -2., -1., -2.].map(Scalar::Real)
         );
         let gamma = e.fold_unary("chlo.lgamma", &view).unwrap();
         assert!(
             e.fixed_operand(&gamma)
                 .unwrap()
                 .iter()
-                .all(|x| *x == Scalar::Real(0.))
+                .all(|x| x == Scalar::Real(0.))
         );
     }
 
@@ -1086,7 +1109,7 @@ mod tests {
         assert!(e.fixed_operand(&view).is_none());
         assert!(e.fold_unary("chlo.lgamma", &view).is_none());
         let data = e.constants.get(&source.ssa).unwrap();
-        assert!(Arc::ptr_eq(data, &e.fixed_operand(&source).unwrap()));
+        assert!(data.ptr_eq(&e.fixed_operand(&source).unwrap()));
     }
 
     #[test]
@@ -1174,7 +1197,7 @@ mod tests {
             e.fixed_operand(&gamma)
                 .unwrap()
                 .iter()
-                .all(|x| *x == Scalar::Real(0.))
+                .all(|x| x == Scalar::Real(0.))
         );
     }
 
@@ -1203,8 +1226,8 @@ mod tests {
             let finite = e.compare("LT", &magnitude, &infinity);
             let finite = e.reduce_all(&finite);
             assert_eq!(
-                e.fixed_operand(&finite).unwrap().as_ref(),
-                &[Scalar::Bool(true), Scalar::Bool(true), Scalar::Bool(true)]
+                e.fixed_operand(&finite).unwrap().iter().collect::<Vec<_>>(),
+                [Scalar::Bool(true), Scalar::Bool(true), Scalar::Bool(true)]
             );
             let rounded = if matches!(dtype, Dtype::F32) {
                 16777216.
@@ -1241,12 +1264,12 @@ mod tests {
             let all = e.reduce_all(&flags);
             let any = e.reduce_boolean("stablehlo.or", "false", &flags);
             assert_eq!(
-                e.fixed_operand(&all).unwrap().as_ref(),
-                &[Scalar::Bool(false), Scalar::Bool(true), Scalar::Bool(false)]
+                e.fixed_operand(&all).unwrap().iter().collect::<Vec<_>>(),
+                [Scalar::Bool(false), Scalar::Bool(true), Scalar::Bool(false)]
             );
             assert_eq!(
-                e.fixed_operand(&any).unwrap().as_ref(),
-                &[Scalar::Bool(true), Scalar::Bool(true), Scalar::Bool(false)]
+                e.fixed_operand(&any).unwrap().iter().collect::<Vec<_>>(),
+                [Scalar::Bool(true), Scalar::Bool(true), Scalar::Bool(false)]
             );
         }
     }

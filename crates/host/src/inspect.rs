@@ -49,7 +49,13 @@ pub enum Domain {
     ZeroSum {
         n: Option<u32>,
     },
-    /// Nested per-axis powers flatten into one shape. `None` is a dynamic extent.
+    /// `corrcholesky(n)`: n×n Cholesky factors of correlation matrices.
+    CorrCholesky {
+        n: Option<u32>,
+    },
+    /// A power of scalars flattens its per-axis powers into one shape; an
+    /// array of arrays keeps one level per array (its type says which, see
+    /// [`typed_domain`]). `None` is a dynamic extent.
     CartPow {
         of: Box<Domain>,
         shape: Vec<Option<u32>>,
@@ -104,6 +110,7 @@ impl Domain {
             ValueSet::StdSimplex(n) => Self::StdSimplex { n: extent(*n) },
             ValueSet::Ordered(n) => Self::Ordered { n: extent(*n) },
             ValueSet::ZeroSum(n) => Self::ZeroSum { n: extent(*n) },
+            ValueSet::CorrCholesky(n) => Self::CorrCholesky { n: extent(*n) },
             ValueSet::CartPow(elem, n) => {
                 let mut shape = vec![extent(*n)];
                 let mut elem = elem.as_ref();
@@ -133,6 +140,20 @@ impl Domain {
     }
 }
 
+/// The JSON domain of a value in `set` whose type is `ty`, with the nesting the
+/// type has: `cartpow(cartpow(reals, 4), 3)` (an array of vectors) stays two
+/// powers, while the matrix `cartpow(reals, [3, 4])` is one, although both are
+/// the same [`ValueSet`]. A measure is read at its variate type.
+pub(crate) fn typed_domain(module: &Module, set: &ValueSet, ty: Option<&Type>) -> Domain {
+    let domain = Domain::of(module, set);
+    let ty = match ty {
+        Some(Type::Measure { domain, .. }) => Some(domain.as_ref()),
+        other => other,
+    };
+    ty.and_then(|ty| crate::transforms::nest(&domain, ty, module).ok())
+        .unwrap_or(domain)
+}
+
 /// One input of a kernel or likelihood interface.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct InputInfo {
@@ -157,7 +178,10 @@ pub(crate) fn inputs(module: &Module, rhs: NodeId) -> Option<Vec<InputInfo>> {
             .iter()
             .map(|name| InputInfo {
                 name: module.resolve(*name).into(),
-                domain: Domain::of(module, bound.get(name).unwrap_or(&ValueSet::Unknown)),
+                domain: match bound.get(name) {
+                    Some((set, ty)) => typed_domain(module, set, ty.as_ref()),
+                    None => Domain::Unknown,
+                },
             })
             .collect(),
     )
@@ -169,7 +193,7 @@ pub(crate) fn inputs(module: &Module, rhs: NodeId) -> Option<Vec<InputInfo>> {
 fn collect_inputs(
     module: &Module,
     node: NodeId,
-    bound: &mut HashMap<Symbol, ValueSet>,
+    bound: &mut HashMap<Symbol, (ValueSet, Option<Type>)>,
     seen: &mut HashSet<BindingId>,
 ) {
     match module.node(node) {
@@ -205,16 +229,25 @@ fn collect_inputs(
     }
 }
 
-/// The set of the binding a boundary entry names; a placeholder has none.
-fn bound_set(module: &Module, source: &Ref) -> ValueSet {
+/// The set and type of the binding a boundary entry names; a placeholder has
+/// neither.
+fn bound_set(module: &Module, source: &Ref) -> (ValueSet, Option<Type>) {
     if source.ns != RefNs::SelfMod {
-        return ValueSet::Unknown;
+        return (ValueSet::Unknown, None);
     }
-    module
+    let Some(rhs) = module
         .binding_by_name(source.name)
-        .and_then(|binding| module.valueset_of(module.binding(binding).rhs))
-        .cloned()
-        .unwrap_or(ValueSet::Unknown)
+        .map(|binding| module.binding(binding).rhs)
+    else {
+        return (ValueSet::Unknown, None);
+    };
+    (
+        module
+            .valueset_of(rhs)
+            .cloned()
+            .unwrap_or(ValueSet::Unknown),
+        module.type_of(rhs).cloned(),
+    )
 }
 
 fn extent(dim: Dim) -> Option<u32> {

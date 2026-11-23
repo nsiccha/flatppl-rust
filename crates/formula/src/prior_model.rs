@@ -443,11 +443,15 @@ fn coordinate_node(b: &mut Builder<'_>, set: &ValueSet) -> Option<NodeId> {
             let n = b.lit_int(i64::from(*n));
             b.call("cartpow", &[of, n])
         }
-        StdSimplex(Dim::Static(n)) | Ordered(Dim::Static(n)) | ZeroSum(Dim::Static(n)) => {
+        StdSimplex(Dim::Static(n))
+        | Ordered(Dim::Static(n))
+        | ZeroSum(Dim::Static(n))
+        | CorrCholesky(Dim::Static(n)) => {
             let name = match set {
                 StdSimplex(_) => "stdsimplex",
                 Ordered(_) => "ordered",
-                _ => "zerosum",
+                ZeroSum(_) => "zerosum",
+                _ => "corrcholesky",
             };
             let n = b.lit_int(i64::from(*n));
             b.call(name, &[n])

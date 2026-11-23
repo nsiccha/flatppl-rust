@@ -7,7 +7,8 @@ use flatppl_core::{CallHead, Dim, Module, Node, NodeId, RefNs, Scalar, ScalarTyp
 
 use crate::Constant;
 use crate::compiler::resolve_ref;
-use crate::readers::{Datum, decode, format};
+use crate::constants::ArrayData;
+use crate::readers::{Datum, Leaves, decode, format};
 
 /// A `load_data` source that cannot be loaded, localized to its call when the
 /// call is known.
@@ -201,7 +202,7 @@ fn selected_value(module: &Module, datum: &Datum, ty: &Type) -> Result<Constant,
                 }
                 datum => datum,
             };
-            let mut data = Vec::new();
+            let mut data = Entries::new(elem);
             match datum {
                 Datum::Tensor {
                     shape,
@@ -209,7 +210,10 @@ fn selected_value(module: &Module, datum: &Datum, ty: &Type) -> Result<Constant,
                 } => tensor_prefix(module, shape, leaves, &dims, elem, &mut data)?,
                 datum => array_prefix(module, datum, &dims, dims.len(), elem, &mut data)?,
             }
-            Ok(Constant::Array { shape: dims, data })
+            Ok(Constant::Array {
+                shape: dims,
+                data: data.finish(),
+            })
         }
         Type::Record(fields) => fields
             .iter()
@@ -286,7 +290,9 @@ fn scalar_value(datum: &Datum, kind: ScalarType) -> Result<Constant, String> {
         Datum::Real32(x) => Ok(Constant::Real32(*x)),
         Datum::Number(x) => untyped_number(*x, kind, || format!("value {x}")),
         Datum::Null => Err("a value is missing".into()),
-        Datum::Tensor { shape, data } if shape.is_empty() => scalar_value(&data[0], kind),
+        Datum::Tensor { shape, data } if shape.is_empty() => {
+            scalar_value(&data.get(0).ok_or("expected a scalar")?, kind)
+        }
         Datum::Text(cell) => {
             if cell.eq_ignore_ascii_case("true") || cell.eq_ignore_ascii_case("false") {
                 return Ok(Constant::Bool(cell.eq_ignore_ascii_case("true")));
@@ -334,14 +340,15 @@ fn array_prefix(
     shape: &[u32],
     rank: usize,
     elem: &Type,
-    data: &mut Vec<Constant>,
+    data: &mut Entries,
 ) -> Result<(), String> {
     let Some((&n, rest)) = shape.split_first() else {
         data.push(selected_value(module, datum, elem)?);
         return Ok(());
     };
-    let values = match datum {
-        Datum::List(values) => values,
+    let available = match datum {
+        Datum::List(values) => values.len(),
+        Datum::Leaves(values) => values.len(),
         Datum::Text(_) => {
             return Err(
                 "a delimited cell holds one scalar, and §07 gives an array-valued column no \
@@ -351,20 +358,29 @@ fn array_prefix(
         }
         _ => return Err("expected an array".into()),
     };
-    if values.len() < n as usize {
+    if available < n as usize {
         return Err(format!(
-            "requested {n} entries but only {} are available",
-            values.len()
+            "requested {n} entries but only {available} are available"
         ));
     }
-    if rank > 1 && values.len() != n as usize {
+    if rank > 1 && available != n as usize {
         return Err(format!(
-            "an axis holds {} entries, but the declared shape needs exactly {n}",
-            values.len()
+            "an axis holds {available} entries, but the declared shape needs exactly {n}"
         ));
     }
-    for value in &values[..n as usize] {
-        array_prefix(module, value, rest, rank, elem, data)?;
+    match datum {
+        Datum::List(values) => {
+            for value in &values[..n as usize] {
+                array_prefix(module, value, rest, rank, elem, data)?;
+            }
+        }
+        Datum::Leaves(values) => {
+            for i in 0..n as usize {
+                let value = values.get(i).expect("index below len");
+                array_prefix(module, &value, rest, rank, elem, data)?;
+            }
+        }
+        _ => unreachable!("checked above"),
     }
     Ok(())
 }
@@ -374,10 +390,10 @@ fn array_prefix(
 fn tensor_prefix(
     module: &Module,
     shape: &[usize],
-    leaves: &[Datum],
+    leaves: &Leaves,
     dims: &[u32],
     elem: &Type,
-    data: &mut Vec<Constant>,
+    data: &mut Entries,
 ) -> Result<(), String> {
     let fits = shape.len() == dims.len()
         && shape
@@ -393,10 +409,117 @@ fn tensor_prefix(
         ));
     }
     let count = dims.iter().map(|&d| d as usize).product::<usize>();
-    for leaf in &leaves[..count] {
-        data.push(selected_value(module, leaf, elem)?);
+    for i in 0..count {
+        let leaf = leaves
+            .get(i)
+            .ok_or("the tensor holds fewer leaves than its shape")?;
+        data.push(selected_value(module, &leaf, elem)?);
     }
     Ok(())
+}
+
+/// An array's entries as they are selected, in one buffer while they are
+/// scalars of one kind. An entry takes the declared scalar kind as
+/// [`Constant::normalized`] would give it later (an integer or boolean entry of
+/// a real array is that real), so mixed spellings of one kind share the buffer.
+enum Entries {
+    Typed {
+        kind: Option<ScalarType>,
+        buffer: Option<Buffer>,
+    },
+    Values(Vec<Constant>),
+}
+
+enum Buffer {
+    Bool(Vec<bool>),
+    Integer(Vec<i64>),
+    Real(Vec<f64>),
+    Real32(Vec<f32>),
+}
+
+impl Entries {
+    fn new(elem: &Type) -> Self {
+        let kind = match elem {
+            Type::Scalar(kind) => Some(*kind),
+            _ => None,
+        };
+        Entries::Typed { kind, buffer: None }
+    }
+
+    fn push(&mut self, value: Constant) {
+        let Entries::Typed { kind, buffer } = self else {
+            let Entries::Values(values) = self else {
+                unreachable!()
+            };
+            values.push(value);
+            return;
+        };
+        let value = match (*kind, value) {
+            (Some(ScalarType::Real), Constant::Integer(i)) => Constant::Real(i as f64),
+            (Some(ScalarType::Real), Constant::Bool(b)) => Constant::Real(f64::from(b)),
+            (Some(ScalarType::Integer), Constant::Bool(b)) => Constant::Integer(i64::from(b)),
+            (_, value) => value,
+        };
+        let pushed = match (buffer.as_mut(), &value) {
+            (None, Constant::Bool(b)) => {
+                *buffer = Some(Buffer::Bool(vec![*b]));
+                true
+            }
+            (None, Constant::Integer(i)) => {
+                *buffer = Some(Buffer::Integer(vec![*i]));
+                true
+            }
+            (None, Constant::Real(x)) => {
+                *buffer = Some(Buffer::Real(vec![*x]));
+                true
+            }
+            (None, Constant::Real32(x)) => {
+                *buffer = Some(Buffer::Real32(vec![*x]));
+                true
+            }
+            (Some(Buffer::Bool(v)), Constant::Bool(b)) => {
+                v.push(*b);
+                true
+            }
+            (Some(Buffer::Integer(v)), Constant::Integer(i)) => {
+                v.push(*i);
+                true
+            }
+            (Some(Buffer::Real(v)), Constant::Real(x)) => {
+                v.push(*x);
+                true
+            }
+            (Some(Buffer::Real32(v)), Constant::Real32(x)) => {
+                v.push(*x);
+                true
+            }
+            _ => false,
+        };
+        if !pushed {
+            let mut values = std::mem::replace(self, Entries::Values(Vec::new()))
+                .finish()
+                .iter()
+                .collect::<Vec<_>>();
+            values.push(value);
+            *self = Entries::Values(values);
+        }
+    }
+
+    fn finish(self) -> ArrayData {
+        match self {
+            Entries::Typed { buffer: None, .. } => ArrayData::Values(Vec::new()),
+            Entries::Typed {
+                buffer: Some(buffer),
+                ..
+            } => match buffer {
+                Buffer::Bool(v) => ArrayData::Bool(v.into()),
+                Buffer::Integer(v) => ArrayData::Integer(v.into()),
+                Buffer::Real(v) => ArrayData::Real(v.into()),
+                Buffer::Real32(v) => ArrayData::Real32(v.into()),
+            },
+            Entries::Values(values) => values.into(),
+        }
+    }
 }
 
 fn binding(module: &Module, name: &str) -> Option<NodeId> {

@@ -621,13 +621,13 @@ impl Packer<'_, '_> {
         if data.iter().all(|v| v.len() == 1) {
             if values.iter().all(|v| v.ssa == values[0].ssa) {
                 let scalar = self.out.folded_constant(
-                    vec![data[0][0].clone()],
+                    vec![data[0].get(0)?],
                     MlirTy::Scalar,
                     Axes::default(),
                 )?;
                 return Some(self.out.broadcast_in_dim(&scalar, &[], ty));
             }
-            let scalars = data.iter().map(|v| v[0].clone()).collect();
+            let scalars = data.iter().map(|v| v.get(0)).collect::<Option<_>>()?;
             let vector = self.out.folded_constant(
                 scalars,
                 MlirTy::Ranked(vec![Some(values.len() as u64)]),
@@ -650,7 +650,7 @@ impl Packer<'_, '_> {
             return None;
         }
         self.out.folded_constant(
-            data.into_iter().flat_map(|v| v.iter().cloned()).collect(),
+            data.into_iter().flat_map(|v| v.iter()).collect(),
             ty,
             Axes::default(),
         )

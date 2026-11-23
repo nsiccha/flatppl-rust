@@ -93,6 +93,50 @@ fn ordered_and_zerosum_domains_report_their_length() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// An array of vectors and a matrix share one value set, so the domain JSON
+/// reads the nesting from the type: a host that writes the set back as
+/// FlatPPL text gets `cartpow(cartpow(reals, 4), 3)` for the one and
+/// `cartpow(reals, [3, 4])` for the other, for values, laws and inputs alike.
+#[test]
+fn nested_arrays_keep_their_nesting_in_domains() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = bindings(
+        "w ~ iid(iid(Normal(0, 1), 4), 3)\nm ~ iid(Normal(0, 1), [3, 4])\n\
+         A ~ iid(Dirichlet([1.0, 1.0, 1.0]), 2)\nprior = lawof(record(w = w, m = m))\n\
+         p = elementof(cartpow(cartpow(posreals, 2), 5))\n",
+    )?;
+    let reals = |shape: serde_json::Value| json!({"set": "cartpow", "of": {"set": "reals"}, "shape": shape});
+    let nested = json!({"set": "cartpow", "of": reals(json!([4])), "shape": [3]});
+    assert_eq!(rows["w"]["domain"], nested);
+    assert_eq!(rows["m"]["domain"], reals(json!([3, 4])));
+    assert_eq!(
+        rows["A"]["domain"],
+        json!({"set": "cartpow", "of": {"set": "stdsimplex", "n": 3}, "shape": [2]})
+    );
+    assert_eq!(
+        rows["prior"]["domain"],
+        json!({"set": "record", "fields": [
+            {"name": "w", "set": nested},
+            {"name": "m", "set": reals(json!([3, 4]))},
+        ]})
+    );
+    assert_eq!(
+        rows["p"]["domain"],
+        json!({"set": "cartpow", "of": {"set": "cartpow", "of": {"set": "posreals"}, "shape": [2]}, "shape": [5]})
+    );
+    Ok(())
+}
+
+#[test]
+fn corrcholesky_domains_report_their_matrix_shape() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = bindings("L = elementof(corrcholesky(3))\nM ~ LKJCholesky(2, 4.0)\n")?;
+    assert_eq!(rows["L"]["domain"], json!({"set": "corrcholesky", "n": 3}));
+    // Nine stored values, three free coordinates: the ABI is a 3x3 real matrix.
+    assert_eq!(rows["L"]["shape"], json!([3, 3]));
+    assert_eq!(rows["L"]["size"], 9);
+    assert_eq!(rows["M"]["domain"], json!({"set": "corrcholesky", "n": 2}));
+    Ok(())
+}
+
 #[test]
 fn renamed_kernel_inputs_report_the_bound_values_support() -> Result<(), Box<dyn std::error::Error>>
 {

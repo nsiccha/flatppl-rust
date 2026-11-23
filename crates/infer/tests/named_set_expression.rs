@@ -87,6 +87,7 @@ fn named_and_inline_set_expressions_agree() {
         "stdsimplex(3)",
         "ordered(3)",
         "zerosum(3)",
+        "corrcholesky(3)",
         "cartprod(reals, posreals)",
         "cartprod(a = reals, b = posreals)",
         "cartpow(cartprod(a = reals, b = posreals), 5)",

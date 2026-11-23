@@ -25,6 +25,12 @@ pub struct Export {
     /// Device-side error status, separate from the authored output structure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<RuntimeStatus>,
+    /// Data-only likelihood preparation of a prepared compile. It has no
+    /// inputs. Run it once and check its status. Then pass its output leaves,
+    /// in order and without batch axes, after the declared input leaves of
+    /// every call of `stablehlo`. Ordinary compiles never set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<Box<Export>>,
 }
 
 #[derive(Serialize)]
@@ -303,7 +309,99 @@ pub fn emit_query(
         output_names,
         batch_shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
         runtime_status,
+        preparation: None,
     })
+}
+
+/// Emit a split likelihood: the preparation program, and the scoring program
+/// whose trailing arguments are the preparation's outputs. `source` describes
+/// the original query's declared outputs.
+pub(crate) fn emit_prepared(
+    prepared: flatppl_determinizer::PreparedLikelihood,
+    source: &Module,
+    options: &EmitOptions,
+    batch: Option<&BatchSpec>,
+) -> Result<Export, EmitError> {
+    let flatppl_determinizer::PreparedLikelihood {
+        preparation,
+        score,
+        summaries,
+    } = prepared;
+    let preparation = emit_query(preparation.clone(), &preparation, options, None)?;
+    if !preparation.inputs.is_empty() {
+        return Err(EmitError::whole(
+            "fixed-data preparation must not take inputs",
+        ));
+    }
+    let prepared_leaves = leaves(&preparation.output);
+    if prepared_leaves.len() != summaries.len() {
+        return Err(EmitError::whole("each prepared summary must be one tensor"));
+    }
+    let mut exported = emit_query(score, source, options, batch)?;
+    let split = exported
+        .inputs
+        .len()
+        .checked_sub(summaries.len())
+        .ok_or_else(|| EmitError::whole("the scoring query lacks its summary inputs"))?;
+    let appended = exported.inputs.split_off(split);
+    let declared_leaves: usize = exported.inputs.iter().map(|f| leaves(&f.value).len()).sum();
+    for (position, ((field, name), prepared)) in appended
+        .iter()
+        .zip(&summaries)
+        .zip(&prepared_leaves)
+        .enumerate()
+    {
+        let [argument] = leaves(&field.value)[..] else {
+            return Err(EmitError::whole("each prepared summary must be one tensor"));
+        };
+        let (
+            Schema::Tensor {
+                index,
+                dtype,
+                shape,
+                ..
+            },
+            Schema::Tensor {
+                dtype: prepared_dtype,
+                shape: prepared_shape,
+                ..
+            },
+        ) = (argument, prepared)
+        else {
+            unreachable!("leaves are tensors")
+        };
+        if let Some(batch) = batch
+            && batch
+                .input_axes
+                .get(*index)
+                .is_none_or(|axes| axes.iter().any(Option::is_some))
+        {
+            return Err(EmitError::whole(
+                "prepared summaries are shared by every batch cell and take no batch axis",
+            ));
+        }
+        if field.name != *name
+            || *index != declared_leaves + position
+            || dtype != prepared_dtype
+            || shape != prepared_shape
+        {
+            return Err(EmitError::whole(format!(
+                "prepared summary {name} does not match its scoring argument"
+            )));
+        }
+    }
+    exported.preparation = Some(Box::new(preparation));
+    Ok(exported)
+}
+
+/// Tensor leaves in argument/result order.
+fn leaves(schema: &Schema) -> Vec<&Schema> {
+    match schema {
+        Schema::Tensor { .. } => vec![schema],
+        Schema::Record { fields } => fields.iter().flat_map(|f| leaves(&f.value)).collect(),
+        Schema::Table { fields, .. } => fields.iter().flat_map(|f| leaves(&f.value)).collect(),
+        Schema::Tuple { items } => items.iter().flat_map(leaves).collect(),
+    }
 }
 
 fn bind_inputs(

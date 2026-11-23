@@ -325,7 +325,7 @@ impl Emitter<'_> {
         // window that reaches the first step also carries it.
         let zero = self.constants.get(&init.ssa).is_some_and(|data| {
             data.iter()
-                .all(|v| matches!(v, Scalar::Real(x) if *x == 0.0) || matches!(v, Scalar::Int(0)))
+                .all(|v| matches!(v, Scalar::Real(x) if x == 0.0) || matches!(v, Scalar::Int(0)))
         });
         let mut x = offset.clone();
         if !zero {

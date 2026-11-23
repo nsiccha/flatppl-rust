@@ -96,6 +96,19 @@ pub(super) fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, 
         }
         _ => {}
     }
+    // Element by element, as its `vector` call of literals.
+    if let Node::Packed(p) = m.node(id) {
+        return p
+            .iter()
+            .try_fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
+                let x = match value {
+                    Scalar::Real(x) if x.is_finite() => x,
+                    Scalar::Int(x) => x as f64,
+                    _ => return None,
+                };
+                Some((lo.min(x), hi.max(x)))
+            });
+    }
     let (name, args) = arithmetic(m, id)?;
     match (name, args) {
         ("get" | "get0" | "fill", [array, ..]) => bounds(m, *array, reducer),

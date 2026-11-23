@@ -90,3 +90,32 @@ fn authored_zero_does_not_change_the_slot_of_a_runtime_failure() {
         "{signature}"
     );
 }
+
+#[test]
+fn real_eigh_rotates_only_the_affected_rows_and_columns() {
+    let real = emit(
+        "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
+         A=external(cartpow(reals,[5,5]))\n\
+         inputs=A\noutputs=e.eigh(A).vectors",
+    );
+    assert!(real.contains("stablehlo.dynamic_update_slice"), "{real}");
+    // The inner loop visits each pair p < q once: 5 * 4 / 2 iterations.
+    assert!(
+        real.contains("stablehlo.constant dense<10> : tensor<i64>"),
+        "{real}"
+    );
+    assert!(
+        !real.contains("stablehlo.constant dense<25> : tensor<i64>"),
+        "{real}"
+    );
+    // Batched cells keep the masked rotation.
+    let batched = emit(
+        "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
+         A=external(cartpow(cartpow(reals,[5,5]),3))\n\
+         vectors(a)=e.eigh(a).vectors\ninputs=A\noutputs=vectors.(A)",
+    );
+    assert!(
+        !batched.contains("stablehlo.dynamic_update_slice"),
+        "{batched}"
+    );
+}

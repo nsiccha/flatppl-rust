@@ -54,7 +54,8 @@ fn bound_columns_export_their_matrix_shape() -> Result<(), Box<dyn std::error::E
                         Constant::Real(1.0),
                         Constant::Real(2.0),
                         Constant::Real(3.0),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
         ],

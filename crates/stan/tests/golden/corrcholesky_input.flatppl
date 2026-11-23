@@ -1,0 +1,5 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+L = elementof(corrcholesky(3))
+inputs = L
+outputs = logdensityof(LKJCholesky(3, 2.0), L)

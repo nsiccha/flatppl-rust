@@ -1003,6 +1003,10 @@ impl<'m, 's> Inferencer<'m, 's> {
                 (Type::Any, Phase::Fixed)
             }
             Node::Call(_) => unreachable!("calls use scheduler frames"),
+            Node::Packed(p) => {
+                self.set_vset(id, ops::packed_valueset(p));
+                (ops::packed_type(p), Phase::Fixed)
+            }
         };
         // A cycle marker may have landed on this node while the walk was in
         // flight (see enter_binding); it is authoritative — don't clobber it.

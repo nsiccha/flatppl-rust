@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use flatppl_core::Type;
+use flatppl_core::{Module, Type};
 
 use crate::{Domain, DomainField, LoadedModule};
 
@@ -48,17 +48,98 @@ fn sum(parts: impl Iterator<Item = String>) -> String {
     }
 }
 
-// Inspection metadata flattens nested Cartesian powers. Do not rebuild those
-// as matrices: their broadcast semantics differ even when the ABI agrees.
+/// A fresh name for the cell variable of a broadcast over `point`: one more
+/// than the deepest `row<k>` the point already names, so a nested broadcast
+/// never captures an enclosing cell.
+fn fresh_row(point: &str) -> String {
+    let deepest = point
+        .match_indices("row")
+        .filter_map(|(i, _)| {
+            let digits: String = point[i + 3..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<u32>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("row{}", deepest + 1)
+}
+
+// Inspection metadata flattens nested Cartesian powers, so charts read the
+// nesting back from the value's type (`nest`) rather than rebuilding those as
+// matrices: their broadcast semantics differ even when the ABI agrees.
 pub(crate) fn supported_container(ty: &Type) -> bool {
     match ty {
         Type::Scalar(_) => true,
-        Type::Array { elem, .. } => matches!(elem.as_ref(), Type::Scalar(_)),
+        Type::Array { elem, .. } => match elem.as_ref() {
+            Type::Scalar(_) => true,
+            inner @ Type::Array { .. } => supported_container(inner),
+            _ => false,
+        },
         Type::Record(fields)
         | Type::Table {
             columns: fields, ..
         } => fields.iter().all(|(_, ty)| supported_container(ty)),
         _ => false,
+    }
+}
+
+/// `domain` with the nesting of `ty` restored. [`Domain::of`] writes
+/// `cartpow(cartpow(reals, 4), 3)` and `cartpow(reals, [3, 4])` as one
+/// flattened power; the type tells the array of vectors from the matrix.
+/// Records and table rows are restored field by field.
+pub(crate) fn nest(domain: &Domain, ty: &Type, module: &Module) -> Result<Domain, String> {
+    match (ty, domain) {
+        (Type::Array { shape, elem }, Domain::CartPow { of, shape: flat })
+            if !matches!(elem.as_ref(), Type::Scalar(_)) =>
+        {
+            let outer = shape.len();
+            let inner = match flat.len() {
+                n if n == outer => of.as_ref().clone(),
+                n if n > outer => Domain::CartPow {
+                    of: of.clone(),
+                    shape: flat[outer..].to_vec(),
+                },
+                _ => return Err("the input's domain has fewer axes than its type".into()),
+            };
+            Ok(Domain::CartPow {
+                of: Box::new(nest(&inner, elem, module)?),
+                shape: flat[..outer].to_vec(),
+            })
+        }
+        (Type::Table { columns, .. }, Domain::CartPow { of, shape }) => Ok(Domain::CartPow {
+            of: Box::new(nest(of, &Type::Record(columns.clone()), module)?),
+            shape: shape.clone(),
+        }),
+        (Type::Record(types), _) => {
+            let Some(original) = record_fields(domain) else {
+                return Ok(domain.clone());
+            };
+            let fields = original
+                .iter()
+                .cloned()
+                .map(|field| {
+                    let ty = types
+                        .iter()
+                        .find(|(name, _)| module.resolve(*name) == field.name);
+                    Ok(DomainField {
+                        set: match ty {
+                            Some((_, ty)) => nest(&field.set, ty, module)?,
+                            None => field.set,
+                        },
+                        name: field.name,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            // Keep the written form (a product of record sets stays one) unless
+            // a field's nesting changed.
+            if fields == original {
+                return Ok(domain.clone());
+            }
+            Ok(Domain::Record { fields })
+        }
+        _ => Ok(domain.clone()),
     }
 }
 
@@ -123,7 +204,12 @@ fn record_chart(
 
 // Formula correlation factors use LKJCholesky, whose reference measure is
 // Lebesgue measure on the independent strictly lower-triangular coordinates.
+// Such a factor is declared as a square real matrix; `corrcholesky(n)` inputs
+// take the same chart through `Domain::chart`.
 fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
+    if let Domain::CorrCholesky { .. } = domain {
+        return domain.chart(point);
+    }
     let Domain::CartPow { of, shape } = domain else {
         return Err(format!(
             "correlation factor `{point}` must be a square real matrix"
@@ -140,6 +226,15 @@ fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
             "correlation factor `{point}` must be a square real matrix of size at least two"
         ));
     }
+    cholesky_factor_chart(n, format!("cartpow(reals, [{n}, {n}])"), point)
+}
+
+/// The chart of n×n correlation Cholesky factors (n >= 2) declared on
+/// `domain`: tanh partial correlations, with free coordinates in the row-major
+/// order of the n(n-1)/2 strictly lower-triangular entries. Its log volume is
+/// relative to coordinate Lebesgue measure on those entries, LKJCholesky's
+/// reference measure (§08) and `Lebesgue(support = corrcholesky(n))`'s.
+fn cholesky_factor_chart(n: u32, domain: String, point: &str) -> Result<Chart, String> {
     let size = n
         .checked_mul(n)
         .ok_or("correlation matrix size overflows")?;
@@ -197,7 +292,7 @@ fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
         }
     }
     Ok(Chart {
-        domain: format!("cartpow(reals, [{n}, {n}])"),
+        domain,
         free: format!("cartpow(reals, {free_size})"),
         constrain: format!("rowstack([{}])", rows.join(", ")),
         unconstrain: format!(
@@ -212,6 +307,19 @@ fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
 }
 
 impl Domain {
+    /// A set of arrays rather than scalars: a (restored) nested power, a §03
+    /// vector set, or the fork's `corrcholesky(n)`.
+    fn is_array_set(&self) -> bool {
+        matches!(
+            self,
+            Self::CartPow { .. }
+                | Self::StdSimplex { .. }
+                | Self::Ordered { .. }
+                | Self::ZeroSum { .. }
+                | Self::CorrCholesky { .. }
+        )
+    }
+
     fn has_complex_elements(&self) -> bool {
         match self {
             Self::Complexes => true,
@@ -328,8 +436,9 @@ impl Domain {
                 if let [rows] = shape.as_slice()
                     && let Some(fields) = record_fields(of)
                 {
-                    let row = record_chart(&fields, "row", &[])?;
-                    let map_rows = |expr: &str| format!("broadcast(row -> {expr}, {point})");
+                    let var = fresh_row(point);
+                    let row = record_chart(&fields, &var, &[])?;
+                    let map_rows = |expr: &str| format!("broadcast({var} -> {expr}, {point})");
                     return Ok(Chart {
                         domain: format!("cartpow({}, {rows})", row.domain),
                         free: format!("cartpow({}, {rows})", row.free),
@@ -350,6 +459,37 @@ impl Domain {
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
+                // A power of arrays (a nested array, vectors of a §03 vector
+                // set, correlation factors): each cell takes the element's
+                // chart. The free value is the power of the element's free
+                // set, so it stays nested in the same way, and the log volumes
+                // of the cells add.
+                if of.is_array_set() {
+                    let var = fresh_row(point);
+                    let cell = of.chart(&var)?;
+                    let map = |expr: &str| {
+                        if expr == var {
+                            point.to_string()
+                        } else {
+                            format!("broadcast({var} -> {expr}, {point})")
+                        }
+                    };
+                    return Ok(Chart {
+                        domain: format!("cartpow({}, [{dims}])", cell.domain),
+                        free: format!("cartpow({}, [{dims}])", cell.free),
+                        constrain: map(&cell.constrain),
+                        unconstrain: map(&cell.unconstrain),
+                        log_det: if cell.log_det == "0.0" {
+                            "0.0".into()
+                        } else {
+                            format!("sum({})", map(&cell.log_det))
+                        },
+                        // Nested cells do not flatten into a positional product.
+                        size: 0,
+                        free_size: 0,
+                        scalar: false,
+                    });
+                }
                 if matches!(of.as_ref(), Self::Complexes) {
                     let rank = shape.len();
                     let axes = ":, ".repeat(rank);
@@ -429,6 +569,10 @@ impl Domain {
                 free_size: n - 1,
                 scalar: false,
             }),
+            // `corrcholesky(1)` is the single point [[1]], with no free coordinate.
+            Self::CorrCholesky { n: Some(n) } if *n > 1 => {
+                cholesky_factor_chart(*n, format!("corrcholesky({n})"), point)
+            }
             Self::StdSimplex { n: Some(n) } if *n > 1 => {
                 let offsets = (1..*n)
                     .rev()
@@ -486,7 +630,9 @@ impl Domain {
                 let mut parts = Vec::new();
                 let complex = of.iter().any(Self::has_complex_elements);
                 for domain in of {
-                    if matches!(domain, Self::CartPow { shape, .. } if shape.len() != 1) {
+                    if matches!(domain, Self::CartPow { shape, of } if shape.len() != 1 || of.is_array_set())
+                        || matches!(domain, Self::CorrCholesky { .. })
+                    {
                         return Err("coordinate products currently require scalar or flat-vector components".into());
                     }
                     let base = domain.chart(point)?;

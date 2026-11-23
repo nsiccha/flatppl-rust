@@ -43,6 +43,33 @@ pub(crate) fn literal_type(s: &Scalar) -> Type {
     }
 }
 
+/// A packed vector has the type of its `vector` call of literals.
+pub(crate) fn packed_type(p: &flatppl_core::Packed) -> Type {
+    Type::Array {
+        shape: Box::new([Dim::Static(p.len() as u32)]),
+        elem: Box::new(Type::Scalar(p.scalar_type())),
+    }
+}
+
+/// The value set `vector` gives its literal elements (`join_scalar_sets` over
+/// each element's `literal_valueset`), computed from the buffer directly.
+pub(crate) fn packed_valueset(p: &flatppl_core::Packed) -> ValueSet {
+    use flatppl_core::Packed;
+    let elem = match p {
+        Packed::Int(v) if v.iter().all(|&n| n > 0) => ValueSet::PosIntegers,
+        Packed::Int(v) if v.iter().all(|&n| n >= 0) => ValueSet::NonNegIntegers,
+        Packed::Int(_) => ValueSet::Integers,
+        Packed::Bool(_) => ValueSet::Booleans,
+        // NaN compares unequal and outside every bound, so it widens to `reals`.
+        Packed::Real(v) if v.iter().all(|&x| x == v[0]) => ValueSet::Interval(v[0], v[0]),
+        Packed::Real(v) if v.iter().all(|&x| (0.0..=1.0).contains(&x)) => ValueSet::UnitInterval,
+        Packed::Real(v) if v.iter().all(|&x| x > 0.0) => ValueSet::PosReals,
+        Packed::Real(v) if v.iter().all(|&x| x >= 0.0) => ValueSet::NonNegReals,
+        Packed::Real(_) => ValueSet::Reals,
+    };
+    ValueSet::CartPow(Box::new(elem), Dim::Static(p.len() as u32))
+}
+
 /// Built-in constants in value position. Sets and ops-as-values have no
 /// first-class `Type` (they are resolved structurally where consumed:
 /// `elementof` reads its set argument's *node*, `broadcast` its head).
@@ -107,7 +134,7 @@ fn op_rule(
     if !args.is_empty()
         && !named.is_empty()
         && !applied_chain
-        && !matches!(call.head, CallHead::Builtin(op) if matches!(inf.module.resolve(op), "functionof" | "kernelof" | "broadcast" | "ksuperpose" | "load_module" | "weighted" | "logweighted" | "pushfwd" | "reduce" | "filter" | "scan" | "kscan" | "markovchain"))
+        && !matches!(call.head, CallHead::Builtin(op) if matches!(inf.module.resolve(op), "functionof" | "kernelof" | "broadcast" | "ksuperpose" | "load_module" | "weighted" | "logweighted" | "pushfwd" | "reduce" | "filter" | "scan" | "kscan" | "markovchain" | "odesolve"))
     {
         inf.diags.push(crate::Diagnostic::error_at(
             id,
@@ -886,6 +913,9 @@ fn op_rule(
             });
         }
         "scan" => return scan_type(inf, args).map(inf, move |_, ty| (ty, joined)),
+        "odesolve" => {
+            return odesolve_type(inf, id, args, named).map(inf, move |_, ty| (ty, joined));
+        }
         // `fchain(f1, f2, …)` (spec §04) composes deterministic functions; the
         // result is a function with `f1`'s input signature (output type is not
         // tracked by `Type::Function`).
@@ -1029,7 +1059,9 @@ fn op_rule(
 
         // ---- set constructors (spec §03) — set objects have no first-class
         // type; consumers (`elementof`, `truncate`, …) read them structurally.
-        "interval" | "cartprod" | "stdsimplex" | "ordered" | "zerosum" => Type::Any,
+        "interval" | "cartprod" | "stdsimplex" | "ordered" | "zerosum" | "corrcholesky" => {
+            Type::Any
+        }
         // `cartpow(S, size)` takes exactly a set and a size; the size is an
         // integer (1-D) or a vector of positive integers (multi-axis), §03
         // "Cartesian power". The legacy variadic `cartpow(S, d1, d2, …)` form
@@ -1549,6 +1581,181 @@ fn scan_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Type> {
         },
         _ => Type::Deferred,
     })
+}
+
+/// `odesolve(f, y0, t0, ts)` and `odesolve(f, y0, t0, ts, p)` (dogfood-fork
+/// extension; not yet in flatppl-design): the solution of the initial value
+/// problem `dy/dt = f(t, y)`, `y(t0) = y0`, at each time in `ts`. Like `scan`,
+/// the result is an array with one state per element of `ts`. `f` is called
+/// positionally as `f(t, y)`, or `f(t, y, p)` with the §04 explicit callback
+/// parameter, and returns `dy/dt` with the type of `y0`. The optional named
+/// inputs `rtol`, `atol` (real) and `max_steps` (integer, per output interval)
+/// configure the engine's error control.
+fn odesolve_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let refuse = |inf: &mut Inferencer<'_, '_>, node: NodeId, what: String| {
+        inf.diags
+            .push(crate::Diagnostic::error_at(node, what.clone()));
+        Ready(Type::Failed(format!("odesolve: {what}").into()))
+    };
+    for (name, node, ty, _) in named {
+        let integer = match inf.module.resolve(*name) {
+            "rtol" | "atol" => false,
+            "max_steps" => true,
+            other => {
+                return refuse(
+                    inf,
+                    *node,
+                    format!(
+                        "`odesolve` has no keyword input `{other}`; its named inputs are \
+                         `rtol`, `atol` and `max_steps`"
+                    ),
+                );
+            }
+        };
+        let fits = match ty {
+            Type::Scalar(ScalarType::Integer) => true,
+            Type::Scalar(ScalarType::Real) => !integer,
+            Type::Deferred | Type::Any | Type::Var(_) => true,
+            _ => false,
+        };
+        if !fits {
+            let want = if integer {
+                "an integer"
+            } else {
+                "a real number"
+            };
+            let name = inf.module.resolve(*name).to_string();
+            return refuse(inf, *node, format!("`odesolve` takes `{name}` as {want}"));
+        }
+    }
+    let [function, y0, t0, ts, parameters @ ..] = args else {
+        return refuse(
+            inf,
+            id,
+            "`odesolve` takes `odesolve(f, y0, t0, ts)` or `odesolve(f, y0, t0, ts, p)`".into(),
+        );
+    };
+    if parameters.len() > 1 {
+        return refuse(
+            inf,
+            id,
+            "`odesolve` takes one final parameter `p`; pass several values as one record".into(),
+        );
+    }
+    let shown = |inf: &mut Inferencer<'_, '_>, ty: &Type| crate::boundary::show(inf, ty);
+    let state = match real_vector_len(&y0.1) {
+        Ok(Some(d)) => Type::Array {
+            shape: Box::new([d]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+        Ok(None) => return Ready(Type::Deferred),
+        Err(()) => {
+            let got = shown(inf, &y0.1);
+            return refuse(
+                inf,
+                y0.0,
+                format!("`odesolve` takes the initial state `y0` as a real vector, got {got}"),
+            );
+        }
+    };
+    match &t0.1 {
+        Type::Scalar(ScalarType::Real | ScalarType::Integer) => {}
+        Type::Deferred | Type::Any | Type::Var(_) => return Ready(Type::Deferred),
+        other => {
+            let got = shown(inf, other);
+            return refuse(
+                inf,
+                t0.0,
+                format!("`odesolve` takes the initial time `t0` as a real number, got {got}"),
+            );
+        }
+    }
+    let len = match real_vector_len(&ts.1) {
+        Ok(Some(len)) => len,
+        Ok(None) => return Ready(Type::Deferred),
+        Err(()) => {
+            let got = shown(inf, &ts.1);
+            return refuse(
+                inf,
+                ts.0,
+                format!("`odesolve` takes the output times `ts` as a real vector, got {got}"),
+            );
+        }
+    };
+    let mut arguments = vec![
+        (t0.0, Type::Scalar(ScalarType::Real), t0.2),
+        (y0.0, state.clone(), y0.2),
+    ];
+    arguments.extend(parameters.iter().cloned());
+    let function = function.0;
+    let y0_node = y0.0;
+    substituted_result(inf, function, &arguments, &[], None, false).and_then(
+        inf,
+        move |inf, result| {
+            let result = result
+                .map(|(ty, _)| ty)
+                .or_else(|| reified_result_type(inf, function));
+            match result {
+                Some(ty) if ty == state => {}
+                // An element type still being decided (a callback reading a
+                // record parameter, a branch) is checked again at emission.
+                Some(Type::Array { shape, elem })
+                    if Some(&*shape) == state_shape(&state)
+                        && matches!(
+                            *elem,
+                            Type::Scalar(ScalarType::Integer)
+                                | Type::Deferred
+                                | Type::Any
+                                | Type::Var(_)
+                        ) => {}
+                None | Some(Type::Deferred | Type::Any | Type::Var(_)) => {}
+                Some(other) => {
+                    let got = crate::boundary::show(inf, &other);
+                    let want = crate::boundary::show(inf, &state);
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        y0_node,
+                        format!(
+                            "`odesolve` needs `f` to return dy/dt with the type of `y0` \
+                             ({want}), got {got}"
+                        ),
+                    ));
+                    return Ready(Type::Failed("odesolve: f result type".into()));
+                }
+            }
+            Ready(Type::Array {
+                shape: Box::new([len]),
+                elem: Box::new(state),
+            })
+        },
+    )
+}
+
+/// The length of a rank-1 real (or integer) vector type: `Ok(None)` while its
+/// element type is still undecided, `Err(())` when it is not such a vector.
+fn real_vector_len(ty: &Type) -> Result<Option<Dim>, ()> {
+    let (len, elem) = match ty {
+        Type::Array { shape, elem } if shape.len() == 1 => (shape[0], &**elem),
+        Type::TVector { len, elem } => (*len, &**elem),
+        Type::Deferred | Type::Any | Type::Var(_) => return Ok(None),
+        _ => return Err(()),
+    };
+    match elem {
+        Type::Scalar(ScalarType::Real | ScalarType::Integer) => Ok(Some(len)),
+        Type::Deferred | Type::Any | Type::Var(_) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+fn state_shape(ty: &Type) -> Option<&[Dim]> {
+    match ty {
+        Type::Array { shape, .. } => Some(shape.as_ref()),
+        _ => None,
+    }
 }
 
 fn scan_state_type(
@@ -3955,6 +4162,18 @@ fn set_element_type_at(
                         elem: Box::new(Type::Scalar(ScalarType::Real)),
                     }
                 }
+                // `corrcholesky(n)` (fork-only) is a set of n×n real matrices:
+                // the element has the ABI of `cartpow(reals, [n, n])`, and the
+                // triangle, positive diagonal and unit row norms live in the
+                // value-set slot (`CorrCholesky`), as for `stdsimplex(n)`.
+                "corrcholesky" => {
+                    let size_arg = c.args.first().copied();
+                    let dim = size_arg.map_or(Dim::Dynamic, |n| resolve_dim(inf, n));
+                    Type::Array {
+                        shape: Box::new([dim, dim]),
+                        elem: Box::new(Type::Scalar(ScalarType::Real)),
+                    }
+                }
                 "cartprod" => {
                     // Clone to release the module borrow before recursing into
                     // set_element_type (mirrors the pattern used in set_expr_valueset).
@@ -4224,6 +4443,7 @@ fn disintegrate_type(inf: &mut Inferencer<'_, '_>, call: &Call, args: &[ArgInfo]
                 let selector = resolve_binding_refs(inf, call.args[0]);
                 let selected = match inf.module.node(selector) {
                     Node::Lit(Scalar::Int(_)) => Some(1),
+                    Node::Packed(p @ flatppl_core::Packed::Int(_)) => Some(p.len()),
                     Node::Call(c)
                         if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
                             && c.args.iter().all(|n| {
@@ -4661,7 +4881,7 @@ fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
         },
         // Literals and named constants are fixed; anything else (holes,
         // cross-module refs) is conservatively non-stochastic.
-        Node::Lit(_) | Node::Const(_) => Phase::Fixed,
+        Node::Lit(_) | Node::Const(_) | Node::Packed(_) => Phase::Fixed,
         _ => Phase::Parametric,
     }
 }
@@ -4993,11 +5213,15 @@ fn ksuperpose_type(
         (None, None) => true,
         _ => false,
     };
-    fn literal_cells(inf: &Inferencer<'_, '_>, node: NodeId, out: &mut Vec<NodeId>) -> bool {
+    fn literal_cells(inf: &Inferencer<'_, '_>, node: NodeId, out: &mut Vec<Scalar>) -> bool {
         let node = resolve_binding_refs(inf, node);
         match inf.module.node(node) {
-            Node::Lit(_) => {
-                out.push(node);
+            Node::Lit(s) => {
+                out.push(s.clone());
+                true
+            }
+            Node::Packed(p) => {
+                out.extend(p.iter());
                 true
             }
             Node::Call(call) if matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector") => {
@@ -5013,7 +5237,7 @@ fn ksuperpose_type(
     }
     let mut literals = Vec::new();
     let literal_unit =
-        literal_cells(inf, *weights, &mut literals) && literal_weights_sum_to_one(inf, &literals);
+        literal_cells(inf, *weights, &mut literals) && literal_weights_sum_to_one(&literals);
     let mass = ksuperpose_mass(
         ksuperpose_component_mass(inf, args[0].0, &args[0].1),
         weights_ty,
@@ -7890,6 +8114,7 @@ const WRITTEN_SIZE_ARGS: &[(&str, &str, usize, &str)] = &[
     ("stdsimplex", "n", 0, "§03 \"Standard simplex\""),
     ("ordered", "n", 0, "§03 \"Ordered vectors\""),
     ("zerosum", "n", 0, "§03 \"Zero-sum vectors\""),
+    ("corrcholesky", "n", 0, "§08 `LKJCholesky`"),
     ("iid", "size", 1, "§06 `iid`"),
     ("markovchain", "n", 2, "§06 `markovchain`"),
     ("LKJ", "n", 0, "§08 `LKJ`"),
@@ -7943,16 +8168,24 @@ fn written_size_check(
     }
     // A written size vector contributes one axis per element; a scalar size is
     // the single axis. Either way the elements are read as written.
-    let axes: Vec<NodeId> = match inf.module.node(size_node).clone() {
+    // A packed element has no node of its own, so the vector carries its blame.
+    let axes: Vec<(NodeId, Option<i64>)> = match inf.module.node(size_node).clone() {
         Node::Call(c) if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector") => {
-            c.args.to_vec()
+            c.args.iter().map(|&a| (a, written_int(inf, a))).collect()
         }
-        _ => vec![size_node],
+        Node::Packed(p) => p
+            .iter()
+            .map(|s| match s {
+                Scalar::Int(n) => (size_node, Some(n)),
+                _ => (size_node, None),
+            })
+            .collect(),
+        _ => vec![(size_node, written_int(inf, size_node))],
     };
     let multi = axes.len() > 1;
     let mut refused = false;
-    for (i, axis) in axes.iter().enumerate() {
-        let Some(n) = written_int(inf, *axis) else {
+    for (i, (axis, n)) in axes.iter().enumerate() {
+        let Some(n) = *n else {
             continue;
         };
         if n > 0 {
@@ -8053,6 +8286,19 @@ fn non_increasing_written_edges(
         Node::Ref(r) if r.ns == RefNs::SelfMod => {
             let binding = inf.module.binding_by_name(r.name)?;
             non_increasing_written_edges(inf, inf.module.binding(binding).rhs, hops + 1)
+        }
+        Node::Packed(p) => {
+            let values = p.iter().map(|s| match s {
+                Scalar::Real(x) => Some(x),
+                Scalar::Int(n) => Some(n as f64),
+                Scalar::Bool(b) => Some(f64::from(b)),
+                Scalar::Str(_) => None,
+            });
+            let values: Vec<Option<f64>> = values.collect();
+            values
+                .windows(2)
+                .any(|pair| matches!(pair, [Some(lo), Some(hi)] if hi <= lo))
+                .then_some(node)
         }
         Node::Call(c) => {
             let CallHead::Builtin(op) = c.head else {
@@ -8281,6 +8527,7 @@ fn written_vector_is_string(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<bo
                 let binding = inf.module.binding_by_name(r.name)?;
                 node = inf.module.binding(binding).rhs;
             }
+            Node::Packed(_) => return Some(false),
             Node::Call(call) if matches!(call.head, CallHead::Builtin(head) if inf.module.resolve(head) == "vector") =>
             {
                 let mut kind = None;
@@ -9266,6 +9513,22 @@ fn refuse_bad_rng_seed(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo
         // A written byte vector is checked element by element; any other vector
         // is a run-time value this pass cannot read.
         let literal = resolve_binding_refs(inf, *node);
+        if let Node::Packed(p) = inf.module.node(literal)
+            && let Some(byte) = p.iter().find_map(|s| match s {
+                Scalar::Int(n) if !(0..=255).contains(&n) => Some(n),
+                _ => None,
+            })
+        {
+            inf.diags.push(crate::Diagnostic::error_at(
+                literal,
+                format!(
+                    "`rnginit` byte-vector seed has element {byte}, outside 0..255: spec \
+                     §07 `rnginit` states that a byte-vector seed contains integers in \
+                     $\\{{0, \\ldots, 255\\}}$"
+                ),
+            ));
+            return Some(Type::Failed("rnginit: seed byte out of range".into()));
+        }
         if let Node::Call(call) = inf.module.node(literal)
             && matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
         {
@@ -10777,15 +11040,8 @@ fn param_dim(inf: &Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo], kw
 // =====================================================================
 
 pub(crate) fn literal_valueset(s: &Scalar) -> ValueSet {
-    match s {
-        Scalar::Int(n) if *n > 0 => ValueSet::PosIntegers,
-        Scalar::Int(n) if *n == 0 => ValueSet::NonNegIntegers,
-        Scalar::Int(_) => ValueSet::Integers,
-        // A real literal is its own singleton interval.
-        Scalar::Real(r) => ValueSet::Interval(*r, *r),
-        Scalar::Bool(_) => ValueSet::Booleans,
-        Scalar::Str(_) => ValueSet::Unknown,
-    }
+    // A real literal is its own singleton interval.
+    ValueSet::of_literal(s)
 }
 
 pub(crate) fn const_valueset(name: &str) -> ValueSet {
@@ -10846,9 +11102,8 @@ pub(crate) fn call_valueset(
         // A set-constructor used directly as a value binding is a PRESET (spec
         // §03): its value-set is the set it denotes. (Its TYPE is `%any` — a set
         // is not a value type — set in the `cartprod`/`interval`/… type arms.)
-        "interval" | "stdsimplex" | "ordered" | "zerosum" | "cartpow" | "cartprod" => {
-            set_call_valueset(inf, call)
-        }
+        "interval" | "stdsimplex" | "ordered" | "zerosum" | "corrcholesky" | "cartpow"
+        | "cartprod" => set_call_valueset(inf, call),
         // Parameters / loaded sets.
         "elementof" | "external" => set_expr_valueset(inf, args.first().map(|a| a.0)),
         "ksuperpose" => args
@@ -11296,6 +11551,11 @@ fn set_call_valueset_at(
                 .first()
                 .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
         ),
+        "corrcholesky" => ValueSet::CorrCholesky(
+            c.args
+                .first()
+                .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
+        ),
         "cartpow" => {
             // The size is REQUIRED (spec §03 "Cartesian power") — the type
             // arm already fails 1-arg `cartpow(S)` (`Type::Failed`, above);
@@ -11427,6 +11687,13 @@ fn distribution_support(
     let Some(sig) = crate::catalogue::builtin().base(name) else {
         return ValueSet::Unknown;
     };
+    // §08 LKJCholesky: "lower-triangular n×n matrices with positive diagonal
+    // and unit-norm rows", the fork's `corrcholesky(n)` set. Its `n` sizes the
+    // set as it sizes the variate (`lkj_matrix_domain`).
+    if name == "LKJCholesky" {
+        let n = named_or_positional_node(inf.module, named, args, "n", 0);
+        return ValueSet::CorrCholesky(n.map_or(Dim::Dynamic, |n| resolve_dim(inf, n)));
+    }
     // Structural support: live code path reads the actual set argument.
     // Currently only Uniform; the static catalogue approximation (Unknown) is
     // not used here — the concrete arg-dependent value is what inference needs.
@@ -11502,7 +11769,14 @@ fn superpose_is_provably_normalized(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) 
         }
         weights.push(weight);
     }
-    literal_weights_sum_to_one(inf, &weights)
+    let literal = weights
+        .iter()
+        .map(|&w| match inf.module.node(w) {
+            Node::Lit(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    literal.is_some_and(|w| literal_weights_sum_to_one(&w))
         || complement_pair(inf, &weights)
         || simplex_weights_cover_vector(inf, &weights)
 }
@@ -11600,12 +11874,9 @@ pub(crate) fn resolve_binding_refs(inf: &Inferencer<'_, '_>, node: NodeId) -> No
 /// So the proof is exact rational arithmetic over what the model says, never
 /// over what a particular float width does with it — FlatPPL mandates no
 /// precision, and this verdict must not move with the engine's.
-fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> bool {
-    fn exact_sum_is_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> Option<bool> {
-        let parsed: Option<Vec<(i128, u32)>> = weights
-            .iter()
-            .map(|&w| decimal_literal(inf.module.node(w)))
-            .collect();
+fn literal_weights_sum_to_one(weights: &[Scalar]) -> bool {
+    fn exact_sum_is_one(weights: &[Scalar]) -> Option<bool> {
+        let parsed: Option<Vec<(i128, u32)>> = weights.iter().map(decimal_literal).collect();
         let parsed = parsed?;
         // A negative weight makes the component a signed measure, not a measure.
         if parsed.iter().any(|&(mantissa, _)| mantissa < 0) {
@@ -11620,7 +11891,7 @@ fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> b
         }
         Some(total == unit)
     }
-    exact_sum_is_one(inf, weights).unwrap_or(false)
+    exact_sum_is_one(weights).unwrap_or(false)
 }
 
 /// A built-in whose value is a property of the NODE rather than of the expression:
@@ -11677,10 +11948,10 @@ fn contains_opaque_value_source(inf: &Inferencer<'_, '_>, node: NodeId) -> bool 
 /// A numeric literal as its declared decimal value: `(mantissa, scale)` denotes
 /// `mantissa / 10^scale`. `None` for a non-literal, and for a magnitude whose
 /// digits would overflow the exact sum.
-fn decimal_literal(node: &Node) -> Option<(i128, u32)> {
-    match node {
-        Node::Lit(Scalar::Int(n)) => Some((*n as i128, 0)),
-        Node::Lit(Scalar::Real(r)) if r.is_finite() => {
+fn decimal_literal(value: &Scalar) -> Option<(i128, u32)> {
+    match value {
+        Scalar::Int(n) => Some((*n as i128, 0)),
+        Scalar::Real(r) if r.is_finite() => {
             // `{}` on an f64 is the shortest decimal that round-trips, i.e. what
             // the model wrote, and never exponent notation.
             let text = format!("{r}");
