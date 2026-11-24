@@ -20,7 +20,6 @@ struct HermitianScaling {
     adjoint: Pair,
     tolerance: Value,
     hermitian: Value,
-    zero: Value,
     one: Value,
 }
 
@@ -61,7 +60,6 @@ impl Emitter<'_> {
             adjoint,
             tolerance,
             hermitian,
-            zero,
             one,
         }
     }
@@ -434,7 +432,6 @@ impl Emitter<'_> {
             adjoint,
             tolerance,
             hermitian,
-            zero,
             one,
         } = self.hermitian_scaling(&input, n);
         if record {
