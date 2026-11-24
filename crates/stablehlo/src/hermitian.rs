@@ -1,6 +1,7 @@
 //! Hermitian cyclic Jacobi iteration with ascending, orthonormal eigenpairs.
 //! An unbatched real input rotates only the two affected rows and columns of
-//! each pair, in the same cyclic order, instead of masking the whole matrix.
+//! each pair, in the same cyclic order, instead of masking the whole matrix,
+//! and is emitted as the versioned private helper `__enzyme_linalg_eigh_v1_*`.
 
 use super::*;
 
@@ -11,7 +12,58 @@ pub(super) struct HermitianEigen {
     pub(super) vectors: Option<Pair>,
 }
 
+/// The input divided by its largest magnitude, its adjoint, and whether it is
+/// Hermitian within the eigensolver's tolerance.
+struct HermitianScaling {
+    scale: Value,
+    scaled: Pair,
+    adjoint: Pair,
+    tolerance: Value,
+    hermitian: Value,
+    one: Value,
+}
+
 impl Emitter<'_> {
+    fn eigen_epsilon(&self) -> f64 {
+        match self.dtype {
+            Dtype::F32 => f32::EPSILON as f64,
+            Dtype::F64 => f64::EPSILON,
+        }
+    }
+
+    fn hermitian_scaling(&mut self, input: &Pair, n: u64) -> HermitianScaling {
+        let epsilon = self.eigen_epsilon();
+        let ar = self.abs(&input.0);
+        let ai = self.abs(&input.1);
+        let magnitude = self.max(&ar, &ai);
+        let scale = self.reduce_max(&magnitude);
+        let zero = self.scalar(0.0);
+        let one = self.scalar(1.0);
+        let positive = self.compare("GT", &scale, &zero);
+        let safe_scale = self.select(&positive, &scale, &one);
+        let scaled = (
+            self.div(&input.0, &safe_scale),
+            self.div(&input.1, &safe_scale),
+        );
+        let adjoint = self.hermitian_adjoint(&scaled);
+        let dr = self.sub(&scaled.0, &adjoint.0);
+        let di = self.sub(&scaled.1, &adjoint.1);
+        let dr = self.abs(&dr);
+        let di = self.abs(&di);
+        let error = self.max(&dr, &di);
+        let error = self.reduce_max(&error);
+        let tolerance = self.scalar(64.0 * epsilon * n as f64);
+        let hermitian = self.compare("LE", &error, &tolerance);
+        HermitianScaling {
+            scale,
+            scaled,
+            adjoint,
+            tolerance,
+            hermitian,
+            one,
+        }
+    }
+
     fn hermitian_adjoint(&mut self, a: &Pair) -> Pair {
         let re = self.svd_transpose(&a.0);
         let im = self.svd_transpose(&a.1);
@@ -266,6 +318,98 @@ impl Emitter<'_> {
             self.convert(&input.0, ElemKind::Real),
             self.convert(&input.1, ElemKind::Real),
         );
+        let real = self.batch_rank(&input.0) == 0 && self.known_zero(&input.1);
+        // Explicit host batches keep primitive replay, as the solve helpers do.
+        if n > 0 && real && !self.host_batch {
+            return Ok(self.symmetric_eigen_helper(&input, n, vectors));
+        }
+        Ok(self.hermitian_eigen(input, n, vectors, real, true).0)
+    }
+
+    /// Unbatched real symmetric eigenpairs through the versioned private
+    /// helper `__enzyme_linalg_eigh_v1_{dtype}_{target}_n{n}`. Enzyme-JAX
+    /// wheels that recognise it differentiate it analytically; any other
+    /// consumer inlines and differentiates its body, the Jacobi solver. The
+    /// helper returns ascending eigenvalues, eigenvector columns at canonical
+    /// phase and one validity flag, so the caller repeats the O(n^2) symmetry
+    /// check to keep its own runtime error apart from non-convergence.
+    fn symmetric_eigen_helper(&mut self, input: &Pair, n: u64, vectors: bool) -> HermitianEigen {
+        let dtype = match self.dtype {
+            Dtype::F32 => "f32",
+            Dtype::F64 => "f64",
+        };
+        let target = match self.target {
+            crate::Target::Cpu => "cpu",
+            crate::Target::Gpu => "gpu",
+        };
+        let name = format!("__enzyme_linalg_eigh_v1_{dtype}_{target}_n{n}");
+        let matrix = MlirTy::Ranked(vec![Some(n), Some(n)]);
+        if !self.solve_helpers.contains_key(&name) {
+            let mut helper = self.scratch_emitter();
+            let a = Value {
+                ssa: "%a".into(),
+                ty: matrix.clone(),
+                elem: ElemKind::Real,
+            };
+            let zero = helper.constant_like(0.0, &a);
+            let (eigen, valid) = helper.hermitian_eigen((a.clone(), zero), n, true, true, false);
+            let valid = valid.expect("a non-empty eigensolve reports its validity");
+            let (eigenvectors, _) = eigen.vectors.expect("requested eigenvectors");
+            let args = [(a.ssa, a.ty, a.elem)];
+            let rets = [&eigen.values, &eigenvectors, &valid];
+            let definition = helper.finish_function(&name, &args, &rets, true);
+            self.solve_helpers.insert(name.clone(), definition);
+        }
+        let hermitian = self.hermitian_scaling(input, n).hermitian;
+        self.record_runtime_error(&hermitian, 12);
+        let vector = MlirTy::Ranked(vec![Some(n)]);
+        let matrix_ty = matrix.render(self.dtype, ElemKind::Real);
+        let vector_ty = vector.render(self.dtype, ElemKind::Real);
+        let result = self.fresh();
+        self.push(&format!(
+            "{result}:3 = func.call @{name}({}) : ({matrix_ty}) -> ({vector_ty}, {matrix_ty}, tensor<i1>)",
+            input.0.ssa,
+        ));
+        let values = Value {
+            ssa: format!("{result}#0"),
+            ty: vector,
+            elem: ElemKind::Real,
+        };
+        let valid = Value {
+            ssa: format!("{result}#2"),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Bool,
+        };
+        // The helper already includes the symmetry check, which is recorded
+        // first, so this reports only non-convergence.
+        self.record_runtime_error(&valid, 10);
+        let vectors = vectors.then(|| {
+            let re = Value {
+                ssa: format!("{result}#1"),
+                ty: matrix,
+                elem: ElemKind::Real,
+            };
+            let zero = self.constant_like(0.0, &re);
+            let nan = self.scalar(f64::NAN);
+            let im = self.select(&valid, &zero, &nan);
+            (re, im)
+        });
+        HermitianEigen { values, vectors }
+    }
+
+    /// Ascending eigenpairs and, for a non-empty matrix, their validity: the
+    /// input is Hermitian within tolerance and the iteration converged. With
+    /// `record` the two failures report runtime errors 12 and 10; a helper
+    /// body returns the validity to its caller instead. `real` selects the
+    /// unbatched real loop.
+    fn hermitian_eigen(
+        &mut self,
+        input: Pair,
+        n: u64,
+        vectors: bool,
+        real: bool,
+        record: bool,
+    ) -> (HermitianEigen, Option<Value>) {
         let axes = self.axes_of(&input.0);
         let batch = self.batch_rank(&input.0);
         let rows = self.axis_indices(&input.0, batch);
@@ -275,43 +419,29 @@ impl Emitter<'_> {
         let zero_matrix = self.constant_like(0.0, &input.0);
         if n == 0 {
             let values = self.diagonal_axes(&input.0, batch, batch + 1);
-            return Ok(HermitianEigen {
+            let eigen = HermitianEigen {
                 values,
                 vectors: vectors.then_some((identity, zero_matrix)),
-            });
+            };
+            return (eigen, None);
         }
-        let epsilon = match self.dtype {
-            Dtype::F32 => f32::EPSILON as f64,
-            Dtype::F64 => f64::EPSILON,
-        };
-        let ar = self.abs(&input.0);
-        let ai = self.abs(&input.1);
-        let magnitude = self.max(&ar, &ai);
-        let scale = self.reduce_max(&magnitude);
-        let zero = self.scalar(0.0);
-        let one = self.scalar(1.0);
-        let positive = self.compare("GT", &scale, &zero);
-        let safe_scale = self.select(&positive, &scale, &one);
-        let scaled = (
-            self.div(&input.0, &safe_scale),
-            self.div(&input.1, &safe_scale),
-        );
-        let adjoint = self.hermitian_adjoint(&scaled);
-        let dr = self.sub(&scaled.0, &adjoint.0);
-        let di = self.sub(&scaled.1, &adjoint.1);
-        let dr = self.abs(&dr);
-        let di = self.abs(&di);
-        let error = self.max(&dr, &di);
-        let error = self.reduce_max(&error);
-        let tolerance = self.scalar(64.0 * epsilon * n as f64);
-        let hermitian = self.compare("LE", &error, &tolerance);
-        self.record_runtime_error(&hermitian, 12);
+        let epsilon = self.eigen_epsilon();
+        let HermitianScaling {
+            scale,
+            scaled,
+            adjoint,
+            tolerance,
+            hermitian,
+            one,
+        } = self.hermitian_scaling(&input, n);
+        if record {
+            self.record_runtime_error(&hermitian, 12);
+        }
         let half = self.scalar(0.5);
         let re = self.add(&scaled.0, &adjoint.0);
         let im = self.add(&scaled.1, &adjoint.1);
         let re = self.mul(&half, &re);
         let im = self.mul(&half, &im);
-        let real = batch == 0 && self.known_zero(&input.1);
         let mut initial = vec![re, im];
         if vectors {
             initial.extend([identity.clone(), zero_matrix]);
@@ -380,7 +510,9 @@ impl Emitter<'_> {
         let off = self.max(&off_r, &off_i);
         let error = self.reduce_max(&off);
         let converged = self.compare("LE", &error, &tolerance);
-        self.record_runtime_error(&converged, 10);
+        if record {
+            self.record_runtime_error(&converged, 10);
+        }
         let valid = self.and(&hermitian, &converged);
         // Stable sorting by pairwise rank retains one column per equal value.
         let column_values = self.svd_expand(&values, &identity, false);
@@ -411,6 +543,121 @@ impl Emitter<'_> {
         } else {
             None
         };
-        Ok(HermitianEigen { values, vectors })
+        (HermitianEigen { values, vectors }, Some(valid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flatppl_core::Idx;
+
+    fn matrix(ssa: &str, batch: usize, n: u64) -> Value {
+        let mut dims = vec![Some(3); batch];
+        dims.extend([Some(n), Some(n)]);
+        Value {
+            ssa: ssa.into(),
+            ty: MlirTy::Ranked(dims),
+            elem: ElemKind::Real,
+        }
+    }
+
+    /// Enzyme-JAX recognises `__enzyme_linalg_eigh_v1_{dtype}_{target}_n{n}`
+    /// only as a private function of one non-empty square real matrix that
+    /// returns the eigenvalues, the eigenvector columns and an `i1` validity.
+    #[test]
+    fn unbatched_real_eigh_calls_the_recognised_helper() {
+        use crate::Target::{Cpu, Gpu};
+        let module = Module::new();
+        let id = NodeId::from_usize(0);
+        for (dtype, target, n, case, helper) in [
+            (Dtype::F32, Cpu, 5, "eigh", true),
+            (Dtype::F64, Cpu, 1, "eigvalsh", true),
+            (Dtype::F64, Gpu, 3, "eigh", true),
+            (Dtype::F64, Cpu, 0, "eigh", false),
+            (Dtype::F64, Cpu, 3, "host batch", false),
+            (Dtype::F64, Cpu, 3, "batched", false),
+            (Dtype::F64, Cpu, 3, "complex", false),
+        ] {
+            let vectors = case != "eigvalsh";
+            let host_batch = case == "host batch";
+            let batch = usize::from(case == "batched");
+            let complex = case == "complex";
+            let mut emitter = Emitter::with_options(
+                &module,
+                &crate::EmitOptions {
+                    dtype,
+                    target,
+                    ..Default::default()
+                },
+            );
+            if host_batch {
+                emitter.lower_for_host_batch();
+            }
+            let re = matrix("%arg0", batch, n);
+            let im = matrix("%arg1", batch, n);
+            for value in [&re, &im] {
+                emitter.remember_axes(
+                    &value.ssa,
+                    Axes {
+                        batch,
+                        layers: vec![2],
+                    },
+                );
+            }
+            let imaginary = if complex {
+                im.clone()
+            } else {
+                emitter.constant_like(0.0, &re)
+            };
+            // Two solves of the same shape share one definition.
+            let first = emitter
+                .matrix_hermitian(id, (re.clone(), imaginary.clone()), vectors)
+                .unwrap();
+            let second = emitter
+                .matrix_hermitian(id, (re.clone(), imaginary), vectors)
+                .unwrap();
+            let codes = emitter.runtime_codes();
+            let mut rets = vec![&first.values, &second.values];
+            if let Some((vectors, _)) = &first.vectors {
+                rets.push(vectors);
+            }
+            let args = [
+                (re.ssa.clone(), re.ty.clone(), re.elem),
+                (im.ssa.clone(), im.ty.clone(), im.elem),
+            ];
+            let ir = emitter.finish("main", &args, &rets);
+            let t = match dtype {
+                Dtype::F32 => "f32",
+                Dtype::F64 => "f64",
+            };
+            let case = format!("{t} {target:?} n={n} {case}:\n{ir}");
+            if !helper {
+                assert!(!ir.contains("__enzyme_linalg_eigh"), "{case}");
+                continue;
+            }
+            let name = format!("{t}_{}_n{n}", format!("{target:?}").to_lowercase());
+            let signature = format!(
+                "  func.func private @__enzyme_linalg_eigh_v1_{name}(%a: tensor<{n}x{n}x{t}>) \
+                 -> (tensor<{n}x{t}>, tensor<{n}x{n}x{t}>, tensor<i1>) {{"
+            );
+            assert_eq!(
+                ir.lines().filter(|line| *line == signature).count(),
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                ir.matches(&format!("func.call @__enzyme_linalg_eigh_v1_{name}("))
+                    .count(),
+                2,
+                "{case}"
+            );
+            // The caller keeps a non-Hermitian input (12) apart from
+            // non-convergence (10).
+            assert!(
+                codes.contains(&12) && codes.contains(&10),
+                "{codes:?} {case}"
+            );
+        }
     }
 }
