@@ -317,21 +317,8 @@ pub(crate) fn emit_logdensity_abi(
         }
         Ok(rets_vals)
     };
-    // odesolve sensitivity control lowers the outputs twice: on the value-only
-    // steps for the value, and on Stan's coupled steps for the derivative
-    // (`ode.rs`). Values not downstream of an odesolve are shared.
-    e.ode_two_pass = true;
-    let mut rets_vals = lower_outputs(&mut e)?;
-    if e.ode_coupled_needed {
-        e.forget_nodes(&reaching_odesolve(m, &abi.outputs));
-        e.ode_coupled_pass = true;
-        let coupled = lower_outputs(&mut e)?;
-        rets_vals = rets_vals
-            .iter()
-            .zip(&coupled)
-            .map(|(value, coupled)| e.ode_combine(value, coupled))
-            .collect();
-    }
+    // odesolve sensitivity control lowers the outputs twice (`ode.rs`).
+    let rets_vals = e.lower_outputs_with_ode_sensitivities(&abi.outputs, lower_outputs)?;
     let rets: Vec<&Value> = rets_vals.iter().collect();
     Ok(e.finish("logdensity", &args, &rets))
 }
@@ -1008,14 +995,10 @@ fn aggregate_columns(m: &Module, rhs: NodeId) -> Option<Vec<(String, Type)>> {
     fields_of(m, m.type_of(rhs)?)
 }
 
-/// A free-parameter declaration: `Phase::Parametric` (spec §04 "Phase of
-/// an expression") AND structurally a bare `elementof(...)` call. The phase
-/// check alone is not enough — see the module doc comment on why phase is a
-/// taint over the whole dependent subtree, not a parameter-leaf marker.
 /// Every node from which an `odesolve` call is reachable, through module-level
 /// bindings and called functions, starting from `roots`: what the coupled
 /// pass of odesolve sensitivity control lowers again.
-fn reaching_odesolve(m: &Module, roots: &[NodeId]) -> HashSet<NodeId> {
+pub(crate) fn reaching_odesolve(m: &Module, roots: &[NodeId]) -> HashSet<NodeId> {
     let mut reaches: HashMap<NodeId, bool> = HashMap::new();
     let mut stack: Vec<(NodeId, bool)> = roots.iter().map(|&root| (root, false)).collect();
     while let Some((node, ready)) = stack.pop() {
@@ -1056,6 +1039,10 @@ fn reaching_odesolve(m: &Module, roots: &[NodeId]) -> HashSet<NodeId> {
         .collect()
 }
 
+/// A free-parameter declaration: `Phase::Parametric` (spec §04 "Phase of
+/// an expression") AND structurally a bare `elementof(...)` call. The phase
+/// check alone is not enough — see the module doc comment on why phase is a
+/// taint over the whole dependent subtree, not a parameter-leaf marker.
 fn is_free_param(m: &Module, rhs: NodeId) -> bool {
     m.phase_of(rhs) == Some(Phase::Parametric) && is_builtin_call(m, rhs, "elementof")
 }

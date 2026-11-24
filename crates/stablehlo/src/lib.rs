@@ -300,9 +300,10 @@ pub struct EmitOptions {
     /// Take derivatives on Stan's coupled forward-sensitivity steps, whose
     /// error norm covers odesolve's sensitivities too, so gradients match
     /// Stan's gradient call; values keep the value-only steps of Stan's
-    /// `log_density`. Logdensity mode only. The sensitivities' Jacobian-vector
-    /// products are `enzyme.fwddiff` operations, which need an Enzyme-JAX build
-    /// whose `hlo_call` accepts Enzyme's dialect.
+    /// `log_density`. Applies to logdensity mode and to host exports; sample
+    /// mode refuses it. The sensitivities' Jacobian-vector products are
+    /// `enzyme.fwddiff` operations, which need an Enzyme-JAX build whose
+    /// `hlo_call` accepts Enzyme's dialect.
     pub ode_sensitivity_control: bool,
 }
 

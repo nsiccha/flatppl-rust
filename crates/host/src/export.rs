@@ -215,20 +215,24 @@ pub fn emit_query(
         &declared,
         &inputs,
     );
-    let tensorize = emitter
-        .can_tensorize_call(&results.iter().map(|leaf| leaf.node).collect::<Vec<_>>())
+    let result_nodes = results.iter().map(|leaf| leaf.node).collect::<Vec<_>>();
+    let tensorize = emitter.can_tensorize_call(&result_nodes)
         && arguments.iter().all(|leaf| !matches!(leaf.ty, MlirTy::Key));
-    let mut returned = Vec::new();
-    for leaf in &results {
-        let value = emitter.lower_node(leaf.node)?;
-        if value.ty != leaf.ty || value.elem != leaf.elem {
-            return Err(EmitError::at(
-                leaf.node,
-                "emitted result type disagrees with the query schema",
-            ));
-        }
-        returned.push(value);
-    }
+    let returned = emitter.lower_outputs_with_ode_sensitivities(&result_nodes, |emitter| {
+        results
+            .iter()
+            .map(|leaf| {
+                let value = emitter.lower_node(leaf.node)?;
+                if value.ty != leaf.ty || value.elem != leaf.elem {
+                    return Err(EmitError::at(
+                        leaf.node,
+                        "emitted result type disagrees with the query schema",
+                    ));
+                }
+                Ok(value)
+            })
+            .collect()
+    })?;
     let runtime_status = emitter.runtime_status().map(|_| RuntimeStatus {
         index: returned.len(),
         dtype: match dtype {
@@ -262,33 +266,39 @@ pub fn emit_query(
             bind_inputs(
                 &mut e, &module, &roots, &mut paths, &bound, &declared, &inputs,
             );
-            results
-                .iter()
-                .map(|leaf| {
-                    let value = e.lower_node(leaf.node)?;
-                    let value = e.batch_output(&value, batch);
-                    let mut expected = batch.shape.iter().copied().map(Some).collect::<Vec<_>>();
-                    match &leaf.ty {
-                        MlirTy::Scalar => {}
-                        MlirTy::Ranked(dims) => expected.extend(dims),
-                        _ => {
+            e.lower_outputs_with_ode_sensitivities(&result_nodes, |e| {
+                results.iter().map(|leaf| e.lower_node(leaf.node)).collect()
+            })
+            .and_then(|values| {
+                values
+                    .iter()
+                    .zip(&results)
+                    .map(|(value, leaf)| {
+                        let value = e.batch_output(value, batch);
+                        let mut expected =
+                            batch.shape.iter().copied().map(Some).collect::<Vec<_>>();
+                        match &leaf.ty {
+                            MlirTy::Scalar => {}
+                            MlirTy::Ranked(dims) => expected.extend(dims),
+                            _ => {
+                                return Err(EmitError::at(
+                                    leaf.node,
+                                    "batched output requires a numeric tensor",
+                                ));
+                            }
+                        }
+                        if value.ty != MlirTy::Ranked(expected) || value.elem != leaf.elem {
                             return Err(EmitError::at(
                                 leaf.node,
-                                "batched output requires a numeric tensor",
+                                "batched result type disagrees with the query schema",
                             ));
                         }
-                    }
-                    if value.ty != MlirTy::Ranked(expected) || value.elem != leaf.elem {
-                        return Err(EmitError::at(
-                            leaf.node,
-                            "batched result type disagrees with the query schema",
-                        ));
-                    }
-                    Ok(value)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(|values| e.finish("main", &physical, &values.iter().collect::<Vec<_>>()))
-                .ok()
+                        Ok(value)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map(|values| e.finish("main", &physical, &values.iter().collect::<Vec<_>>()))
+            .ok()
         } else {
             None
         };

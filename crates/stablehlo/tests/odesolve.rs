@@ -369,3 +369,41 @@ inputs = x
     let plain = emit(src, Target::Cpu, Dtype::F64).expect("emit odesolve");
     assert_eq!(coupled, plain);
 }
+
+#[test]
+fn sample_mode_refuses_sensitivity_control() {
+    // A draw whose mean is read from the solution.
+    let src = r#"flatppl_compat = "0.1"
+k = elementof(posreals)
+decay(t, y, k) = -k .* y
+level = sum(rowstack(odesolve(decay, [1.0, 2.0], 0.0, [0.5, 1.0], k))[:, 1])
+draw, state = rand(Normal(level, 1.0), rnginit(7))
+inputs = k
+outputs = (draw, state)
+"#;
+    let (mut model, diagnostics) = inferred(src);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let roots = [model.intern("inputs"), model.intern("outputs")];
+    let lowered = flatppl_determinizer::determinize_with_options(
+        &model,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+        &flatppl_stablehlo::LOWERING_OPTIONS,
+    )
+    .unwrap();
+    let options = EmitOptions {
+        dtype: Dtype::F64,
+        restrict_enzyme_compatible: false,
+        ode_sensitivity_control: true,
+        ..Default::default()
+    };
+    let error = flatppl_stablehlo::emit(&lowered, Mode::Sample, &options)
+        .expect_err("sample mode refuses sensitivity control")
+        .to_string();
+    assert!(error.contains("not to sample mode"), "{error}");
+    let plain = EmitOptions {
+        ode_sensitivity_control: false,
+        ..options
+    };
+    flatppl_stablehlo::emit(&lowered, Mode::Sample, &plain).expect("sample mode without it");
+}
