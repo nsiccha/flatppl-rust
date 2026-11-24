@@ -754,7 +754,9 @@ impl NativeModule {
     /// `prepare_fixed_data` moves data-only likelihood summaries into the
     /// export's `preparation`, which the caller runs once and passes after the
     /// declared input leaves (`LoadedModule::compile_prepared`).
-    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", sufficient_statistics=true, prepare_fixed_data=false))]
+    /// `ode_sensitivity_control` takes odesolve's derivatives on Stan's coupled
+    /// sensitivity steps (`EmitOptions::ode_sensitivity_control`).
+    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", sufficient_statistics=true, prepare_fixed_data=false, ode_sensitivity_control=false))]
     #[allow(clippy::too_many_arguments)]
     fn export(
         &self,
@@ -766,6 +768,7 @@ impl NativeModule {
         target: &str,
         sufficient_statistics: bool,
         prepare_fixed_data: bool,
+        ode_sensitivity_control: bool,
     ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
@@ -788,7 +791,7 @@ impl NativeModule {
             target,
             check_parameters: true,
             sufficient_statistics,
-            ode_sensitivity_control: false,
+            ode_sensitivity_control,
         };
         let exported = py
             .detach(|| match (batch, prepare_fixed_data) {

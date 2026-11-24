@@ -59,8 +59,9 @@
 //! the sensitivities of `y` to every non-constant component of `y0` and `p`,
 //! and its error norm runs over both. The two differ by up to the tolerance
 //! (8e-2 in log density on PosteriorDB `lotka_volterra`), and so does the
-//! density downstream of the solution. So a logdensity-mode module lowers its
-//! outputs twice: once on the value-only steps and once on the coupled steps,
+//! density downstream of the solution. So a query lowers its outputs twice
+//! ([`Emitter::lower_outputs_with_ode_sensitivities`], for `@logdensity` and
+//! for host exports): once on the value-only steps and once on the coupled steps,
 //! sharing every value that does not depend on an odesolve. Each output is
 //! `stop(value) + (coupled - stop(coupled))` ([`Emitter::ode_combine`]): the
 //! value of the first pass, which equals it wherever `|value| >= 2^-11` and is
@@ -80,8 +81,8 @@
 //! where its coupled solve does. A component counts as constant when the
 //! emitter can read all its elements at emit time (embedded data, literals);
 //! anything else is a direction, as Stan treats a `var`. The option needs an
-//! Enzyme-JAX build whose `hlo_call` accepts Enzyme's dialect, and other modes
-//! refuse it.
+//! Enzyme-JAX build whose `hlo_call` accepts Enzyme's dialect, and `@sample`
+//! refuses it.
 
 use super::constants::element_count;
 use super::sequences::Components;
@@ -289,7 +290,8 @@ impl Emitter<'_> {
         if self.ode_sensitivity_control && !self.ode_two_pass {
             return Err(EmitError::at(
                 id,
-                "odesolve sensitivity control is lowered for logdensity-mode modules only",
+                "odesolve sensitivity control applies to log densities and host exports, \
+                 not to sample mode",
             ));
         }
         let mut directions = None;
@@ -305,6 +307,34 @@ impl Emitter<'_> {
         }
         let value = self.ode_solve(id, &rhs, &solve, directions.as_ref())?;
         Ok(self.with_typed_axes(id, value))
+    }
+
+    /// Lower a query's outputs `roots` with `lower`, which returns their
+    /// results. Under [`crate::EmitOptions::ode_sensitivity_control`], when an
+    /// odesolve they reach has sensitivity directions, `lower` runs again on
+    /// the coupled steps after the values downstream of an odesolve are
+    /// forgotten, and each result is [`Self::ode_combine`] of the two (module
+    /// docs). Otherwise the results are `lower`'s. `@logdensity` and host
+    /// exports lower their outputs through here; `@sample` does not, so an
+    /// odesolve there refuses the option.
+    pub fn lower_outputs_with_ode_sensitivities(
+        &mut self,
+        roots: &[NodeId],
+        mut lower: impl FnMut(&mut Self) -> Result<Vec<Value>, EmitError>,
+    ) -> Result<Vec<Value>, EmitError> {
+        self.ode_two_pass = true;
+        let values = lower(self)?;
+        if !self.ode_coupled_needed {
+            return Ok(values);
+        }
+        self.forget_nodes(&crate::modes::reaching_odesolve(self.m, roots));
+        self.ode_coupled_pass = true;
+        let coupled = lower(self)?;
+        Ok(values
+            .iter()
+            .zip(&coupled)
+            .map(|(value, coupled)| self.ode_combine(value, coupled))
+            .collect())
     }
 
     /// The combination of one output's two lowerings (module docs): the value

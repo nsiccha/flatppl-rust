@@ -369,3 +369,31 @@ inputs = x
     let plain = emit(src, Target::Cpu, Dtype::F64).expect("emit odesolve");
     assert_eq!(coupled, plain);
 }
+
+#[test]
+fn sample_mode_refuses_sensitivity_control() {
+    let (mut model, diagnostics) = inferred(LOTKA_VOLTERRA);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let roots = [model.intern("inputs"), model.intern("outputs")];
+    let lowered = flatppl_determinizer::determinize_with_options(
+        &model,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+        &flatppl_stablehlo::LOWERING_OPTIONS,
+    )
+    .unwrap();
+    let options = EmitOptions {
+        dtype: Dtype::F64,
+        ode_sensitivity_control: true,
+        ..Default::default()
+    };
+    let error = flatppl_stablehlo::emit(&lowered, Mode::Sample, &options)
+        .expect_err("sample mode refuses sensitivity control")
+        .to_string();
+    assert!(error.contains("not to sample mode"), "{error}");
+    let plain = EmitOptions {
+        ode_sensitivity_control: false,
+        ..options
+    };
+    flatppl_stablehlo::emit(&lowered, Mode::Sample, &plain).expect("sample mode without it");
+}
