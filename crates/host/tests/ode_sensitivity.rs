@@ -161,3 +161,135 @@ fn sensitivity_control_leaves_a_module_without_odesolve_unchanged() {
         module.compile(&options(false)).unwrap().stablehlo
     );
 }
+
+/// Sampling exports (flatppl-python's `autodiff=False`): Enzyme restrictions off.
+fn sampling(ode_sensitivity_control: bool) -> EmitOptions {
+    EmitOptions {
+        restrict_enzyme_compatible: false,
+        ..options(ode_sensitivity_control)
+    }
+}
+
+/// The rng keys an export's draws consume: the operand of each
+/// `stablehlo.rng_bit_generator`.
+fn consumed_keys(stablehlo: &str) -> Vec<&str> {
+    stablehlo
+        .lines()
+        .filter_map(|line| line.split("stablehlo.rng_bit_generator ").nth(1))
+        .map(|rest| rest.split(',').next().unwrap())
+        .collect()
+}
+
+/// The successor key the `n`th draw (from 0, in emission order) produces.
+fn successor(stablehlo: &str, n: usize) -> &str {
+    stablehlo
+        .lines()
+        .filter(|line| line.contains("stablehlo.rng_bit_generator"))
+        .nth(n)
+        .and_then(|line| line.trim().split(',').next())
+        .unwrap()
+}
+
+/// The last operand of `@main`'s `return`: the query's final successor key.
+fn returned_key(stablehlo: &str) -> &str {
+    stablehlo
+        .lines()
+        .skip_while(|line| !line.contains("func.func @main("))
+        .find_map(|line| line.trim().strip_prefix("return "))
+        .and_then(|operands| operands.split(" : ").next())
+        .and_then(|operands| operands.split(", ").last())
+        .unwrap()
+}
+
+#[test]
+fn a_sampling_export_lowers_its_draw_on_both_step_regimes() {
+    // flatppl-python's snag `ode-sensitivity-3b060798`: the successor key
+    // reached the combination of the two passes and panicked.
+    for law in [
+        "m = odesolve(decay, [1.0], 0.0, [1.0], k)\noutputs = rand(Normal(m[1][1], 1.0), state)",
+        "outputs = rand(Normal(odesolve(decay, [1.0], 0.0, [1.0], k)[1][1], 1.0), state)",
+    ] {
+        let source = format!(
+            "flatppl_compat = \"0.1\"\ndecay(t, z, th) = [-th * z[1]]\nstate = rnginit(0)\n\
+             k = elementof(posreals)\ninputs = (state, k)\n{law}\n"
+        );
+        let mut context = Context::default();
+        let module = parse(&mut context, "draw", &source);
+        let plain = module.compile(&sampling(false)).unwrap();
+        let coupled = module.compile(&sampling(true)).unwrap();
+        // One direction, k: the unbatched product.
+        assert!(
+            coupled
+                .stablehlo
+                .contains("func.func private @__flatppl_ode_rhs_0("),
+            "{}",
+            coupled.stablehlo
+        );
+        let products = fwddiffs(&coupled.stablehlo);
+        assert_eq!(products.len(), 7, "{}", coupled.stablehlo);
+        assert!(products.iter().all(|line| !line.contains("width =")));
+        // Both passes draw from the input key, and the export returns the
+        // value pass's successor.
+        assert_eq!(consumed_keys(&plain.stablehlo), ["%arg0"]);
+        assert_eq!(consumed_keys(&coupled.stablehlo), ["%arg0", "%arg0"]);
+        assert_eq!(
+            returned_key(&coupled.stablehlo),
+            successor(&coupled.stablehlo, 0),
+            "{}",
+            coupled.stablehlo
+        );
+        assert_eq!(
+            serde_json::to_value(&coupled.inputs).unwrap(),
+            serde_json::to_value(&plain.inputs).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&coupled.output).unwrap(),
+            serde_json::to_value(&plain.output).unwrap()
+        );
+        // The reporter's prepared form, and a batched one.
+        module.compile_prepared(&sampling(true)).unwrap();
+        let batch = BatchSpec {
+            shape: vec![3],
+            input_axes: vec![vec![Some(0)], vec![Some(0)]],
+        };
+        let batched = module.compile_batched(&sampling(true), &batch).unwrap();
+        assert!(!fwddiffs(&batched.stablehlo).is_empty());
+    }
+}
+
+#[test]
+fn a_chained_draw_returns_the_value_pass_successor_key() {
+    // Both draws are lowered again on the coupled steps; the final successor
+    // key, which carries no derivative, is the value pass's.
+    let source = "flatppl_compat = \"0.1\"\ndecay(t, z, th) = [-th * z[1]]\n\
+                  s = rnginit(0)\nk = elementof(posreals)\n\
+                  m = odesolve(decay, [1.0], 0.0, [1.0], k)\n\
+                  d, s2 = rand(Normal(m[1][1], 1.0), s)\ny, s3 = rand(Normal(d, 1.0), s2)\n\
+                  inputs = (s, k)\noutputs = (y, s3)\n";
+    let mut context = Context::default();
+    let module = parse(&mut context, "chain", source);
+    let plain = module.compile(&sampling(false)).unwrap();
+    let coupled = module.compile(&sampling(true)).unwrap();
+    assert_eq!(
+        consumed_keys(&plain.stablehlo).len(),
+        2,
+        "{}",
+        plain.stablehlo
+    );
+    assert_eq!(
+        consumed_keys(&coupled.stablehlo).len(),
+        4,
+        "{}",
+        coupled.stablehlo
+    );
+    assert_eq!(
+        returned_key(&coupled.stablehlo),
+        successor(&coupled.stablehlo, 1),
+        "{}",
+        coupled.stablehlo
+    );
+    assert_eq!(
+        serde_json::to_value(&coupled.output).unwrap(),
+        serde_json::to_value(&plain.output).unwrap()
+    );
+}
