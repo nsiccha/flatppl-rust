@@ -192,42 +192,9 @@ impl Emitter<'_> {
                     let alpha = entry(e, &p, &p);
                     let beta = entry(e, &q, &q);
                     let gamma = entry(e, &p, &q);
-                    let zero = e.scalar(0.0);
-                    let one = e.scalar(1.0);
-                    let gamma_scale = e.abs(&gamma);
-                    let nonzero = e.compare("GT", &gamma_scale, &zero);
-                    let safe = e.select(&nonzero, &gamma_scale, &one);
-                    let gr = e.div(&gamma, &safe);
-                    let norm2 = e.mul(&gr, &gr);
-                    let absolute = e.svd_safe_sqrt(&norm2);
-                    let absolute = e.mul(&absolute, &gamma_scale);
                     let eps = e.scalar(epsilon);
-                    let active = e.compare("GT", &absolute, &eps);
-                    let safe_gamma = e.select(&active, &absolute, &one);
-                    let difference = e.sub(&beta, &alpha);
-                    let two = e.scalar(2.0);
-                    let twice_gamma = e.mul(&two, &safe_gamma);
-                    let magnitude = e.abs(&difference);
-                    let rotation_scale = e.max(&magnitude, &twice_gamma);
-                    let d = e.div(&magnitude, &rotation_scale);
-                    let g = e.div(&twice_gamma, &rotation_scale);
-                    let d2 = e.mul(&d, &d);
-                    let g2 = e.mul(&g, &g);
-                    let radius = e.add(&d2, &g2);
-                    let radius = e.sqrt(&radius);
-                    let denominator = e.add(&d, &radius);
-                    let tangent = e.div(&g, &denominator);
-                    let negative = e.compare("LT", &difference, &zero);
-                    let minus_tangent = e.neg(&tangent);
-                    let tangent = e.select(&negative, &minus_tangent, &tangent);
-                    let tangent = e.select(&active, &tangent, &zero);
-                    let t2 = e.mul(&tangent, &tangent);
-                    let norm = e.add(&one, &t2);
-                    let norm = e.sqrt(&norm);
-                    let cosine = e.div(&one, &norm);
-                    let sine = e.mul(&cosine, &tangent);
-                    let phase = e.div(&gamma, &safe_gamma);
-                    let w = e.mul(&sine, &phase);
+                    let (cosine, w, _) =
+                        e.jacobi_rotation(&alpha, &beta, (&gamma, None), &eps, &eps, None);
                     // p' = c p - w q; q' = w p + c q, as the general rotation with real phase.
                     let rotate = |e: &mut Self, x: &Value, y: &Value| {
                         let cx = e.mul(&cosine, x);
@@ -367,49 +334,22 @@ impl Emitter<'_> {
                         e.hermitian_entry(&a.0, &p, &q),
                         e.hermitian_entry(&a.1, &p, &q),
                     );
-                    let gr = e.abs(&gamma.0);
-                    let gi = e.abs(&gamma.1);
-                    let gamma_scale = e.max(&gr, &gi);
-                    let nonzero = e.compare("GT", &gamma_scale, &zero);
-                    let safe = e.select(&nonzero, &gamma_scale, &one);
-                    let gr = e.div(&gamma.0, &safe);
-                    let gi = e.div(&gamma.1, &safe);
-                    let gr2 = e.mul(&gr, &gr);
-                    let gi2 = e.mul(&gi, &gi);
-                    let norm2 = e.add(&gr2, &gi2);
-                    let absolute = e.svd_safe_sqrt(&norm2);
-                    let absolute = e.mul(&absolute, &gamma_scale);
                     let eps = e.scalar(epsilon);
-                    let correlated = e.compare("GT", &absolute, &eps);
                     let ordered = e.compare("LT", &p, &q);
-                    let active = e.and(&ordered, &correlated);
-                    let safe_gamma = e.select(&active, &absolute, &one);
-                    let difference = e.sub(&beta, &alpha);
-                    let two = e.scalar(2.0);
-                    let twice_gamma = e.mul(&two, &safe_gamma);
-                    let magnitude = e.abs(&difference);
-                    let rotation_scale = e.max(&magnitude, &twice_gamma);
-                    let d = e.div(&magnitude, &rotation_scale);
-                    let g = e.div(&twice_gamma, &rotation_scale);
-                    let d2 = e.mul(&d, &d);
-                    let g2 = e.mul(&g, &g);
-                    let radius = e.add(&d2, &g2);
-                    let radius = e.sqrt(&radius);
-                    let denominator = e.add(&d, &radius);
-                    let tangent = e.div(&g, &denominator);
-                    let negative = e.compare("LT", &difference, &zero);
-                    let minus_tangent = e.neg(&tangent);
-                    let tangent = e.select(&negative, &minus_tangent, &tangent);
-                    let tangent = e.select(&active, &tangent, &zero);
-                    let t2 = e.mul(&tangent, &tangent);
-                    let norm = e.add(&one, &t2);
-                    let norm = e.sqrt(&norm);
-                    let cosine = e.div(&one, &norm);
-                    let sine = e.mul(&cosine, &tangent);
-                    let phase = (e.div(&gamma.0, &safe_gamma), e.div(&gamma.1, &safe_gamma));
-                    let right = e.svd_rotate(&a, &p, &q, &cosine, &sine, &phase);
+                    let (cosine, wr, wi) = e.jacobi_rotation(
+                        &alpha,
+                        &beta,
+                        (&gamma.0, Some(&gamma.1)),
+                        &eps,
+                        &eps,
+                        Some(&ordered),
+                    );
+                    // svd_rotate scales its phase by the sine; w = c t already
+                    // carries it.
+                    let w = (wr, wi.expect("complex coupling"));
+                    let right = e.svd_rotate(&a, &p, &q, &cosine, &one, &w);
                     let adjoint = e.hermitian_adjoint(&right);
-                    let both = e.svd_rotate(&adjoint, &p, &q, &cosine, &sine, &phase);
+                    let both = e.svd_rotate(&adjoint, &p, &q, &cosine, &one, &w);
                     let both = e.hermitian_adjoint(&both);
                     let mut next = vec![both.0, both.1];
                     if vectors {
@@ -418,8 +358,8 @@ impl Emitter<'_> {
                             &p,
                             &q,
                             &cosine,
-                            &sine,
-                            &phase,
+                            &one,
+                            &w,
                         );
                         next.extend([v.0, v.1]);
                     }

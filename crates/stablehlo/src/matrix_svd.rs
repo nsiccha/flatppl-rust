@@ -381,6 +381,111 @@ impl Emitter<'_> {
         (self.reduce_sum(&re), self.reduce_sum(&im))
     }
 
+    /// The Jacobi rotation that annihilates `gamma`, the `(p, q)` entry of the
+    /// Hermitian pair block `[[alpha, gamma], [conj(gamma), beta]]` (an `eigh`
+    /// pivot block, or the Gram block of two `svd` columns). With
+    /// `d = beta - alpha` and the tangent
+    /// `t = 2 gamma sgn(d) / (|d| + sqrt(d^2 + 4 |gamma|^2))`, the root with
+    /// `|t| <= 1`, the rotation is `p' = c p - conj(w) q`, `q' = w p + c q` for
+    /// `c = 1 / sqrt(1 + |t|^2)` and `w = c t`. Returns `c` and the real and
+    /// (for complex `gamma`) imaginary parts of `w`.
+    ///
+    /// `t` is formed from `gamma` itself, so it is linear in `gamma` near
+    /// zero, and a pair whose gap `|d|` exceeds `gap` is rotated however small
+    /// `gamma` is. Together they keep the rotation differentiable at
+    /// `gamma = 0`, where `dt/dgamma = 1/d` carries the derivative of the
+    /// vectors of a pair that is already diagonal or orthogonal. Splitting
+    /// `gamma` into `|gamma|` and a phase, or skipping every small `gamma`,
+    /// makes that derivative zero. Only a pair that is degenerate to rounding
+    /// (`|d| <= gap` and `|gamma| <= coupling`), or not `ordered`, keeps the
+    /// identity. A pair rotated by both rules gets the same `c` and `w` bit for
+    /// bit for real `gamma`.
+    pub(super) fn jacobi_rotation(
+        &mut self,
+        alpha: &Value,
+        beta: &Value,
+        gamma: (&Value, Option<&Value>),
+        gap: &Value,
+        coupling: &Value,
+        ordered: Option<&Value>,
+    ) -> (Value, Value, Option<Value>) {
+        let zero = self.scalar(0.0);
+        let one = self.scalar(1.0);
+        let two = self.scalar(2.0);
+        let difference = self.sub(beta, alpha);
+        let magnitude = self.abs(&difference);
+        let separated = self.compare("GT", &magnitude, gap);
+        let (gamma_re, gamma_im) = gamma;
+        let re_scale = self.abs(gamma_re);
+        let (correlated, gamma_scale) = match gamma_im {
+            None => (self.compare("GT", &re_scale, coupling), re_scale),
+            Some(im) => {
+                let rr = self.mul(gamma_re, gamma_re);
+                let ii = self.mul(im, im);
+                let norm2 = self.add(&rr, &ii);
+                let limit2 = self.mul(coupling, coupling);
+                let im_scale = self.abs(im);
+                (
+                    self.compare("GT", &norm2, &limit2),
+                    self.max(&re_scale, &im_scale),
+                )
+            }
+        };
+        let active = self.or(&separated, &correlated);
+        let active = match ordered {
+            Some(ordered) => self.and(ordered, &active),
+            None => active,
+        };
+        // t is invariant under a common scale of d and gamma, so normalising
+        // by the larger of |d| and 2|gamma| keeps the squares representable.
+        let twice_scale = self.mul(&two, &gamma_scale);
+        let rotation_scale = self.max(&magnitude, &twice_scale);
+        let rotation_scale = self.select(&active, &rotation_scale, &one);
+        let d = self.div(&magnitude, &rotation_scale);
+        let d2 = self.mul(&d, &d);
+        let scaled = |e: &mut Self, part: &Value| {
+            let twice = e.mul(&two, part);
+            let g = e.div(&twice, &rotation_scale);
+            let g2 = e.mul(&g, &g);
+            (g, g2)
+        };
+        let (gr, gr2) = scaled(self, gamma_re);
+        let gi = gamma_im.map(|im| scaled(self, im));
+        let radius2 = self.add(&d2, &gr2);
+        let radius2 = match &gi {
+            Some((_, gi2)) => self.add(&radius2, gi2),
+            None => radius2,
+        };
+        // A pair with d = gamma = 0 would otherwise feed sqrt's infinite
+        // slope at zero into the reverse pass, even through a discarded branch.
+        let radius2 = self.select(&active, &radius2, &one);
+        let radius = self.sqrt(&radius2);
+        let denominator = self.add(&d, &radius);
+        let negative = self.compare("LT", &difference, &zero);
+        let tangent = |e: &mut Self, g: &Value| {
+            let t = e.div(g, &denominator);
+            let minus = e.neg(&t);
+            let t = e.select(&negative, &minus, &t);
+            e.select(&active, &t, &zero)
+        };
+        let tr = tangent(self, &gr);
+        let ti = gi.map(|(gi, _)| tangent(self, &gi));
+        let t2 = self.mul(&tr, &tr);
+        let t2 = match &ti {
+            Some(ti) => {
+                let ti2 = self.mul(ti, ti);
+                self.add(&t2, &ti2)
+            }
+            None => t2,
+        };
+        let norm = self.add(&one, &t2);
+        let norm = self.sqrt(&norm);
+        let cosine = self.div(&one, &norm);
+        let wr = self.mul(&cosine, &tr);
+        let wi = ti.map(|ti| self.mul(&cosine, &ti));
+        (cosine, wr, wi)
+    }
+
     /// Apply a unitary two-column rotation to B and its right singular basis.
     pub(super) fn svd_rotate(
         &mut self,
@@ -547,64 +652,41 @@ impl Emitter<'_> {
                 let alpha = e.svd_norm2(&bp);
                 let beta = e.svd_norm2(&bq);
                 let gamma = e.svd_inner(&bp, &bq);
-                let gr = e.abs(&gamma.0);
-                let gi = e.abs(&gamma.1);
-                let gamma_scale = e.max(&gr, &gi);
-                let nonzero_gamma = e.compare("GT", &gamma_scale, &zero);
-                let safe = e.select(&nonzero_gamma, &gamma_scale, &one);
-                let gr = e.div(&gr, &safe);
-                let gi = e.div(&gi, &safe);
-                let gr2 = e.mul(&gr, &gr);
-                let gi2 = e.mul(&gi, &gi);
-                let absolute2 = e.add(&gr2, &gi2);
-                let absolute = e.svd_safe_sqrt(&absolute2);
-                let absolute = e.mul(&absolute, &gamma_scale);
+                // Columns count as orthogonal relative to their norms, and as
+                // equally long relative to their total.
                 let norm_p = e.svd_safe_sqrt(&alpha);
                 let norm_q = e.svd_safe_sqrt(&beta);
                 let norm_product = e.mul(&norm_p, &norm_q);
-                let threshold = e.mul(&tolerance, &norm_product);
-                let correlated = e.compare("GT", &absolute, &threshold);
+                let coupling = e.mul(&tolerance, &norm_product);
+                let total = e.add(&alpha, &beta);
+                let gap = e.mul(&tolerance, &total);
                 let ordered = e.compare("LT", &p, &q);
-                let active = e.and(&ordered, &correlated);
-                let safe_gamma = e.select(&active, &absolute, &one);
-                let difference = e.sub(&beta, &alpha);
-                let two = e.scalar(2.0);
-                let twice_gamma = e.mul(&two, &safe_gamma);
-                let magnitude = e.abs(&difference);
-                let rotation_scale = e.max(&magnitude, &twice_gamma);
-                let d = e.div(&magnitude, &rotation_scale);
-                let g = e.div(&twice_gamma, &rotation_scale);
-                let d2 = e.mul(&d, &d);
-                let g2 = e.mul(&g, &g);
-                let radius = e.add(&d2, &g2);
-                let radius = e.sqrt(&radius);
-                let denominator = e.add(&d, &radius);
-                let tangent = e.div(&g, &denominator);
-                let negative = e.compare("LT", &difference, &zero);
-                let minus_tangent = e.neg(&tangent);
-                let tangent = e.select(&negative, &minus_tangent, &tangent);
-                let tangent = e.select(&active, &tangent, &zero);
-                let t2 = e.mul(&tangent, &tangent);
-                let norm = e.add(&one, &t2);
-                let norm = e.sqrt(&norm);
-                let cosine = e.div(&one, &norm);
-                let sine = e.mul(&cosine, &tangent);
-                let phase = (e.div(&gamma.0, &safe_gamma), e.div(&gamma.1, &safe_gamma));
+                let (cosine, wr, wi) = e.jacobi_rotation(
+                    &alpha,
+                    &beta,
+                    (&gamma.0, Some(&gamma.1)),
+                    &gap,
+                    &coupling,
+                    Some(&ordered),
+                );
+                // svd_rotate scales its phase by the sine; w = c t already
+                // carries it.
+                let w = (wr, wi.expect("complex coupling"));
                 let b = e.svd_rotate(
                     &(state[0].clone(), state[1].clone()),
                     &p,
                     &q,
                     &cosine,
-                    &sine,
-                    &phase,
+                    &one,
+                    &w,
                 );
                 let v = e.svd_rotate(
                     &(state[2].clone(), state[3].clone()),
                     &p,
                     &q,
                     &cosine,
-                    &sine,
-                    &phase,
+                    &one,
+                    &w,
                 );
                 vec![b.0, b.1, v.0, v.1]
             })
