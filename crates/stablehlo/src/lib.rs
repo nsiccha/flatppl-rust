@@ -297,6 +297,13 @@ pub struct EmitOptions {
     /// Check distribution parameters against their declared value sets at run
     /// time (status 9). Constants are always checked at emit time.
     pub check_parameters: bool,
+    /// Take derivatives on Stan's coupled forward-sensitivity steps, whose
+    /// error norm covers odesolve's sensitivities too, so gradients match
+    /// Stan's gradient call; values keep the value-only steps of Stan's
+    /// `log_density`. Logdensity mode only. The sensitivities' Jacobian-vector
+    /// products are `enzyme.fwddiff` operations, which need an Enzyme-JAX build
+    /// whose `hlo_call` accepts Enzyme's dialect.
+    pub ode_sensitivity_control: bool,
 }
 
 /// Error estimates for positive scalar integrals, evaluated in log space.
@@ -337,6 +344,7 @@ impl Default for EmitOptions {
             integration: None,
             target: Target::Cpu,
             check_parameters: true,
+            ode_sensitivity_control: false,
         }
     }
 }

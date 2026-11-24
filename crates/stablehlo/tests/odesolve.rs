@@ -59,6 +59,29 @@ fn inferred(src: &str) -> (flatppl_core::Module, Vec<flatppl_infer::Diagnostic>)
 }
 
 fn emit(src: &str, target: Target, dtype: Dtype) -> Result<String, String> {
+    emit_with(
+        src,
+        &EmitOptions {
+            target,
+            dtype,
+            ..Default::default()
+        },
+    )
+}
+
+/// `f64` CPU emission with odesolve's sensitivity control.
+fn emit_coupled(src: &str) -> Result<String, String> {
+    emit_with(
+        src,
+        &EmitOptions {
+            dtype: Dtype::F64,
+            ode_sensitivity_control: true,
+            ..Default::default()
+        },
+    )
+}
+
+fn emit_with(src: &str, options: &EmitOptions) -> Result<String, String> {
     let (mut model, diagnostics) = inferred(src);
     if let Some(d) = diagnostics.first() {
         return Err(d.message.clone());
@@ -71,16 +94,7 @@ fn emit(src: &str, target: Target, dtype: Dtype) -> Result<String, String> {
         &flatppl_stablehlo::LOWERING_OPTIONS,
     )
     .map_err(|e| e.reason)?;
-    flatppl_stablehlo::emit(
-        &lowered,
-        Mode::LogDensity,
-        &EmitOptions {
-            target,
-            dtype,
-            ..Default::default()
-        },
-    )
-    .map_err(|e| e.to_string())
+    flatppl_stablehlo::emit(&lowered, Mode::LogDensity, options).map_err(|e| e.to_string())
 }
 
 #[test]
@@ -248,4 +262,110 @@ fn unknown_keyword_and_non_vector_state_are_refused() {
     let real_steps = LOTKA_VOLTERRA.replace("max_steps = 500", "max_steps = 0.5");
     let error = emit(&real_steps, Target::Cpu, Dtype::F64).unwrap_err();
     assert!(error.contains("`max_steps` as an integer"), "{error}");
+}
+
+/// The `enzyme.fwddiff` lines of an emitted module.
+fn fwddiffs(ir: &str) -> Vec<&str> {
+    ir.lines()
+        .map(str::trim)
+        .filter(|line| line.contains("enzyme.fwddiff"))
+        .collect()
+}
+
+#[test]
+fn sensitivity_control_is_off_by_default() {
+    let ir = emit(LOTKA_VOLTERRA, Target::Cpu, Dtype::F64).expect("emit odesolve");
+    assert!(!ir.contains("enzyme."), "{ir}");
+    assert!(!ir.contains("__flatppl_ode_rhs_"), "{ir}");
+}
+
+#[test]
+fn sensitivity_control_lowers_the_outputs_again_on_coupled_steps() {
+    let ir = emit_coupled(LOTKA_VOLTERRA).expect("emit odesolve");
+    // The value pass and the coupled pass each nest an adaptive loop in a
+    // counted loop over the output times.
+    assert_eq!(ir.matches("stablehlo.while").count(), 4, "{ir}");
+    assert!(
+        ir.contains(
+            "func.func private @__flatppl_ode_rhs_0(%t: tensor<f64>, %y: tensor<2xf64>, \
+             %p0: tensor<4xf64>) -> tensor<2xf64>"
+        ),
+        "{ir}"
+    );
+    // z0's 2 and theta's 4 components are the directions: one product at
+    // t0 and one per stage after the first.
+    let products = fwddiffs(&ir);
+    assert_eq!(products.len(), 7, "{ir}");
+    for line in products {
+        assert!(line.contains("@__flatppl_ode_rhs_0("), "{line}");
+        assert!(line.contains("width = 6 : i64"), "{line}");
+        assert!(
+            line.contains(
+                "activity=[#enzyme.activity<enzyme_const>, #enzyme.activity<enzyme_dup>, \
+                 #enzyme.activity<enzyme_dup>]"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "(tensor<f64>, tensor<2xf64>, tensor<6x2xf64>, tensor<4xf64>, \
+                 tensor<6x4xf64>) -> tensor<6x2xf64>"
+            ),
+            "{line}"
+        );
+    }
+    // The coupled loops carry the sensitivities and their slope.
+    assert!(
+        ir.contains("tensor<6x2xf64>, tensor<6x2xf64>, tensor<4x2xf64>"),
+        "{ir}"
+    );
+}
+
+#[test]
+fn sensitivity_directions_skip_constant_parameters_and_states() {
+    // `[0.0]` and the record's K_m, D and V are constants: k_a and V_m remain.
+    let ir = emit_coupled(ABSORPTION).expect("emit odesolve");
+    let products = fwddiffs(&ir);
+    assert_eq!(products.len(), 7, "{ir}");
+    let const_ = "#enzyme.activity<enzyme_const>";
+    let dup = "#enzyme.activity<enzyme_dup>";
+    let activity =
+        format!("activity=[{const_}, {dup}, {dup}, {const_}, {dup}, {const_}, {const_}]");
+    for line in products {
+        assert!(line.contains(&activity), "{line}");
+        assert!(line.contains("width = 2 : i64"), "{line}");
+    }
+}
+
+#[test]
+fn one_sensitivity_direction_takes_the_unbatched_form() {
+    let src = r#"flatppl_compat = "0.1"
+k = elementof(posreals)
+decay(t, y, k) = -k .* y
+outputs = sum(rowstack(odesolve(decay, [1.0, 2.0], 0.0, [0.5, 1.0], k))[:, 1])
+inputs = k
+"#;
+    let ir = emit_coupled(src).expect("emit odesolve");
+    let products = fwddiffs(&ir);
+    assert_eq!(products.len(), 7, "{ir}");
+    for line in products {
+        assert!(!line.contains("width ="), "{line}");
+        assert!(
+            line.ends_with("(tensor<f64>, tensor<2xf64>, tensor<2xf64>, tensor<f64>, tensor<f64>) -> tensor<2xf64>"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn sensitivity_control_without_directions_changes_nothing() {
+    let src = r#"flatppl_compat = "0.1"
+x = elementof(reals)
+decay(t, y, k) = -k .* y
+outputs = x * sum(rowstack(odesolve(decay, [1.0, 2.0], 0.0, [0.5, 1.0], 0.7))[:, 1])
+inputs = x
+"#;
+    let coupled = emit_coupled(src).expect("emit odesolve");
+    let plain = emit(src, Target::Cpu, Dtype::F64).expect("emit odesolve");
+    assert_eq!(coupled, plain);
 }

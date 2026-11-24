@@ -296,6 +296,12 @@ enum Command {
         /// Maximum adaptive quadrature intervals. Failed convergence returns NaN.
         #[arg(long, default_value_t = 128, requires = "numerical_integrals")]
         integration_max_intervals: u32,
+        /// Take odesolve derivatives on Stan's coupled sensitivity steps, so
+        /// gradients match Stan's gradient call; values keep the value-only steps
+        /// (logdensity mode). Emits enzyme.fwddiff: the module then needs an
+        /// Enzyme-JAX build whose hlo_call accepts Enzyme's dialect.
+        #[arg(long)]
+        ode_sensitivity_control: bool,
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -541,6 +547,7 @@ fn main() -> ExitCode {
             integration_rtol,
             integration_atol,
             integration_max_intervals,
+            ode_sensitivity_control,
             output,
         } => stablehlo_cmd(
             &input,
@@ -564,6 +571,7 @@ fn main() -> ExitCode {
                 } else {
                     flatppl_stablehlo::Target::Cpu
                 },
+                ode_sensitivity_control,
             },
             output.as_deref(),
             LikelihoodOutput {
