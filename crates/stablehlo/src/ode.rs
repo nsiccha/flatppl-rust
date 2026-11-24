@@ -66,6 +66,8 @@
 //! `stop(value) + (coupled - stop(coupled))` ([`Emitter::ode_combine`]): the
 //! value of the first pass, which equals it wherever `|value| >= 2^-11` and is
 //! within `2^-63` of it elsewhere, with the derivative of the second.
+//! An output that is not a real tensor, such as a sampling export's successor
+//! rng state, is the value pass's.
 //! Combining the solutions instead would evaluate the density's derivative at
 //! the value-only states, about 1e-3 off Stan's gradient on that model.
 //!
@@ -338,9 +340,15 @@ impl Emitter<'_> {
     }
 
     /// The combination of one output's two lowerings (module docs): the value
-    /// of the value pass with the derivative of the coupled pass.
+    /// of the value pass with the derivative of the coupled pass. Anything but
+    /// a real tensor, such as an rng key (whose element kind reads real), is
+    /// the value pass's.
     pub(crate) fn ode_combine(&mut self, value: &Value, coupled: &Value) -> Value {
-        if value.ssa == coupled.ssa || value.elem != ElemKind::Real || value.ty != coupled.ty {
+        if value.ssa == coupled.ssa
+            || value.elem != ElemKind::Real
+            || !matches!(value.ty, MlirTy::Scalar | MlirTy::Ranked(_))
+            || value.ty != coupled.ty
+        {
             return value.clone();
         }
         let value = self.without_derivative(value);
