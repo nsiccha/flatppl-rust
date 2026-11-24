@@ -69,7 +69,7 @@
 //! Enzyme-JAX before any gradient runs, while a multi-result `func.func`
 //! imports, executes and differentiates.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
@@ -295,24 +295,42 @@ pub(crate) fn emit_logdensity_abi(
     }
     check_arity(abi, args.len())?;
 
-    let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
-    for &node in &abi.outputs {
-        let before = rets_vals.len();
-        if let Some(indices) = crate::indices::outputs(&mut e, node) {
-            rets_vals.extend(indices?);
-        } else {
-            lower_output(&mut e, node, &mut rets_vals)?;
+    let lower_outputs = |e: &mut Emitter| -> Result<Vec<Value>, EmitError> {
+        let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
+        for &node in &abi.outputs {
+            let before = rets_vals.len();
+            if let Some(indices) = crate::indices::outputs(e, node) {
+                rets_vals.extend(indices?);
+            } else {
+                lower_output(e, node, &mut rets_vals)?;
+            }
+            // A drawn successor state is threaded by `@sample` (spec §07 rng ABI,
+            // §13 output reduction). A key computed from a seed is an ordinary value.
+            if rets_vals[before..].iter().any(|v| v.ty == MlirTy::Key) && reaches_sample(m, node) {
+                return Err(EmitError::at(
+                    node,
+                    "this output is an rng state, which logdensity mode does not return; \
+                     a query that threads the random state needs `--mode sample` (spec §07 \
+                     \"Random number generation\", §13 \"Output reduction\")",
+                ));
+            }
         }
-        // A drawn successor state is threaded by `@sample` (spec §07 rng ABI,
-        // §13 output reduction). A key computed from a seed is an ordinary value.
-        if rets_vals[before..].iter().any(|v| v.ty == MlirTy::Key) && reaches_sample(m, node) {
-            return Err(EmitError::at(
-                node,
-                "this output is an rng state, which logdensity mode does not return; \
-                 a query that threads the random state needs `--mode sample` (spec §07 \
-                 \"Random number generation\", §13 \"Output reduction\")",
-            ));
-        }
+        Ok(rets_vals)
+    };
+    // odesolve sensitivity control lowers the outputs twice: on the value-only
+    // steps for the value, and on Stan's coupled steps for the derivative
+    // (`ode.rs`). Values not downstream of an odesolve are shared.
+    e.ode_two_pass = true;
+    let mut rets_vals = lower_outputs(&mut e)?;
+    if e.ode_coupled_needed {
+        e.forget_nodes(&reaching_odesolve(m, &abi.outputs));
+        e.ode_coupled_pass = true;
+        let coupled = lower_outputs(&mut e)?;
+        rets_vals = rets_vals
+            .iter()
+            .zip(&coupled)
+            .map(|(value, coupled)| e.ode_combine(value, coupled))
+            .collect();
     }
     let rets: Vec<&Value> = rets_vals.iter().collect();
     Ok(e.finish("logdensity", &args, &rets))
@@ -994,6 +1012,50 @@ fn aggregate_columns(m: &Module, rhs: NodeId) -> Option<Vec<(String, Type)>> {
 /// an expression") AND structurally a bare `elementof(...)` call. The phase
 /// check alone is not enough — see the module doc comment on why phase is a
 /// taint over the whole dependent subtree, not a parameter-leaf marker.
+/// Every node from which an `odesolve` call is reachable, through module-level
+/// bindings and called functions, starting from `roots`: what the coupled
+/// pass of odesolve sensitivity control lowers again.
+fn reaching_odesolve(m: &Module, roots: &[NodeId]) -> HashSet<NodeId> {
+    let mut reaches: HashMap<NodeId, bool> = HashMap::new();
+    let mut stack: Vec<(NodeId, bool)> = roots.iter().map(|&root| (root, false)).collect();
+    while let Some((node, ready)) = stack.pop() {
+        if reaches.contains_key(&node) && !ready {
+            continue;
+        }
+        let mut children = m.node(node).children();
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(node)
+            && let Some(binding) = m.binding_by_name(*name)
+        {
+            children.push(m.binding(binding).rhs);
+        }
+        if ready {
+            let hit = is_builtin_call(m, node, "odesolve")
+                || children
+                    .iter()
+                    .any(|child| reaches.get(child) == Some(&true));
+            reaches.insert(node, hit);
+        } else {
+            // Mark the node in progress, so a shared descendant is visited once.
+            reaches.insert(node, false);
+            stack.push((node, true));
+            stack.extend(
+                children
+                    .into_iter()
+                    .filter(|child| !reaches.contains_key(child))
+                    .map(|child| (child, false)),
+            );
+        }
+    }
+    reaches
+        .into_iter()
+        .filter(|&(_, hit)| hit)
+        .map(|(node, _)| node)
+        .collect()
+}
+
 fn is_free_param(m: &Module, rhs: NodeId) -> bool {
     m.phase_of(rhs) == Some(Phase::Parametric) && is_builtin_call(m, rhs, "elementof")
 }

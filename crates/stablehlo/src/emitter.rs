@@ -180,6 +180,14 @@ pub struct Emitter<'m> {
     pub(crate) sufficient_statistics: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
+    /// Step odesolve on the error of its sensitivities too (see `ode.rs`).
+    pub(crate) ode_sensitivity_control: bool,
+    /// The outputs are lowered twice, once per step regime (logdensity mode).
+    pub(crate) ode_two_pass: bool,
+    /// This lowering is the second pass, on the coupled steps.
+    pub(crate) ode_coupled_pass: bool,
+    /// The first pass lowered an odesolve with sensitivity directions.
+    pub(crate) ode_coupled_needed: bool,
     /// The program is replayed over host batch axes after lowering.
     host_batch: bool,
     runtime_batch_rank: usize,
@@ -264,6 +272,10 @@ impl<'m> Emitter<'m> {
             sufficient_statistics: true,
             integration: None,
             target: crate::Target::Cpu,
+            ode_sensitivity_control: false,
+            ode_two_pass: false,
+            ode_coupled_pass: false,
+            ode_coupled_needed: false,
             host_batch: false,
             runtime_batch_rank: 0,
             runtime_status: None,
@@ -302,7 +314,14 @@ impl<'m> Emitter<'m> {
         emitter.sufficient_statistics = opts.sufficient_statistics;
         emitter.integration = opts.integration;
         emitter.target = opts.target;
+        emitter.ode_sensitivity_control = opts.ode_sensitivity_control;
         emitter
+    }
+
+    /// Drop the lowered values of `nodes`, so the next lowering recomputes them.
+    pub(crate) fn forget_nodes(&mut self, nodes: &HashSet<NodeId>) {
+        self.memo.retain(|node, _| !nodes.contains(node));
+        self.columns.retain(|(node, _), _| !nodes.contains(node));
     }
 
     /// A new region's scratch emitter must preserve target restrictions.
@@ -313,6 +332,7 @@ impl<'m> Emitter<'m> {
         emitter.sufficient_statistics = self.sufficient_statistics;
         emitter.integration = self.integration;
         emitter.target = self.target;
+        emitter.ode_sensitivity_control = self.ode_sensitivity_control;
         emitter.host_batch = self.host_batch;
         emitter.runtime_batch_rank = self.runtime_batch_rank;
         emitter.region_depth = self.region_depth + 1;

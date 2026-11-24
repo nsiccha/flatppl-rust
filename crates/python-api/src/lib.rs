@@ -788,6 +788,7 @@ impl NativeModule {
             target,
             check_parameters: true,
             sufficient_statistics,
+            ode_sensitivity_control: false,
         };
         let exported = py
             .detach(|| match (batch, prepare_fixed_data) {
