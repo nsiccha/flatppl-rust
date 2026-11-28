@@ -274,12 +274,11 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         && f.parameters
             .iter()
             .any(|&(name, value)| m.resolve(name) == "sigma" && r.scalar(m, value).is_some())
-        && call(
-            m,
-            resolve_record_field(m, f.observed, &r.boundary),
-            "vector",
-        )
-        .is_some()
+        && {
+            // Fixed observations in either literal spelling.
+            let observed = resolve_record_field(m, f.observed, &r.boundary);
+            call(m, observed, "vector").is_some() || matches!(m.node(observed), Node::Packed(_))
+        }
         && r.fixed(m, f.observed);
     let max_groups = if fixed_normal {
         (count as usize / 4).clamp(64, 4096)

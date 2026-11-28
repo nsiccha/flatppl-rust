@@ -213,6 +213,8 @@ fn literal_part(m: &Module, node: NodeId, resolve: impl Fn(NodeId) -> Option<Nod
         return false;
     }
     is_literal(id)
+        // A packed real vector is the same vector of literals.
+        || matches!(m.node(id), Node::Packed(flatppl_core::Packed::Real(_)))
         || expect_builtin_call(m, id, "vector").is_some_and(|call| {
             call.named.is_empty()
                 && call.inputs.is_none()

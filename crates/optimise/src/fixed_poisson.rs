@@ -72,6 +72,19 @@ fn fixed_vector(
         if m.phase_of(id) != Some(Phase::Fixed) {
             return None;
         }
+        // A packed vector is the same fixed literal.
+        if let Node::Packed(packed) = m.node(id) {
+            let flatppl_core::Packed::Int(values) = packed else {
+                return None;
+            };
+            if values.len() != width || m.is_sample_result(id) || m.sample_origin(id).is_some() {
+                return None;
+            }
+            return values
+                .iter()
+                .map(|&value| i32::try_from(value).ok().map(i64::from))
+                .collect();
+        }
         if let Some(elements) = args(m, id, "vector") {
             if elements.len() != width {
                 return None;

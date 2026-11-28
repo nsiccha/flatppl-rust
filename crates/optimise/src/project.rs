@@ -480,6 +480,17 @@ impl<'a> Project<'a> {
     }
 
     fn literal_rows(&self, id: NodeId) -> Option<Vec<i64>> {
+        // A packed vector is the same vector of integer literals.
+        if let Node::Packed(flatppl_core::Packed::Int(rows)) = self.m.node(id) {
+            let typed = matches!(self.m.type_of(id), Some(Type::Array { shape, elem })
+                if matches!(shape.as_ref(), [Dim::Static(n)] if *n as usize == rows.len())
+                    && **elem == Type::Scalar(flatppl_core::ScalarType::Integer));
+            return (typed
+                && !self.cuts.blocked(self.m, id)
+                && !self.m.is_sample_result(id)
+                && self.m.sample_origin(id).is_none())
+            .then(|| rows.to_vec());
+        }
         let Node::Call(c) = self.m.node(id) else {
             return None;
         };
