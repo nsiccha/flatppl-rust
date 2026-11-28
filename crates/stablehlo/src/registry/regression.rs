@@ -206,9 +206,20 @@ fn predictors(e: &mut Emitter, p: &Params, family: Family) -> Result<(Value, u64
     Ok((e.add(&xb, &alpha), xd[0]))
 }
 
+/// max(z,0) + log1p(exp(-abs(z))) avoids overflow in either tail.
+fn softplus(e: &mut Emitter, z: &Value) -> Value {
+    let abs = e.abs(z);
+    let negative = e.neg(&abs);
+    let ex = e.exp(&negative);
+    let tail = e.log1p(&ex);
+    let zero = e.scalar(0.0);
+    let positive = e.max(z, &zero);
+    e.add(&positive, &tail)
+}
+
 fn log_sigmoid(e: &mut Emitter, z: &Value) -> Value {
     let negative = e.neg(z);
-    let sp = e.softplus(&negative);
+    let sp = softplus(e, &negative);
     e.neg(&sp)
 }
 
@@ -291,39 +302,41 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
     if family == Family::Ordered {
         return ordered_density(e, p, y, &eta);
     }
+    if family == Family::Bernoulli {
+        if let Some(score) = e.reduce_regression_design(&eta, y) {
+            return Ok(score);
+        }
+        // The arithmetic of the broadcast law `Bernoulli.(invlogit.(eta))`.
+        let one = e.scalar(1.0);
+        let zero = e.scalar(0.0);
+        let success = e.compare("EQ", y, &one);
+        let failure = e.compare("EQ", y, &zero);
+        let supported = e.or(&success, &failure);
+        let rows = super::bernoulli_logit_score(e, &eta, &success, &supported);
+        return Ok(finish(e, &supported, &rows));
+    }
     let one = e.scalar(1.0);
     let zero = e.scalar(0.0);
     let y = e.convert(y, ElemKind::Real);
     match family {
-        Family::Bernoulli | Family::Binomial => {
-            let trials = if family == Family::Bernoulli {
-                one.clone()
-            } else {
-                scalar_param(e, p, "n")?
-            };
+        Family::Binomial => {
+            let trials = scalar_param(e, p, "n")?;
             let (supported, y) = count_support(e, &y, Some(&trials));
-            if family == Family::Bernoulli {
-                let success = e.compare("EQ", &y, &one);
-                let rows = bernoulli_logit_score(e, &success, &eta);
-                return Ok(finish(e, &supported, &rows));
-            }
             let negative_eta = e.neg(&eta);
-            let yes = e.softplus(&negative_eta);
-            let no = e.softplus(&eta);
+            let yes = softplus(e, &negative_eta);
+            let no = softplus(e, &eta);
             let successes = e.mul(&y, &yes);
             let failures = e.sub(&trials, &y);
             let failures = e.mul(&failures, &no);
             let penalty = e.add(&successes, &failures);
-            let mut rows = e.neg(&penalty);
-            if family == Family::Binomial {
-                let n_minus_y = e.sub(&trials, &y);
-                let a = e.add(&y, &one);
-                let b = e.add(&n_minus_y, &one);
-                let lb = e.log_beta(&a, &b);
-                let log_n = e.log1p(&trials);
-                let choose = e.add(&log_n, &lb);
-                rows = e.sub(&rows, &choose);
-            }
+            let rows = e.neg(&penalty);
+            let n_minus_y = e.sub(&trials, &y);
+            let a = e.add(&y, &one);
+            let b = e.add(&n_minus_y, &one);
+            let lb = e.log_beta(&a, &b);
+            let log_n = e.log1p(&trials);
+            let choose = e.add(&log_n, &lb);
+            let rows = e.sub(&rows, &choose);
             Ok(finish(e, &supported, &rows))
         }
         Family::Poisson => {
@@ -356,8 +369,8 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
             let log_psi = e.log(&psi);
             let gap = e.sub(&eta, &log_psi);
             let negative_gap = e.neg(&gap);
-            let a = e.softplus(&negative_gap);
-            let b = e.softplus(&gap);
+            let a = softplus(e, &negative_gap);
+            let b = softplus(e, &gap);
             let ya = e.mul(&y, &a);
             let pb = e.mul(&psi, &b);
             let penalty = e.add(&ya, &pb);
@@ -421,7 +434,7 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
                     let small_square = e.mul(&small_z, &small_z);
                     let small_ratio = e.div(&small_square, &nu);
                     let small = e.log1p(&small_ratio);
-                    let tail = e.softplus(&log_ratio);
+                    let tail = softplus(e, &log_ratio);
                     e.select(&large, &tail, &small)
                 };
                 // CPU benefits from skipping the tail math for ordinary data.
@@ -762,8 +775,8 @@ fn ordered_density(
     let a = e.sub(&lo, eta);
     let b = e.sub(&hi, eta);
     let negative_b = e.neg(&b);
-    let lb = e.softplus(&negative_b);
-    let la = e.softplus(&a);
+    let lb = softplus(e, &negative_b);
+    let la = softplus(e, &a);
     let gap = e.sub(&lo, &hi);
     let safe_gap = e.scalar(-1.0);
     let gap = e.select(&middle, &gap, &safe_gap);
@@ -826,8 +839,8 @@ fn ordered_density_batched(
             let upper = vector_elem(e, cuts, class);
             let a = e.sub(&lower, eta);
             let negative_b = e.sub(eta, &upper);
-            let a = e.softplus(&a);
-            let b = e.softplus(&negative_b);
+            let a = softplus(e, &a);
+            let b = softplus(e, &negative_b);
             let gap = e.sub(&lower, &upper);
             let gap = e.expm1(&gap);
             let gap = e.neg(&gap);

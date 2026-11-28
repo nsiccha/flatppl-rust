@@ -15,7 +15,9 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-syntax`](crates/syntax) — canonical FlatPPL surface syntax: parse + print
 * [`flatppl-flatpir`](crates/flatpir) — FlatPIR S-expression reader + writer
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
+* [`flatppl-optimise`](crates/optimise) — output-driven pruning and egglog rewrites for the typed model DAG
 * [`flatppl-model-analysis`](crates/model-analysis) — dependency analysis, scalar conjugacy, sufficient statistics, incremental scores and Normal coordinate maps
+* [`flatppl-autodiff`](crates/autodiff) — source-to-source AD with egglog rules
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-formula`](crates/formula) — Gaussian regression formulas → FlatPPL, with reusable data recipes
 * [`flatppl-convert`](crates/convert) — shared IR construction helpers for converters
@@ -46,6 +48,7 @@ flatppl convert model.flatpir model.flatppl   # FlatPIR → FlatPPL
 flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
 flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
 flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
+flatppl optimise model.flatppl --emit flatpir -o optimised.flatpir
 flatppl prepare model.flatppl                  # fetch the model's remote deps into the cache
 flatppl convert model.flatppl model.html       # the model as a page of mathematics (MathML)
 flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation; default is f32
@@ -54,6 +57,74 @@ flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation;
 StableHLO queries must declare `inputs` and `outputs` to define their compiled ABI.
 The f32 dtype uses i32 integer arithmetic and f64 uses i64: an integer literal
 outside that width refuses, and a computed integer beyond it wraps.
+
+### Source differentiation
+
+Build the CLI with `--features autodiff` and request the derivative explicitly.
+
+```sh
+flatppl autodiff query.flatppl --wrt theta -o gradient.flatppl
+```
+
+Gradient mode requires one real scalar output. Repeat `--wrt` for each selected
+query input. Inputs can be real scalars, fixed-shape real arrays, records,
+fixed-row tables, or promoted fixed tuples of these. Each selected tuple
+position must support a derivative. Record and table derivatives contain the
+real fields in declaration order. Arrays retain their shape and tables retain
+their row count. The result lists the original value followed by gradients in
+the requested order.
+Use `--empty-wrt` for an empty selection, including queries with only discrete
+inputs. The gradient query then returns the primal alone.
+
+Use `--mode jvp` or `--mode vjp` for structured outputs. Both modes preserve
+the original values and split nested tuple outputs into derivative components.
+JVP takes one tangent per selected input and returns the output tangents.
+VJP takes one cotangent per differentiable output component and returns one
+cotangent per selected input.
+
+AD runs after determinization and before optimization. Egglog rules cover
+pointwise arithmetic and conditionals, scalar broadcast callbacks, reductions,
+indexing and stacking, matrix operations, selected distribution transports,
+and log densities including Beta, Gamma, StudentT, Dirichlet, and MvNormal.
+The transform also handles fixed record and array scans, log-space Markov
+updates, and fixed-grid solver steps with active initial states and parameters.
+Active operations without a rule produce an error. Derivatives apply on the
+smooth, finite domain of the query.
+
+Each rule has a key: the catalog (`Pullback` or `Pushforward`), the operation,
+its operand count and the operand slot from 0. `flatppl autodiff --list-rules`
+prints every key, with `*` for a value that the rule leaves open.
+`--explain-rules` prints the keys one derivative loads to stderr, as `rule`
+lines, before the transform runs.
+
+Rust callers can use `flatppl_autodiff::determinize_query` followed by
+`gradient`, `jvp`, or `vjp`. The result is one FlatPDL module with the primal
+and derivative outputs. To print standalone FlatPPL, call
+`flatppl_autodiff::prepare_source` before `flatppl_syntax::print`.
+
+Use `--numerical-integrals` to differentiate an integral and print the
+result as FlatPPL. The generated query uses weighted integrals and requires
+the same opt-in when compiled.
+
+```sh
+flatppl autodiff query.flatppl --numerical-integrals --wrt theta -o gradient.flatppl
+flatppl stablehlo gradient.flatppl --numerical-integrals
+```
+
+Numerical AD integrates the derivative of the integrand and adds terms for
+moving bounds and supported scalar cutoffs. Reverse differentiation supports
+scalar, fixed-vector, fixed-matrix, and nested record captures. The Rust
+`*_with_options` entry points accept `NUMERICAL_SOURCE_OPTIONS`.
+
+Shape derivatives of the regularized incomplete gamma functions and their log
+forms also require `--numerical-integrals`. The real projection of Bessel J
+supports order derivatives when the declared bounds imply an order in
+`[0, 16]` and an argument in `[1/8, 4]`.
+Call `prepare_source_with_options` before printing. To compile the
+derivative directly to StableHLO, add `--ad-wrt` to the `stablehlo` command
+and optionally select `--ad-mode jvp` or `--ad-mode vjp`.
+
+### Lowering and emission
 
 The Rust determinizer lowers affine log weights to closed distribution laws for
 Normal, MvNormal, Gamma, Exponential, ChiSquared, Bernoulli, Binomial, Poisson,
@@ -68,21 +139,14 @@ Positive-count `Poisson` and `NegativeBinomial` laws expressed as
 including live parameter gradients. Sampling these truncated laws is not yet
 implemented and is explicitly refused.
 
-StableHLO scores `Bernoulli` and `Binomial` densities whose probability is
-`invlogit(z)`, including the dotted `Bernoulli.(invlogit.(eta))` form, on the
-logit scale: `log p = -softplus(-z)` and `log(1 - p) = -softplus(z)`, as Stan's
-`bernoulli_logit` and `binomial_logit`. Values and gradients stay finite at
-every finite logit; scoring the rounded `p` gave `-inf` with a NaN gradient
-from `z` ≈ 17 in f32 and ≈ 37 in f64.
-
 StableHLO emission restricts lowering to avoid known Enzyme limitations by
-default. This mode preserves zero-factor product derivatives and avoids known
+default. This mode preserves zero-factor product and cumulative product derivatives and avoids known
 selection-adjoint failures. It retains source tensor operations but skips
 pointwise packet packing.
 It shares identical gathers and their slice lowerings within each region to
 avoid rebuilding the same tensor.
 It requires static tensor shapes and deterministic queries, and refuses `probit`
-and real `cumprod`. Pass `--restrict-enzyme-compatible=false` for unrestricted emission,
+and complex `cumprod`. Pass `--restrict-enzyme-compatible=false` for unrestricted emission,
 including sampling queries. The Rust API exposes the same choice through
 `EmitOptions::restrict_enzyme_compatible`, which defaults to `true`.
 `--target cpu|gpu` (`EmitOptions::target`, default `cpu`) picks a lowering
@@ -110,6 +174,11 @@ refreshes already-cached deps. Cache location and trust are env-controlled
 non-interactive use unless `FLATPPL_TRUST=1`).
 
 ## Building and testing (developers)
+
+`flatppl optimise` accepts FlatPPL or FlatPIR and writes FlatPPL by default.
+For example, selecting a field from a private record can skip the other fields' computations when they have no observable effects.
+Portable rewrites also run during determinization. StableHLO applies its rules to the validated query before emission, using the existing CPU or GPU target.
+Stan can select native matrix contractions. The rule files cover each category separately. [Rule catalogue](crates/optimise/src/rules)
 
 Independent likelihood factors use shared data summaries where supported.
 `flatppl stan --reduce sufficient` prepares observed IID Normal summaries in Stan's
@@ -173,9 +242,7 @@ the design and observations, for example `--data-input X --data-input y`.
 The reduced score uses a scaled QR factor and a data-derived coefficient
 reference. Runtime regression and InverseWishart data require explicit
 preparation to amortize QR setup. Parameter-dependent designs and varying sigmas retain
-ordinary scoring. The design and observations must be finite: fixed data,
-including `load_data` declared on `reals` or `posreals`, are checked by their
-values once read, while runtime data need a bounded value set.
+ordinary scoring.
 
 InverseGamma, Pareto, fixed-shape Weibull and fixed-dispersion NegativeBinomial
 likelihoods also support summaries. Real observations need positive finite

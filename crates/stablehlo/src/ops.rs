@@ -150,7 +150,7 @@ pub(crate) fn lower_builtin(
         // §07 "Identities": `identity(x)` "returns `x` unchanged". Domain
         // "any", so no operand check beyond the one `lower_node` already makes
         // — a value with no tensor form refuses there, not here.
-        "identity" => {
+        "identity" | "fixed" => {
             let [a] = args_exact(id, args)?;
             e.lower_node(a)
         }
@@ -920,53 +920,61 @@ fn lower_cross(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Em
     Ok(e.sub(&left, &right))
 }
 
-/// §07 `diag(A, k)` — "extracts the $k$th diagonal of $\mathbf{A}$ as a vector
-/// … when called as `diag(A)`, `k` defaults to `0`".
-///
-/// PARTIAL against that entry, in two ways, each refused rather than
-/// approximated:
-///
-/// - **`k` must be the literal `0`.** [`Emitter::diag`] masks with
-///   `row == col`; a super- or sub-diagonal needs a shifted mask and a shorter
-///   result, which is a different lowering rather than a parameter of this one.
-/// - **`A` must be SQUARE**, though §07's domain is "matrices". `Emitter::diag`
-///   row-sums an `n`-column mask, so on an `m`x`n` operand with `m > n` it
-///   returns `m` entries — zeros for the rows the diagonal never reaches —
-///   instead of the `min(m, n)` §07 defines. Refusing keeps that from being
-///   silently answered.
+/// Extract a fixed offset diagonal from the trailing matrix axes.
 fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
-    let (a_id, k_id) = match args {
-        [a] => (*a, None),
-        [a, k] => (*a, Some(*k)),
+    let (a, k) = match args {
+        [a] => (*a, 0),
+        [a, k] => {
+            let offset = match e.node(*k) {
+                Node::Lit(Scalar::Int(k)) => *k,
+                _ => {
+                    let value = e.lower_node(*k)?;
+                    match e.fixed_scalar_at(&value, 0) {
+                        Some(Scalar::Int(k)) => k,
+                        _ => {
+                            return Err(EmitError::at(
+                                id,
+                                "`diag`: the offset must be a fixed integer",
+                            ));
+                        }
+                    }
+                }
+            };
+            (*a, offset)
+        }
         _ => {
             return Err(EmitError::at(
                 id,
-                format!("`diag`: expected 1 or 2 argument(s), got {}", args.len()),
+                "`diag` expects a matrix and an optional offset",
             ));
         }
     };
-    if let Some(k) = k_id {
-        let k_val = literal_index(e, id, k).map_err(|_| {
-            EmitError::at(
-                id,
-                "`diag`: the diagonal offset `k` must be an integer literal",
-            )
-        })?;
-        if k_val != 0 {
-            return Err(EmitError::at(
-                id,
-                format!(
-                    "`diag`: only the MAIN diagonal (`k = 0`, §07's default) lowers, got k = \
-                     {k_val} — a §07 super- or sub-diagonal needs a shifted mask and a shorter \
-                     result than this lowering produces"
-                ),
-            ));
-        }
-    }
-    let a = e.lower_node(a_id)?;
-    square_dim(id, &e.cell_ty(&a), "diag")?;
+    let a = e.lower_node(a)?;
+    let (rows, cols) = matrix_dims(id, &e.cell_ty(&a), "diag")?;
     require_inexact_matrix(id, &a, "diag")?;
-    Ok(e.diag(&a))
+    if rows == cols && k == 0 {
+        return Ok(e.diag(&a));
+    }
+    let (row, col) = if k < 0 {
+        (rows.min(k.unsigned_abs()), 0)
+    } else {
+        (0, cols.min(k.unsigned_abs()))
+    };
+    let length = (rows - row).min(cols - col);
+    let MlirTy::Ranked(dims) = &a.ty else {
+        unreachable!()
+    };
+    let mut end = dims
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| EmitError::at(id, "`diag` requires fixed batch dimensions"))?;
+    let mut start = vec![0; end.len()];
+    let axis = end.len() - 2;
+    start[axis..].copy_from_slice(&[row, col]);
+    end[axis..].copy_from_slice(&[row + length, col + length]);
+    let square = e.slice(&a, &start, &end, &vec![1; end.len()]);
+    Ok(e.diag(&square))
 }
 
 fn lower_diagmat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
@@ -1720,6 +1728,11 @@ pub(crate) fn lower_bare_arith<'m>(
     let Ok([a, b]) = <[NodeId; 2]>::try_from(args) else {
         return binary(e, id, args, op);
     };
+    if head == "sub"
+        && let Some(result) = e.lower_signed_rectangle_difference(id, a, b)
+    {
+        return result;
+    }
     let (sa, sb) = (arith_shape(e, a), arith_shape(e, b));
     let shape = |n: NodeId| match e.type_of(n) {
         Some(t) => format!("{t:?}"),
@@ -1774,6 +1787,9 @@ pub(crate) fn lower_bare_arith<'m>(
 /// and this is the only caller that reaches them from surface `*`.
 fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a, b] = args_exact(id, args)?;
+    if let Some(value) = e.lower_matrix_projection(id, a, b) {
+        return Ok(value);
+    }
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (e.cell_ty(&a), e.cell_ty(&b)) else {
@@ -1922,6 +1938,9 @@ fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 
 fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [c, a, b] = args_exact(id, args)?;
+    if let Some(choice) = e.lower_likelihood_choice(id, c, a, b) {
+        return choice;
+    }
     let c = lower_predicate(e, c, "ifelse condition")?;
     // The two BRANCHES must share an orientation: selecting between a row and a
     // column is not defined, and neither the `broadcast_pair` below nor
@@ -3025,12 +3044,10 @@ fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 ///   axis, yielding a `Scalar`).
 /// - A runtime scalar integer selector, including per-batch selectors and nested cells.
 /// - A runtime vector integer selector, including per-batch selectors and nested cells.
-/// - Multi-axis numeric tensor selection with one shared rank-1 integer-vector
-///   selector and literal integer / `all` / `only` selectors on the remaining
-///   axes — [`crate::indexing::lower_multi_axis`].
+/// - Multi-axis numeric tensor selection with shared rank-1 integer-vector,
+///   literal integer, `all`, and `only` selectors — [`crate::indexing::lower_multi_axis`].
 ///
-/// Named-field forms (record, table, tuple), multiple integer-vector selectors,
-/// and non-numeric tensors remain refused, not guessed.
+/// Structural record and tuple projections are lowered separately.
 fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<Value, EmitError> {
     if args.len() != 2 {
         return crate::indexing::lower_multi_axis(e, id, args, base);
@@ -3039,6 +3056,12 @@ fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<
 
     if let Ok(selector) = literal_index(e, id, index) {
         return lower_get_literal(e, id, container, selector, base);
+    }
+    let axis_keyword =
+        matches!(e.node(index), Node::Const(name) if matches!(e.resolve(*name), "all" | "only"));
+    if matches!(e.type_of(container), Some(Type::Array { shape, .. }) if shape.len() > 1 || axis_keyword)
+    {
+        return crate::indexing::lower_multi_axis(e, id, args, base);
     }
     lower_get_gather(e, id, container, index, base)
 }
@@ -3286,12 +3309,24 @@ enum ElemSet {
 /// `in(v, S)` (spec §06 membership predicate `_ in R`) over a §03 element set,
 /// or over `cartpow(S, n)` of one for a vector variate.
 ///
-/// A supported `S` is [`ElemSet`]: `interval(lo, hi)`, `posreals`,
-/// `nonnegreals`. Positional `cartprod` checks each scalar coordinate against
-/// its own element set. Other set expressions refuse.
+/// Positional `cartprod` checks each scalar coordinate against its own
+/// element set. Named `cartprod` checks the corresponding record fields.
 fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [v_id, set_id] = args_exact(id, args)?;
-    lower_membership(e, id, v_id, set_id)
+    // The ABI represents a table by its columns. Treating those columns as
+    // a record point requires the explicit record(table) conversion.
+    fn contains_table(ty: &Type) -> bool {
+        match ty {
+            Type::Table { .. } => true,
+            Type::Record(fields) => fields.iter().any(|(_, ty)| contains_table(ty)),
+            _ => false,
+        }
+    }
+    if e.type_of(v_id).is_some_and(contains_table) {
+        return Err(EmitError::at(id, "'in' over a table point is unsupported"));
+    }
+    let point = e.lower_value(v_id)?;
+    lower_membership(e, id, &point, set_id)
 }
 
 /// The fields of a record set `cartprod(name = S, …)`, by name.
@@ -3305,19 +3340,10 @@ fn record_set_fields(e: &Emitter, set_id: NodeId) -> Option<Vec<(Symbol, NodeId)
     .then(|| c.named.iter().map(|n| (n.name, n.value)).collect())
 }
 
-/// The field values of a written `record(name = v, …)`, by name.
-fn record_fields(e: &Emitter, v_id: NodeId) -> Option<Vec<(Symbol, NodeId)>> {
-    let Node::Call(c) = e.node(e.resolve_ref_one(v_id)) else {
-        return None;
-    };
-    (matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "record") && c.args.is_empty())
-        .then(|| c.named.iter().map(|n| (n.name, n.value)).collect())
-}
-
 fn lower_membership(
     e: &mut Emitter,
     id: NodeId,
-    v_id: NodeId,
+    point: &Lowered,
     set_id: NodeId,
 ) -> Result<Value, EmitError> {
     let set_id = e.resolve_ref_one(set_id);
@@ -3325,11 +3351,11 @@ fn lower_membership(
     // §03: a record lies in `cartprod(name = S, …)` when each field lies in the set
     // of the same name, so the record needs no tensor form.
     if let Some(sets) = record_set_fields(e, set_id) {
-        let Some(fields) = record_fields(e, v_id) else {
-            // A record-valued point that is not written out (a record input,
-            // a field of one, a bound record) is tested on its lowered fields.
-            let point = e.lower_value(v_id)?;
-            return record_value_membership(e, id, point, &sets);
+        let Lowered::Record(fields) = point else {
+            return Err(EmitError::at(
+                id,
+                "'in' over a record set needs a record point",
+            ));
         };
         if fields.len() != sets.len() {
             return Err(EmitError::at(
@@ -3339,7 +3365,7 @@ fn lower_membership(
         }
         let mut members = Vec::with_capacity(sets.len());
         for (name, set) in sets {
-            let Some(&(_, field)) = fields.iter().find(|(n, _)| *n == name) else {
+            let Some((_, field)) = fields.iter().find(|(n, _)| n == e.resolve(name)) else {
                 return Err(EmitError::at(
                     id,
                     format!(
@@ -3356,71 +3382,19 @@ fn lower_membership(
             .ok_or_else(|| EmitError::at(id, "'in' over an empty record set is unsupported"));
     }
 
-    let v = e.lower_node(v_id)?;
-    tensor_membership(e, id, v, set_id)
-}
-
-/// `in` for a lowered record point against the fields of a record set, field
-/// by field and recursively through nested record sets (§03).
-fn record_value_membership(
-    e: &mut Emitter,
-    id: NodeId,
-    point: Lowered,
-    sets: &[(Symbol, NodeId)],
-) -> Result<Value, EmitError> {
-    let Lowered::Record(parts) = point else {
+    let Lowered::Tensor(v) = point else {
         return Err(EmitError::at(
             id,
-            "'in' over a record set needs a record-valued point",
+            "'in' with a record point needs a record set",
         ));
     };
-    if parts.len() != sets.len() {
-        return Err(EmitError::at(
-            id,
-            "'in' over a record set: the point and the set have different fields",
-        ));
-    }
-    let mut members = Vec::with_capacity(sets.len());
-    for &(name, set) in sets {
-        let field = e.resolve(name).to_owned();
-        let Some((_, part)) = parts.iter().find(|(n, _)| *n == field) else {
-            return Err(EmitError::at(
-                id,
-                format!("'in' over a record set: the point has no field `{field}`"),
-            ));
-        };
-        let set = e.resolve_ref_one(set);
-        let member = match (record_set_fields(e, set), part) {
-            (Some(inner), part) => record_value_membership(e, id, part.clone(), &inner)?,
-            (None, Lowered::Tensor(value)) => tensor_membership(e, id, value.clone(), set)?,
-            (None, Lowered::Record(_)) => {
-                return Err(EmitError::at(
-                    id,
-                    format!("'in' over a record set: field `{field}` is a record, its set is not"),
-                ));
-            }
-        };
-        members.push(member);
-    }
-    members
-        .into_iter()
-        .reduce(|a, b| e.and(&a, &b))
-        .ok_or_else(|| EmitError::at(id, "'in' over an empty record set is unsupported"))
-}
 
-/// `in` for a tensor point against a non-record set.
-fn tensor_membership(
-    e: &mut Emitter,
-    id: NodeId,
-    v: Value,
-    set_id: NodeId,
-) -> Result<Value, EmitError> {
     if let Node::Call(c) = e.node(set_id)
         && matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "cartprod")
         && c.named.is_empty()
     {
         let sets = c.args.clone();
-        if e.cell_ty(&v) != MlirTy::Ranked(vec![Some(sets.len() as u64)]) {
+        if e.cell_ty(v) != MlirTy::Ranked(vec![Some(sets.len() as u64)]) {
             return Err(EmitError::at(
                 id,
                 "'in' over cartprod needs a vector with one scalar per set",
@@ -3430,7 +3404,7 @@ fn tensor_membership(
         for (i, set) in sets.into_iter().enumerate() {
             let set = classify_elem_set(e, id, set)?;
             let index = e.int_value_const(i as i64);
-            let cell = e.gather_cells(&v, &index, 0);
+            let cell = e.gather_cells(v, &index, 0);
             members.push(elem_membership(e, id, &cell, set)?);
         }
         return members
@@ -3465,20 +3439,20 @@ fn tensor_membership(
             ));
         }
         let set = classify_elem_set(e, id, elem_id)?;
-        let per_cell = elem_membership(e, id, &v, set)?;
+        let per_cell = elem_membership(e, id, v, set)?;
         return Ok(e.reduce_boolean("stablehlo.and", "true", &per_cell));
     }
 
     if let Some((set, n_id)) = vector_set_parts(e, set_id) {
-        return vector_set_membership(e, id, &v, set, n_id);
+        return vector_set_membership(e, id, v, set, n_id);
     }
 
     if let Some(n_id) = corr_cholesky_size(e, set_id) {
-        return corr_cholesky_membership(e, id, &v, n_id);
+        return corr_cholesky_membership(e, id, v, n_id);
     }
 
     let set = classify_elem_set(e, id, set_id)?;
-    elem_membership(e, id, &v, set)
+    elem_membership(e, id, v, set)
 }
 
 /// The §03 sets of real n-vectors that `in` tests as a whole.

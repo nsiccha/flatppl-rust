@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use flatppl_core::query::{Component as Selector, component};
 use flatppl_core::{
     Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
-    BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, Lowered, MlirTy, Value,
-    check_query_inputs, mlir_type_of,
+    BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, Lowered, MlirTy, RulePolicy,
+    Value, check_query_inputs, mlir_type_of, optimise_query_with_rules,
 };
 use serde::Serialize;
 
@@ -25,10 +26,9 @@ pub struct Export {
     /// Device-side error status, separate from the authored output structure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<RuntimeStatus>,
-    /// Data-only likelihood preparation of a prepared compile. It has no
-    /// inputs. Run it once and check its status. Then pass its output leaves,
-    /// in order and without batch axes, after the declared input leaves of
-    /// every call of `stablehlo`. Ordinary compiles never set it.
+    /// Run this zero-input query once per binding and check its runtime status.
+    /// Pass its tensor results in order after the leaves of `inputs` on every
+    /// score call. They are shared across any batch dimensions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preparation: Option<Box<Export>>,
 }
@@ -69,12 +69,6 @@ pub enum Schema {
     },
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-enum Selector {
-    Field(String),
-    Index(usize),
-}
-
 type InputPath = (Symbol, Vec<Selector>);
 
 struct Leaf {
@@ -85,9 +79,10 @@ struct Leaf {
 
 pub fn emit_query(
     mut module: Module,
-    source: &Module,
+    source: Option<&Module>,
     options: &EmitOptions,
     batch: Option<&BatchSpec>,
+    rules: &RulePolicy,
 ) -> Result<Export, EmitError> {
     let dtype = options.dtype;
     flatppl_determinizer::is_flatpdl_with_options(&module, &options.lowering_options()).map_err(
@@ -103,7 +98,7 @@ pub fn emit_query(
     )?;
     // The emitter reads fixed operands through one ref hop (`Emitter::resolve_ref_one`).
     flatppl_determinizer::resolve_alias_chains(&mut module);
-    let output_node = binding(&module, "outputs")
+    let mut output_node = binding(&module, "outputs")
         .ok_or_else(|| EmitError::whole("declare at least one output"))?;
     let input_nodes = binding(&module, "inputs")
         .map(|id| signature(&module, id))
@@ -144,6 +139,22 @@ pub fn emit_query(
         declared.push((module.resolve(r.name).to_string(), node));
     }
     check_query_inputs(&module, &[output_node], &names, &[])?;
+    // Canonicalization may inline output bindings. Describe their authored names.
+    let source = source.unwrap_or(&module);
+    let declared_output = binding(source, "outputs")
+        .ok_or_else(|| EmitError::whole("declare at least one output"))?;
+    let multiple_outputs = builtin(source, declared_output, "tuple");
+    let output_names = signature(source, declared_output)
+        .iter()
+        .map(|node| match source.node(*node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => Some(source.resolve(r.name).into()),
+            _ => None,
+        })
+        .collect();
+    if let Some((optimised, rhs)) = optimise_query_with_rules(&module, options, rules) {
+        module = optimised;
+        output_node = rhs;
+    }
     let roots = input_roots(&module, &names);
     let mut arguments = Vec::new();
     let mut inputs = Vec::new();
@@ -155,17 +166,6 @@ pub fn emit_query(
             value,
         });
     }
-    // Canonicalization may inline output bindings. Describe their authored names.
-    let declared_output = binding(source, "outputs")
-        .ok_or_else(|| EmitError::whole("declare at least one output"))?;
-    let multiple_outputs = builtin(source, declared_output, "tuple");
-    let output_names = signature(source, declared_output)
-        .iter()
-        .map(|node| match source.node(*node) {
-            Node::Ref(r) if r.ns == RefNs::SelfMod => Some(source.resolve(r.name).into()),
-            _ => None,
-        })
-        .collect();
     let output_type = inferred(&module, output_node)?;
     let mut results = Vec::new();
     let mut output = layout(
@@ -202,10 +202,13 @@ pub fn emit_query(
         args.push((value.ssa.clone(), value.ty.clone(), value.elem));
         values.insert(path, value);
     }
-    let mut emitter = Emitter::with_options(&module, options);
-    if batch.is_some_and(|batch| !batch.shape.is_empty()) {
+    let mut emitter = if batch.is_some_and(|batch| !batch.shape.is_empty()) {
+        let mut emitter = Emitter::with_options_and_rules(&module, options, rules);
         emitter.lower_for_host_batch();
-    }
+        emitter
+    } else {
+        Emitter::for_query_with_rules(&module, options, rules)
+    };
     bind_inputs(
         &mut emitter,
         &module,
@@ -251,7 +254,7 @@ pub fn emit_query(
         let tensorized = if primitives.is_some() {
             primitives
         } else if tensorize && !batch.shape.is_empty() {
-            let mut e = Emitter::with_options(&module, options);
+            let mut e = Emitter::with_options_and_rules(&module, options, rules);
             e.lower_for_host_batch();
             e.set_runtime_batch_rank(batch.shape.len());
             let mut physical = Vec::new();
@@ -323,47 +326,29 @@ pub fn emit_query(
     })
 }
 
-/// Emit a split likelihood: the preparation program, and the scoring program
-/// whose trailing arguments are the preparation's outputs. `source` describes
-/// the original query's declared outputs.
 pub(crate) fn emit_prepared(
     prepared: flatppl_determinizer::PreparedLikelihood,
     source: &Module,
     options: &EmitOptions,
     batch: Option<&BatchSpec>,
+    rules: &RulePolicy,
 ) -> Result<Export, EmitError> {
-    let flatppl_determinizer::PreparedLikelihood {
-        preparation,
-        score,
-        summaries,
-    } = prepared;
-    let preparation = emit_query(preparation.clone(), &preparation, options, None)?;
-    if !preparation.inputs.is_empty() {
-        return Err(EmitError::whole(
-            "fixed-data preparation must not take inputs",
-        ));
+    let preparation = emit_query(prepared.preparation, None, options, None, rules)?;
+    let outputs = match &preparation.output {
+        Schema::Tuple { items } => items.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let summaries = &prepared.summaries;
+    if !preparation.inputs.is_empty() || outputs.len() != summaries.len() {
+        return Err(EmitError::whole("invalid fixed-data preparation signature"));
     }
-    let prepared_leaves = leaves(&preparation.output);
-    if prepared_leaves.len() != summaries.len() {
-        return Err(EmitError::whole("each prepared summary must be one tensor"));
-    }
-    let mut exported = emit_query(score, source, options, batch)?;
-    let split = exported
+    let mut score = emit_query(prepared.score, Some(source), options, batch, rules)?;
+    let declared = score
         .inputs
         .len()
         .checked_sub(summaries.len())
-        .ok_or_else(|| EmitError::whole("the scoring query lacks its summary inputs"))?;
-    let appended = exported.inputs.split_off(split);
-    let declared_leaves: usize = exported.inputs.iter().map(|f| leaves(&f.value).len()).sum();
-    for (position, ((field, name), prepared)) in appended
-        .iter()
-        .zip(&summaries)
-        .zip(&prepared_leaves)
-        .enumerate()
-    {
-        let [argument] = leaves(&field.value)[..] else {
-            return Err(EmitError::whole("each prepared summary must be one tensor"));
-        };
+        .ok_or_else(|| EmitError::whole("the score lacks its summary inputs"))?;
+    for ((field, name), output) in score.inputs[declared..].iter().zip(summaries).zip(outputs) {
         let (
             Schema::Tensor {
                 index,
@@ -372,46 +357,28 @@ pub(crate) fn emit_prepared(
                 ..
             },
             Schema::Tensor {
-                dtype: prepared_dtype,
-                shape: prepared_shape,
+                dtype: result_dtype,
+                shape: result_shape,
                 ..
             },
-        ) = (argument, prepared)
+        ) = (&field.value, output)
         else {
-            unreachable!("leaves are tensors")
+            return Err(EmitError::whole("each prepared summary must be a tensor"));
         };
-        if let Some(batch) = batch
-            && batch
-                .input_axes
-                .get(*index)
-                .is_none_or(|axes| axes.iter().any(Option::is_some))
-        {
+        if batch.is_some_and(|batch| batch.input_axes[*index].iter().any(Option::is_some)) {
             return Err(EmitError::whole(
-                "prepared summaries are shared by every batch cell and take no batch axis",
+                "prepared summaries must be unmapped across batch dimensions",
             ));
         }
-        if field.name != *name
-            || *index != declared_leaves + position
-            || dtype != prepared_dtype
-            || shape != prepared_shape
-        {
+        if field.name != *name || dtype != result_dtype || shape != result_shape {
             return Err(EmitError::whole(format!(
-                "prepared summary {name} does not match its scoring argument"
+                "prepared summary {name} does not match its score argument"
             )));
         }
     }
-    exported.preparation = Some(Box::new(preparation));
-    Ok(exported)
-}
-
-/// Tensor leaves in argument/result order.
-fn leaves(schema: &Schema) -> Vec<&Schema> {
-    match schema {
-        Schema::Tensor { .. } => vec![schema],
-        Schema::Record { fields } => fields.iter().flat_map(|f| leaves(&f.value)).collect(),
-        Schema::Table { fields, .. } => fields.iter().flat_map(|f| leaves(&f.value)).collect(),
-        Schema::Tuple { items } => items.iter().flat_map(leaves).collect(),
-    }
+    score.inputs.truncate(declared);
+    score.preparation = Some(Box::new(preparation));
+    Ok(score)
 }
 
 fn bind_inputs(
@@ -749,22 +716,9 @@ fn input_path(
         Node::Ref(r) if r.ns == RefNs::SelfMod => module
             .binding_by_name(r.name)
             .and_then(|b| input_path(module, module.binding(b).rhs, roots, memo)),
-        Node::Call(c)
-            if (builtin(module, node, "get") || builtin(module, node, "get0"))
-                && c.args.len() == 2 =>
-        {
-            let selector = match (module.type_of(c.args[0]), module.node(c.args[1])) {
-                (Some(Type::Record(_) | Type::Table { .. }), Node::Lit(Scalar::Str(s))) => {
-                    Some(Selector::Field(s.to_string()))
-                }
-                (Some(Type::Tuple(_)), Node::Lit(Scalar::Int(i))) => {
-                    let index = i - i64::from(builtin(module, node, "get"));
-                    usize::try_from(index).ok().map(Selector::Index)
-                }
-                _ => None,
-            };
-            selector.and_then(|selector| {
-                input_path(module, c.args[0], roots, memo).map(|(root, mut path)| {
+        Node::Call(_) if builtin(module, node, "get") || builtin(module, node, "get0") => {
+            component(module, node).and_then(|(base, selector)| {
+                input_path(module, base, roots, memo).map(|(root, mut path)| {
                     path.push(selector);
                     (root, path)
                 })

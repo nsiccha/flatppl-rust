@@ -1,8 +1,12 @@
 //! Fixed gather partitions reuse scalar-family reductions on occupied groups.
 
+mod common_normal;
+
 use std::collections::HashMap;
 
-use super::{Expr, Factor, Reducer, call, map, materialize, op, per_cell, resolve};
+use super::{
+    Expr, Factor, Reducer, call, map, materialize, op, per_cell, resolve, resolve_record_field,
+};
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, Scalar, ScalarType, Type, ValueSet,
 };
@@ -15,7 +19,7 @@ enum Observed {
 
 // A small selector evaluator. It never follows a promoted query input's RHS.
 pub(super) fn fixed_indices(m: &Module, id: NodeId, r: &Reducer) -> Option<Vec<i64>> {
-    let id = resolve(m, id, &r.boundary);
+    let id = resolve_record_field(m, id, &r.boundary);
     if let Node::Lit(Scalar::Int(i)) = m.node(id) {
         return Some(vec![*i]);
     }
@@ -366,8 +370,30 @@ pub(super) fn runtime_bernoulli_counts(
 }
 
 pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<NodeId> {
-    let f = factor(m, id, r)?;
+    let Some(f) = factor(m, id, r) else {
+        link_law(r, m, id);
+        return None;
+    };
     reduce_factor(r, m, &f)
+}
+
+/// A §09 logit or log regression law scores its cells with a probability or
+/// rate that varies by design row: neither a shared scalar nor a gather. Its
+/// cell form stops here, so the law reports the same reason.
+fn link_law(r: &mut Reducer, m: &Module, id: NodeId) {
+    let Some(density) = call(m, id, "builtin_logdensityof") else {
+        return;
+    };
+    let [kernel, _, observed] = *density.args else {
+        return;
+    };
+    let link = matches!(m.node(kernel), Node::Const(s)
+        if matches!(m.resolve(*s), "BernoulliLogitGLM" | "PoissonLogGLM"));
+    let cells = matches!(m.type_of(observed), Some(Type::Array { shape, .. })
+        if matches!(shape.as_ref(), [Dim::Static(n)] if *n >= 2));
+    if link && cells {
+        r.fallback = "parameters need shared scalars or fixed, in-range gather selectors";
+    }
 }
 
 pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<NodeId> {
@@ -384,12 +410,17 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
     if count < 2 {
         return None;
     }
-    let root = resolve(m, f.observed, &r.boundary);
+    let root = resolve_record_field(m, f.observed, &r.boundary);
     let literal = match m.node(root) {
         Node::Packed(p) => Some(Observed::Packed(p.clone())),
         _ => call(m, root, "vector").map(|c| Observed::Nodes(c.args.to_vec())),
     };
     r.fallback = "parameters need shared scalars or fixed, in-range gather selectors";
+    // A gather-shaped parameter makes this grouping's factor, in range or not.
+    r.grouped_claim = f
+        .parameters
+        .iter()
+        .any(|&(_, value)| gather_parts(m, value, r).is_some());
     let parameters = f
         .parameters
         .iter()
@@ -447,6 +478,11 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
             .filter(|(_, positions)| positions.len() == 1)
             .count(),
     };
+    if let Some(value) = common_normal::reduce(r, m, f, &parameters, &groups) {
+        r.count += groups.len();
+        r.rule = Some(("grouped Normal with common scale", Some(partition)));
+        return Some(value);
+    }
     r.fallback = "an occupied group fails the family support or numerical guard";
     // A later bucket can fail a family-specific numerical guard. Commit the
     // whole partition only after every occupied bucket has a valid reduction.
@@ -588,13 +624,9 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
                 value
             }
         };
-        terms.push(Expr::Node(value));
+        terms.push(value);
     }
-    let terms = terms
-        .into_iter()
-        .map(|term| materialize(&mut candidate, term))
-        .collect::<Vec<_>>();
-    let result = super::vectorize::sum_terms(&mut candidate, &terms);
+    let result = super::vectorize::sum_terms(&mut candidate, &terms, m.node_count());
     *m = candidate;
     *r = reducer;
     r.rule = Some(("grouped scalar summaries", Some(partition)));

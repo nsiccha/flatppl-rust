@@ -21,24 +21,30 @@ mod query_analysis;
 mod refuse;
 mod sample;
 mod stdfn;
+mod surface_integrals;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
+pub use crossmodule::{Grafted, Import, graft_imports};
 pub use disintegrate::{rewrite_restrict, split_disintegrate};
 pub use driver::{
     SamplingObserver, desugar_restrict_and_disintegrate, determinize, determinize_with,
-    determinize_with_options, determinize_with_options_and_report, determinize_with_roots,
-    determinize_with_sampling_report,
+    determinize_with_options, determinize_with_options_and_report,
+    determinize_with_options_and_rules, determinize_with_options_report_and_rules,
+    determinize_with_roots, determinize_with_sampling_report,
+    determinize_with_sampling_report_and_rules,
 };
 pub use flatppl_model_analysis::{
     AnalysisError, ConjugateMatch, ConjugateRowId, CoordinatePrecision, GroupPartition,
     IncrementalScorePlan, IncrementalTerm, InputArray, InputCell, InputPath, ModelAnalysis,
     NormalCoordinate, NormalCoordinateQueries, NormalCoordinatesQueries, OutputTerm,
-    PreparationOptions, PreparedLikelihood, ReductionDecision, ReductionOutcome, ReductionReport,
-    sufficient_statistics, sufficient_statistics_with_report,
+    PreparationOptions, PreparedLikelihood, RealPrecision, ReductionDecision, ReductionOutcome,
+    ReductionReport, prepare_fixed_likelihood, prepare_fixed_likelihood_for_precision,
+    sufficient_statistics, sufficient_statistics_for_target, sufficient_statistics_with_report,
 };
 
 pub use flatppl_model_analysis::posterior::gaussian_block::update as gaussian_posterior_block;
 pub use flatppl_model_analysis::posterior::{conjugate_product, conjugate_update};
+pub use flatppl_optimise::{RulePolicy, RuleSelector};
 pub use marginal::{exponentially_modified_normal_logpdf, match_conjugate_marginal};
 pub use preparation::{
     prepare_likelihood, prepare_likelihood_with_options, prepare_likelihood_with_report,
@@ -49,13 +55,21 @@ pub use query_analysis::{
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::{expand_spline, standard_function};
+pub use surface_integrals::reify_numerical_integrals;
 
 /// Deterministic standard functions a backend lowers without portable expansion.
 /// The default keeps the backend-independent FlatPDL form.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoweringOptions<'a> {
+    /// Skip optional graph optimizations before and after measure lowering.
+    pub disable_optimizations: bool,
     /// Leave independent likelihood factors unreduced.
     pub disable_sufficient_statistics: bool,
+    /// Skip the portable rules of the lowered stage. A backend that reads the
+    /// laws of the lowered module, such as StableHLO, runs its own.
+    pub disable_lowered_stage: bool,
+    /// Share regular grouped Normal scale reciprocals across residual terms.
+    pub share_normal_scale: bool,
     pub retain_standard_functions: &'a [(&'a str, &'a str)],
     /// Keep log-CDF subtraction opaque for fixed one-sided interval lanes.
     pub compact_log_cdf_difference: bool,

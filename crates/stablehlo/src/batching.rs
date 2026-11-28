@@ -334,6 +334,11 @@ impl Emitter<'_> {
     pub(crate) fn constant_like(&mut self, x: f64, v: &Value) -> Value {
         let out = self.const_lit_like(&float_literal(self.dtype, x), v);
         self.remember_constant(&out.ssa, [Scalar::Real(x)]);
+        // As in `constant`: finiteness predicates fold against a fixed infinity.
+        if x.is_infinite() {
+            self.constants
+                .insert(out.ssa.clone(), flatppl_core::Packed::Real([x].into()));
+        }
         out
     }
 
@@ -847,7 +852,7 @@ impl Emitter<'_> {
     ) -> Result<Value, EmitError> {
         if matches!(
             name,
-            "linsolve" | "quantile" | "conv" | "crosscorr" | "cross"
+            "linsolve" | "quantile" | "conv" | "crosscorr" | "cross" | "quadform"
         ) {
             let [_, _] = crate::ops::args_exact(id, args)?;
         } else {

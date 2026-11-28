@@ -1,6 +1,10 @@
 use flatppl_stablehlo::{Dtype, EmitOptions, Mode, Target};
 
 fn emit(source: &str, target: Target) -> String {
+    emit_with_dtype(source, target, Dtype::F64)
+}
+
+fn emit_with_dtype(source: &str, target: Target, dtype: Dtype) -> String {
     let mut module = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -15,7 +19,7 @@ fn emit(source: &str, target: Target) -> String {
         &lowered,
         Mode::LogDensity,
         &EmitOptions {
-            dtype: Dtype::F64,
+            dtype,
             target,
             ..Default::default()
         },
@@ -138,5 +142,102 @@ fn gpu_non_affine_integer_steps_keep_the_loop() {
     for step in ["t * t + s", "max(t, s)"] {
         let ir = emit(&integer_count(step), Target::Gpu);
         assert_eq!(ir.matches("stablehlo.while").count(), 1, "{step}: {ir}");
+    }
+}
+
+#[test]
+fn small_nonlinear_gpu_scans_write_ordered_blocks_and_an_exact_tail() {
+    for dtype in [Dtype::F32, Dtype::F64] {
+        for n in [1, 31, 32, 33, 34, 35] {
+            let prefix = format!(
+                "y = elementof(cartpow(reals,{n}))\n\
+                 seed = elementof(reals)\n\
+                 states = scan((s,x) -> tanh(s+x), seed, y)\n\
+                 inputs = (seed,y)\n"
+            );
+            for result in ["sum(states)".to_owned(), format!("states[{n}]")] {
+                let source = format!("{prefix}outputs = {result}");
+                for target in [Target::Cpu, Target::Gpu] {
+                    let ir = emit_with_dtype(&source, target, dtype);
+                    let stepped = target == Target::Gpu && n >= 32;
+                    let expected = if stepped { 4 + n % 4 } else { 1 };
+                    assert_eq!(ir.matches("stablehlo.tanh").count(), expected, "{ir}");
+                    let trips = if stepped { n / 4 } else { n };
+                    let condition = ir
+                        .split("cond {")
+                        .nth(1)
+                        .unwrap()
+                        .split("} do {")
+                        .next()
+                        .unwrap();
+                    assert!(
+                        condition.contains(&format!("dense<{trips}>")),
+                        "{condition}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn long_elementary_scalar_gpu_scans_widen_and_keep_the_exact_tail() {
+    let emit_step = |step: &str, target, length| {
+        emit(
+            &format!(
+                "xs = elementof(cartpow(reals, {length}))\n\
+                 seed = elementof(reals)\n\
+                 inputs = (seed, xs)\n\
+                 states = scan((s, x) -> {step}, seed, xs)\n\
+                 outputs = sum(states)"
+            ),
+            target,
+        )
+    };
+    let check = |ir: &str, trips, occurrences| {
+        let condition = ir
+            .split_once("cond {")
+            .unwrap()
+            .1
+            .split_once("} do {")
+            .unwrap()
+            .0;
+        assert!(
+            condition.contains(&format!("dense<{trips}>")),
+            "{condition}"
+        );
+        assert_eq!(ir.matches("stablehlo.sqrt").count(), occurrences, "{ir}");
+    };
+    let simple = "sqrt((s - x) ^ 2 + 0.5)";
+    check(&emit_step(simple, Target::Gpu, 199), 24, 8 + 7);
+    check(&emit_step(simple, Target::Gpu, 599), 37, 16 + 7);
+    check(&emit_step(simple, Target::Cpu, 199), 199, 1);
+    check(
+        &emit_step(
+            "sqrt(ifelse(x > 0.0, s - x, s + x) ^ 2 + 0.5)",
+            Target::Gpu,
+            199,
+        ),
+        49,
+        4 + 3,
+    );
+}
+
+#[test]
+fn empty_and_large_state_scans_keep_their_existing_lowering() {
+    let empty = "seed = elementof(reals)\n\
+                 xs = filter(x -> x > 10.0, [1.0,2.0])\n\
+                 states = scan((s,x) -> tanh(s+x), seed, xs)\n\
+                 inputs = seed\noutputs = sum(states)";
+    let large = "seed = elementof(cartpow(reals,9))\n\
+                 xs = elementof(cartpow(reals,35))\n\
+                 states = scan((s,x) -> tanh.(s .+ x), seed, xs)\n\
+                 inputs = (seed,xs)\noutputs = sum(states[35])";
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let ir = emit_with_dtype(empty, Target::Gpu, dtype);
+        assert!(!ir.contains("stablehlo.while"), "{ir}");
+        assert!(!ir.contains("stablehlo.tanh"), "{ir}");
+        let ir = emit_with_dtype(large, Target::Gpu, dtype);
+        assert_eq!(ir.matches("stablehlo.tanh").count(), 1, "{ir}");
     }
 }

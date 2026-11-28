@@ -77,7 +77,7 @@
 //! branch pair) — it is a limit of what the boundary can express. A host that
 //! needs the distinction must carry it out of band.
 //!
-//! ## Records flatten depth-first at the function boundary
+//! ## Aggregate results flatten depth-first at the function boundary
 //!
 //! Inside the emitter a record is an ordered map of field name to value, in
 //! declared field order, and a field may itself be a record (spec §03
@@ -94,12 +94,16 @@
 //! place. Field access (`data.y`, `p.inner.v`) resolves to that leaf's
 //! argument. Argument numbering is positional over the flattened list, so an
 //! entry after a destructured one shifts by its leaf count.
+//! A promoted fixed tuple input follows the same depth-first convention in
+//! positional order. Its projections read the corresponding runtime arguments.
 //!
 //! An output whose value is a record — a `record(...)`, a §07 table reduction,
 //! a table row `t[i]`, a record-valued `ifelse` or broadcast — contributes one
 //! result per leaf in the same order. The CLI writes no metadata, so this
 //! order is the ABI; `flatppl-host`'s query `Schema` records the field path of
 //! each leaf.
+//! A tuple output contributes its components in positional order, recursively
+//! flattening tuple and record components into the same tensor result list.
 //!
 //! `inputs` is authoritative and exhaustive: every `elementof` parameter in
 //! the module must be listed, or emission refuses. Each `outputs` entry is a
@@ -230,12 +234,13 @@ mod types;
 
 pub use call_batch::BatchSpec;
 pub use emitter::Emitter;
+pub use flatppl_optimise::{RulePolicy, RuleSelector};
 pub use mlir::{ElemKind, Lowered, MlirTy, Value};
 pub use modes::check_query_inputs;
 pub use refuse::EmitError;
 pub use types::mlir_type_of;
 
-use flatppl_core::Module;
+use flatppl_core::{Module, NodeId};
 
 /// Which computation to emit: the model's log-density, or a sampling program.
 pub enum Mode {
@@ -329,6 +334,7 @@ impl EmitOptions {
     pub fn lowering_options(&self) -> flatppl_determinizer::LoweringOptions<'static> {
         flatppl_determinizer::LoweringOptions {
             disable_sufficient_statistics: !self.sufficient_statistics,
+            share_normal_scale: matches!((self.dtype, self.target), (Dtype::F32, Target::Gpu)),
             numerical_integrals: self.integration.is_some(),
             compact_log_cdf_difference: self.target == Target::Cpu,
             ..LOWERING_OPTIONS
@@ -350,12 +356,55 @@ impl Default for EmitOptions {
     }
 }
 
+/// Optimise a validated query for the selected backend. The returned node is
+/// the updated `outputs` binding's RHS. Sampling retains its authored RNG walk.
+pub fn optimise_query(m: &Module, opts: &EmitOptions) -> Option<(Module, NodeId)> {
+    optimise_query_with_rules(m, opts, &RulePolicy::default())
+}
+
+/// Optimise a validated query using the caller's egglog rules.
+pub fn optimise_query_with_rules(
+    m: &Module,
+    opts: &EmitOptions,
+    rules: &RulePolicy,
+) -> Option<(Module, NodeId)> {
+    use flatppl_optimise::{Dtype as Precision, Target as Backend};
+
+    let (outputs, binding) = m.bindings().find(|(_, b)| m.resolve(b.name) == "outputs")?;
+    if modes::reaches_sample(m, binding.rhs) {
+        return None;
+    }
+    let mut optimised = flatppl_optimise::optimise_stablehlo_with_rules(
+        m,
+        Some(&[binding.name]),
+        match opts.target {
+            Target::Cpu => Backend::Cpu,
+            Target::Gpu => Backend::Gpu,
+        },
+        match opts.dtype {
+            Dtype::F32 => Precision::F32,
+            Dtype::F64 => Precision::F64,
+        },
+        opts.sufficient_statistics,
+        rules,
+    )?;
+    if flatppl_determinizer::has_alias_chains(&optimised) {
+        flatppl_determinizer::resolve_alias_chains(&mut optimised);
+    }
+    let rhs = optimised.binding(outputs).rhs;
+    Some((optimised, rhs))
+}
+
 /// Keep these calls intact so the emitter can use model and modifier structure.
 /// The default determinizer still expands their portable reference definitions.
 pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
         compact_log_cdf_difference: false,
+        disable_optimizations: false,
         disable_sufficient_statistics: false,
+        // The emitter reads the laws, and the StableHLO rules run on them.
+        disable_lowered_stage: true,
+        share_normal_scale: false,
         preserve_rand_tuple: false,
         numerical_integrals: false,
         vector_sort: true,
@@ -391,6 +440,17 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
 /// last-public-binding/source-order query heuristic has been removed, so there
 /// is no fallback.
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
+    emit_with_rules(m, mode, opts, &RulePolicy::default())
+}
+
+/// Emit a determinized query using the caller's egglog rules. Use the same
+/// policy during determinization to control its portable rewrites as well.
+pub fn emit_with_rules(
+    m: &Module,
+    mode: Mode,
+    opts: &EmitOptions,
+    rules: &RulePolicy,
+) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl_with_options(m, &opts.lowering_options())
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
     // The emitter reads fixed operands through one ref hop (`Emitter::resolve_ref_one`).
@@ -403,10 +463,12 @@ pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitEr
     } else {
         m
     };
+    let specialized = flatppl_infer::specialize_empty_axes(m);
+    let m = specialized.as_ref().unwrap_or(m);
     match modes::read_abi(m)? {
         Some(abi) => match mode {
-            Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts),
-            Mode::Sample => modes::emit_sample_abi(m, &abi, opts),
+            Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts, rules),
+            Mode::Sample => modes::emit_sample_abi(m, &abi, opts, rules),
         },
         None => Err(EmitError::whole(
             "no inputs/outputs ABI declared; the last-public-binding query \

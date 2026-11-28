@@ -110,7 +110,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: logistic_logpdf,
             sample: Some(logistic_sample),
-            touniform: None,
+            touniform: Some(logistic_cdf),
             broadcast: Broadcast::Elementwise,
         },
     ),
@@ -128,7 +128,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: exponential_logpdf,
             sample: Some(exponential_sample),
-            touniform: None,
+            touniform: Some(exponential_cdf),
             broadcast: Broadcast::Elementwise,
         },
     ),
@@ -936,8 +936,10 @@ pub(crate) fn lower_transport(
     }
     if !matches!(
         (head, ctor.as_str()),
-        ("builtin_tonormal" | "builtin_fromnormal", "Normal")
-            | ("builtin_fromuniform", "Cauchy" | "Exponential" | "Logistic")
+        (
+            "builtin_tonormal" | "builtin_fromnormal",
+            "Normal" | "LogNormal"
+        ) | ("builtin_fromuniform", "Cauchy" | "Exponential" | "Logistic")
     ) {
         return Err(EmitError::at(
             id,
@@ -1007,6 +1009,28 @@ pub(crate) fn lower_transport(
             let sigma = scalar_param(e, "sigma")?;
             let scaled = e.mul(&sigma, &x);
             Ok(e.add(&mu, &scaled))
+        }
+        ("builtin_tonormal", "LogNormal") => {
+            let mu = scalar_param(e, "mu")?;
+            let sigma = scalar_param(e, "sigma")?;
+            let zero = e.scalar(0.0);
+            let positive = e.compare("GT", &x, &zero);
+            let one = e.scalar(1.0);
+            let safe = e.select(&positive, &x, &one);
+            let log_x = e.log(&safe);
+            let difference = e.sub(&log_x, &mu);
+            let normal = e.div(&difference, &sigma);
+            let outside = e.scalar(f64::NEG_INFINITY);
+            let result = e.select(&positive, &normal, &outside);
+            let nan = e.compare("NE", &x, &x);
+            Ok(e.select(&nan, &x, &result))
+        }
+        ("builtin_fromnormal", "LogNormal") => {
+            let mu = scalar_param(e, "mu")?;
+            let sigma = scalar_param(e, "sigma")?;
+            let scaled = e.mul(&sigma, &x);
+            let exponent = e.add(&mu, &scaled);
+            Ok(e.exp(&exponent))
         }
         ("builtin_fromuniform", "Exponential") => {
             let rate = scalar_param(e, "rate")?;
@@ -1578,6 +1602,36 @@ fn cauchy_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 /// §08 Logistic, verbatim: with `u = (x - mu) / s`, `log f = -u - log(s) -
 /// 2 * log(1 + exp(-u))`.
+fn lognormal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let zero = e.scalar(0.0);
+    let positive = e.compare("GT", x, &zero);
+    let one = e.scalar(1.0);
+    let safe = e.select(&positive, x, &one);
+    let log_x = e.log(&safe);
+    let cdf = normal_cdf(e, p, &log_x)?;
+    let result = e.select(&positive, &cdf, &zero);
+    let nan = e.compare("NE", x, x);
+    Ok(e.select(&nan, x, &result))
+}
+
+fn logistic_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let scale = p.get(e, "s")?;
+    let difference = e.sub(x, &mu);
+    let z = e.div(&difference, &scale);
+    Ok(e.invlogit(&z))
+}
+
+fn exponential_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let rate = p.get(e, "rate")?;
+    let zero = e.scalar(0.0);
+    let nonnegative = e.max(x, &zero);
+    let scaled = e.mul(&rate, &nonnegative);
+    let negative = e.neg(&scaled);
+    let survival_delta = e.expm1(&negative);
+    Ok(e.neg(&survival_delta))
+}
+
 fn logistic_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let s = p.get(e, "s")?;
@@ -1982,24 +2036,6 @@ fn chi_squared_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 /// calling [`Emitter::log`] on `v` a second time (each call emits a fresh
 /// `stablehlo.log` op; unlike [`Emitter::lower_node`], these op helpers do
 /// not memoize by FlatPDL `NodeId`).
-/// §08 LogNormal's CDF: `Φ((log x - mu) / sigma)` on its support `posreals`
-/// and 0 at or below zero. The logarithm reads a safe 1 off the support, so
-/// neither the value nor its derivative picks up the NaN of `log(x <= 0)`.
-fn lognormal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
-    let mu = p.get(e, "mu")?;
-    let sigma = p.get(e, "sigma")?;
-    let zero = e.scalar(0.0);
-    let positive = e.compare("GT", x, &zero);
-    let one = e.constant_like(1.0, x);
-    let safe = e.select(&positive, x, &one);
-    let log_x = e.log(&safe);
-    let diff = e.sub(&log_x, &mu);
-    let z = e.div(&diff, &sigma);
-    let cdf = e.invprobit(&z);
-    let below = e.constant_like(0.0, &cdf);
-    Ok(e.select(&positive, &cdf, &below))
-}
-
 fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
@@ -2436,54 +2472,67 @@ pub(crate) fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
 // a per-observation formula built from arithmetic on `v` — see
 // [`categorical_logpdf`]'s doc comment.
 
+/// The smaller outcome probability q = invlogit(-|z|) is at most 1/2.
+/// The more likely outcome has log mass log1p(-q), and the less likely
+/// outcome's log mass is smaller by |z|, even after q underflows.
+fn binary_logit_terms(e: &mut Emitter, z: &Value) -> (Value, Value) {
+    let magnitude = e.abs(z);
+    let log_odds = e.neg(&magnitude);
+    if e.target() == crate::Target::Cpu && matches!(e.dtype(), Dtype::F64) {
+        // x = exp(-|z|) lies in [0, 1]. Correct the rounding in 1+x before
+        // using the vectorizable CPU log: log1p(x) = log(u) + log1p(error/u).
+        // |error/u| <= eps, so replacing its log1p by error/u loses O(eps^2).
+        // Keep u rounded; algebraic cancellation would discard small tails.
+        let x = e.exp(&log_odds);
+        let one = e.scalar(1.0);
+        let sum = e.add(&one, &x);
+        let sum = e.unary("stablehlo.optimization_barrier", &sum);
+        let increment = e.sub(&sum, &one);
+        let error = e.sub(&x, &increment);
+        let correction = e.div(&error, &sum);
+        let logarithm = e.log(&sum);
+        let common = e.add(&logarithm, &correction);
+        return (e.neg(&common), log_odds);
+    }
+    let small = e.invlogit(&log_odds);
+    let minus_small = e.neg(&small);
+    (e.log1p(&minus_small), log_odds)
+}
+
+/// The Bernoulli log mass at logit `logit` of a supported observation.
+pub(crate) fn bernoulli_logit_score(
+    e: &mut Emitter,
+    logit: &Value,
+    success: &Value,
+    supported: &Value,
+) -> Value {
+    let zero = e.scalar(0.0);
+    let z = e.select(supported, logit, &zero);
+    let (common, log_odds) = binary_logit_terms(e, &z);
+    let nonnegative = e.compare("GE", &z, &zero);
+    let likely = e.compare("EQ", success, &nonnegative);
+    let offset = e.select(&likely, &zero, &log_odds);
+    e.add(&offset, &common)
+}
+
 /// Select the observed probability before taking its log, including p=0 and p=1.
-/// A probability spelled `invlogit(z)` is scored on the logit scale instead
-/// (see [`Emitter::invlogit_operand`]), as `bernoulli_logit` in Stan.
+/// When its logit is known, take the log probability before it rounds to an endpoint.
 fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
     let one = e.scalar(1.0);
     let zero = e.scalar(0.0);
-    if let Some(logit) = e.invlogit_operand(&prob) {
-        let success = e.compare("EQ", v, &one);
-        let failure = e.compare("EQ", v, &zero);
-        let supported = e.or(&success, &failure);
-        let score = bernoulli_logit_score(e, &success, &logit);
-        return Ok(outside_count_support(e, &supported, &score));
-    }
-    let one_minus_p = e.sub(&one, &prob);
     let success = e.compare("EQ", v, &one);
     let failure = e.compare("EQ", v, &zero);
     let supported = e.or(&success, &failure);
-    let selected = e.select(&success, &prob, &one_minus_p);
-    let safe = e.select(&supported, &selected, &one);
-    let score = e.log(&safe);
-    let inf = e.inf_like(&score);
-    let outside = e.neg(&inf);
-    Ok(e.select(&supported, &score, &outside))
-}
-
-/// `log p` at a success and `log(1 - p)` at a failure for `p = invlogit(z)`:
-/// `-softplus(-z)` and `-softplus(z)`, finite with a finite derivative at every
-/// finite logit. Shared with §09 `BernoulliLogitGLM`.
-fn bernoulli_logit_score(e: &mut Emitter, success: &Value, z: &Value) -> Value {
-    let negative = e.neg(z);
-    let signed = e.select(success, &negative, z);
-    let penalty = e.softplus(&signed);
-    e.neg(&penalty)
-}
-
-/// `-count * softplus(signed)` for `p = invlogit(z)`: `signed = -z` gives
-/// `count * log p`, and `signed = z` gives `count * log(1 - p)`. A zero count
-/// contributes exactly zero, even at an infinite logit: its softplus argument
-/// is replaced by 0 first, so neither the value nor the derivative sees
-/// `0 * inf`.
-fn binomial_logit_term(e: &mut Emitter, count: &Value, signed: &Value) -> Value {
-    let zero = e.scalar(0.0);
-    let empty = e.compare("EQ", count, &zero);
-    let safe = e.select(&empty, &zero, signed);
-    let penalty = e.softplus(&safe);
-    let scaled = e.mul(count, &penalty);
-    e.neg(&scaled)
+    let score = if let Some(logit) = e.invlogit_operand(&prob) {
+        bernoulli_logit_score(e, &logit, &success, &supported)
+    } else {
+        let one_minus_p = e.sub(&one, &prob);
+        let selected = e.select(&success, &prob, &one_minus_p);
+        let safe = e.select(&supported, &selected, &one);
+        e.log(&safe)
+    };
+    Ok(outside_count_support(e, &supported, &score))
 }
 
 /// §08 Poisson uses the same expression as §09 ContinuedPoisson on its
@@ -2544,6 +2593,26 @@ fn outside_count_support(e: &mut Emitter, supported: &Value, score: &Value) -> V
     e.select(supported, score, &outside)
 }
 
+/// A zero count of the less likely outcome can occur at an infinite logit.
+/// Replace its unused log odds before multiplication.
+pub(crate) fn binomial_logit_score(
+    e: &mut Emitter,
+    z: &Value,
+    successes: &Value,
+    failures: &Value,
+) -> Value {
+    let zero = e.scalar(0.0);
+    let nonnegative = e.compare("GE", z, &zero);
+    let (common, log_odds) = binary_logit_terms(e, z);
+    let trials = e.add(successes, failures);
+    let common = e.mul(&trials, &common);
+    let count = e.select(&nonnegative, failures, successes);
+    let empty = e.compare("EQ", &count, &zero);
+    let safe = e.select(&empty, &zero, &log_odds);
+    let linear = e.mul(&count, &safe);
+    e.add(&linear, &common)
+}
+
 /// §08 Binomial: `log f = logC(n, k) + k * log(p) + (n - k) * log(1 - p)`,
 /// with `logC(n, k) = -log1p(n) - log B(k + 1, n - k + 1)`, which equals
 /// `lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)`. `n - k` is computed once and its
@@ -2551,26 +2620,18 @@ fn outside_count_support(e: &mut Emitter, supported: &Value, score: &Value) -> V
 /// `(n-k) * log(1-p)` term — the spec's `n - k` appears in both positions
 /// verbatim, same reuse discipline as [`lognormal_logpdf`]'s shared `log(x)`.
 /// Its `@sample` builder is [`binomial_sample`] (Task 16) — the exact sum of
-/// `n` Bernoulli indicators. A probability spelled `invlogit(z)` is scored on
-/// the logit scale (see [`binomial_logit_term`]), as `binomial_logit` in Stan.
+/// `n` Bernoulli indicators.
 fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = p.get(e, "n")?;
     let prob = p.get(e, "p")?;
-    let logit = e.invlogit_operand(&prob);
     let fixed_log_choose = e.fold_log_choose(&n, v);
     let zero = e.scalar(0.0);
     let (supported, v) = count_support(e, v, Some(&n));
-    // Out-of-support lanes score an in-range stand-in and are masked below.
-    let (prob, logit) = match logit {
-        Some(logit) => (prob, Some(e.select(&supported, &logit, &zero))),
-        None => {
-            let half = e.scalar(0.5);
-            (e.select(&supported, &prob, &half), None)
-        }
-    };
     let one = e.scalar(1.0);
 
     let n_minus_k = e.sub(&n, &v);
+    let no_successes = e.compare("EQ", &v, &zero);
+    let no_failures = e.compare("EQ", &n_minus_k, &zero);
     // logC(n, k) = -log1p(n) - log B(k + 1, n - k + 1): no large log-gammas cancel.
     let log_choose_nk = fixed_log_choose.unwrap_or_else(|| {
         let k_plus_one = e.add(&v, &one);
@@ -2578,28 +2639,31 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
         let log_beta = e.log_beta(&k_plus_one, &n_minus_k_plus_one);
         let log1p_n = e.log1p(&n);
         let neg_log1p_n = e.neg(&log1p_n);
-        e.sub(&neg_log1p_n, &log_beta)
+        let coefficient = e.sub(&neg_log1p_n, &log_beta);
+        // C(n, 0) and C(n, n) are one. Roundoff here can erase either logit tail.
+        let endpoint = e.or(&no_successes, &no_failures);
+        e.select(&endpoint, &zero, &coefficient)
     });
 
-    let (k_log_p, n_minus_k_log_one_minus_p) = if let Some(logit) = logit {
-        let negative = e.neg(&logit);
-        let k_log_p = binomial_logit_term(e, &v, &negative);
-        (k_log_p, binomial_logit_term(e, &n_minus_k, &logit))
-    } else {
-        // A zero exponent contributes log(1), even when its probability is zero.
-        // Guard before log so its unused singular derivative cannot poison AD.
-        let no_successes = e.compare("EQ", &v, &zero);
-        let safe_prob = e.select(&no_successes, &one, &prob);
-        let log_p = e.log(&safe_prob);
-        let k_log_p = e.mul(&v, &log_p);
+    if let Some(logit) = e.invlogit_operand(&prob) {
+        let safe = e.select(&supported, &logit, &zero);
+        let term = binomial_logit_score(e, &safe, &v, &n_minus_k);
+        let score = e.add(&log_choose_nk, &term);
+        return Ok(outside_count_support(e, &supported, &score));
+    }
+    let half = e.scalar(0.5);
+    let prob = e.select(&supported, &prob, &half);
+    // A zero exponent contributes log(1), even when its probability is zero.
+    // Guard before log so its unused singular derivative cannot poison AD.
+    let safe_prob = e.select(&no_successes, &one, &prob);
+    let log_p = e.log(&safe_prob);
+    let k_log_p = e.mul(&v, &log_p);
 
-        // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
-        let no_failures = e.compare("EQ", &n_minus_k, &zero);
-        let safe_prob_complement = e.select(&no_failures, &zero, &prob);
-        let neg_prob = e.neg(&safe_prob_complement);
-        let log_one_minus_p = e.log1p(&neg_prob);
-        (k_log_p, e.mul(&n_minus_k, &log_one_minus_p))
-    };
+    // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
+    let safe_prob_complement = e.select(&no_failures, &zero, &prob);
+    let neg_prob = e.neg(&safe_prob_complement);
+    let log_one_minus_p = e.log1p(&neg_prob);
+    let n_minus_k_log_one_minus_p = e.mul(&n_minus_k, &log_one_minus_p);
 
     let t2 = e.add(&log_choose_nk, &k_log_p);
     let score = e.add(&t2, &n_minus_k_log_one_minus_p);

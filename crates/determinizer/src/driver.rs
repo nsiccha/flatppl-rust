@@ -13,6 +13,7 @@ use crate::refuse::RefuseError;
 pub(crate) use flatppl_core::graph::rebuild_with_children;
 use flatppl_core::{BindingId, CallHead, Idx, Module, Node, NodeId, Scalar, Symbol};
 use flatppl_infer::ModuleBundle;
+use flatppl_optimise::RulePolicy;
 
 /// The measure-algebra vocabulary: op names whose presence signals a node that
 /// must be eliminated before the module is FlatPDL-conformant. This list matches
@@ -97,7 +98,18 @@ pub fn determinize_with_options(
     roots: Option<&[Symbol]>,
     options: &crate::LoweringOptions<'_>,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, None, None)
+    determinize_with_options_and_rules(m, bundle, roots, options, &RulePolicy::default())
+}
+
+/// Transform `m` using a caller-selected policy for portable egglog rewrites.
+pub fn determinize_with_options_and_rules(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    rules: &RulePolicy,
+) -> Result<Module, RefuseError> {
+    determinize_inner(m, bundle, roots, options, None, None, rules)
 }
 
 /// Trace the actual lowering-time reductions without changing the result.
@@ -108,7 +120,26 @@ pub fn determinize_with_options_and_report(
     options: &crate::LoweringOptions<'_>,
     report: &mut crate::ReductionReport,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, Some(report), None)
+    determinize_with_options_report_and_rules(
+        m,
+        bundle,
+        roots,
+        options,
+        report,
+        &RulePolicy::default(),
+    )
+}
+
+/// Trace lowering-time reductions with a caller-selected egglog rule policy.
+pub fn determinize_with_options_report_and_rules(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    report: &mut crate::ReductionReport,
+    rules: &RulePolicy,
+) -> Result<Module, RefuseError> {
+    determinize_inner(m, bundle, roots, options, Some(report), None, rules)
 }
 
 /// Inspect source measures after dependency resolution and inference, before
@@ -121,7 +152,36 @@ pub fn determinize_with_sampling_report(
     reductions: &mut crate::ReductionReport,
     inspect: &mut dyn SamplingObserver,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, Some(reductions), Some(inspect))
+    determinize_with_sampling_report_and_rules(
+        m,
+        bundle,
+        roots,
+        options,
+        reductions,
+        inspect,
+        &RulePolicy::default(),
+    )
+}
+
+/// Trace sampled measure identities with a caller-selected egglog rule policy.
+pub fn determinize_with_sampling_report_and_rules(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    reductions: &mut crate::ReductionReport,
+    inspect: &mut dyn SamplingObserver,
+    rules: &RulePolicy,
+) -> Result<Module, RefuseError> {
+    determinize_inner(
+        m,
+        bundle,
+        roots,
+        options,
+        Some(reductions),
+        Some(inspect),
+        rules,
+    )
 }
 
 /// Observe the same source and instantiated measures consumed by lowering.
@@ -142,6 +202,7 @@ fn determinize_inner(
     options: &crate::LoweringOptions<'_>,
     mut report: Option<&mut crate::ReductionReport>,
     mut observer: Option<&mut dyn SamplingObserver>,
+    rules: &RulePolicy,
 ) -> Result<Module, RefuseError> {
     let mut work = m.clone();
     let mut imports = crate::crossmodule::GraftState::default();
@@ -187,6 +248,7 @@ fn determinize_inner(
     }
 
     let mut specialize_sequences = true;
+    let mut optimise_source = !options.disable_optimizations;
     let mut has_mass_queries = false;
     let mut sampling = SamplingInspection {
         observer,
@@ -195,6 +257,18 @@ fn determinize_inner(
     loop {
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
+        // Requested outputs are not the full set of source dependencies until
+        // every query has consumed its draw provenance.
+        if std::mem::take(&mut optimise_source)
+            && let Some(optimised) = flatppl_optimise::optimise_with_rules(
+                &work,
+                None,
+                flatppl_optimise::Profile::Portable,
+                rules,
+            )
+        {
+            work = optimised;
+        }
         if std::mem::take(&mut sampling.refresh)
             && let Some(observer) = sampling.observer.as_mut()
         {
@@ -253,24 +327,62 @@ fn determinize_inner(
 
         match target {
             None => {
-                // Measure layer gone — canonicalize the FlatPDL (and, if
-                // `roots` is given, drop bindings unreachable from them) before
-                // the conformance check and return.
-                crate::canon::canonicalize(&mut work, roots);
+                // Call inlining is still required to reach FlatPDL when the
+                // caller requests the graph before optimization.
+                if options.disable_optimizations {
+                    // Specializing a sequence callback can expose another
+                    // applied callable, and inlining can expose a sequence.
+                    for _ in 0..12 {
+                        let inlined = crate::canon::inline_user_calls(&mut work);
+                        if inlined {
+                            let _ = flatppl_infer::infer(&mut work);
+                        }
+                        let specialized =
+                            crate::density::broadcast::specialize_callable_sequences(&mut work);
+                        if !inlined && !specialized {
+                            break;
+                        }
+                        if specialized {
+                            let _ = flatppl_infer::infer(&mut work);
+                        }
+                    }
+                    if let Some(roots) = roots {
+                        crate::canon::retain_reachable(&mut work, roots);
+                    }
+                } else {
+                    crate::canon::canonicalize(&mut work, roots);
+                }
                 if has_mass_queries && crate::log_mass::lower(&mut work) {
                     if let Some(roots) = roots {
                         crate::canon::retain_reachable(&mut work, roots);
                     }
                     let _ = flatppl_infer::infer(&mut work);
                 }
-                if !options.disable_sufficient_statistics {
-                    if let Some(report) = report.as_deref_mut() {
-                        crate::sufficient_statistics_with_report(&mut work, report);
-                    } else {
-                        crate::sufficient_statistics(&mut work);
-                    }
+                // Closed inner integrals need their own binding before the
+                // nonnested-integral check, including on the AD input path.
+                if options.disable_optimizations
+                    && options.numerical_integrals
+                    && crate::canon::hoist_integrals(&mut work)
+                {
+                    let _ = flatppl_infer::infer(&mut work);
+                }
+                if !options.disable_optimizations && !options.disable_sufficient_statistics {
+                    crate::sufficient_statistics_for_target(
+                        &mut work,
+                        options.share_normal_scale,
+                        report.as_deref_mut(),
+                    );
                 } else if let Some(report) = report.as_deref_mut() {
                     report.record_disabled(&work);
+                }
+                // After the reductions, which read the laws the lowered rules
+                // rewrite, and before conformance, which the rewrite must pass.
+                if !options.disable_optimizations
+                    && !options.disable_lowered_stage
+                    && let Some(lowered) = flatppl_optimise::optimise_lowered(&work, None, rules)
+                {
+                    work = lowered;
+                    let _ = flatppl_infer::infer(&mut work);
                 }
                 match crate::is_flatpdl_with_options(&work, options) {
                     Ok(()) => return Ok(work),
@@ -737,7 +849,13 @@ fn apply_rule(
             })?;
         let root = crate::density::closed_form_totalmass(m, measure)
             .map(Ok)
-            .or_else(|| crate::density::integral::rectangular_totalmass(m, measure))
+            .or_else(|| {
+                crate::density::integral::lebesgue_totalmass(
+                    m,
+                    measure,
+                    options.numerical_integrals,
+                )
+            })
             .ok_or_else(|| {
                 crate::density::refuse(target_node, m, "totalmass needs a closed-form mass")
             })??;

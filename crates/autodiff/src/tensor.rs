@@ -1,0 +1,965 @@
+//! Shape changes used by tensor pullbacks.
+
+use flatppl_core::graph::{build_call, fold_add};
+use flatppl_core::{Axis, Dim, Module, Node, NodeId, Scalar, ScalarType, Type};
+
+use crate::{Emitter, Error, REAL, Step, callbacks, real};
+
+pub(super) fn real_shape(module: &Module, node: NodeId) -> Option<&[Dim]> {
+    real_shape_of(module.type_of(node)?)
+}
+
+pub(super) fn real_shape_of(ty: &Type) -> Option<&[Dim]> {
+    match ty {
+        Type::Scalar(ScalarType::Real) => Some(&[]),
+        Type::Array { shape, elem } if **elem == REAL && fixed(shape) => Some(shape),
+        _ => None,
+    }
+}
+
+pub(super) fn nested_vector(module: &Module, node: NodeId) -> Option<(u32, u32)> {
+    nested_vector_type(module.type_of(node)?)
+}
+
+pub(super) fn nested_vector_type(ty: &Type) -> Option<(u32, u32)> {
+    let Type::Array { shape: outer, elem } = ty else {
+        return None;
+    };
+    let Type::Array { shape: inner, elem } = elem.as_ref() else {
+        return None;
+    };
+    match (outer.as_ref(), inner.as_ref()) {
+        ([Dim::Static(rows)], [Dim::Static(cols)]) if *rows > 0 && *cols > 0 && **elem == REAL => {
+            Some((*rows, *cols))
+        }
+        _ => None,
+    }
+}
+
+// Array cells retain their own axes inside the outer collection.
+pub(super) fn array_of_arrays(ty: &Type) -> Option<(&[Dim], &Type)> {
+    let Type::Array { shape, elem } = ty else {
+        return None;
+    };
+    let cell_shape = real_shape_of(elem)?;
+    (!shape.is_empty() && fixed(shape) && !cell_shape.is_empty()).then_some((shape, elem))
+}
+
+pub(super) fn vector_of_arrays(ty: &Type) -> Option<(Dim, &Type)> {
+    let (outer, elem) = array_of_arrays(ty)?;
+    let [rows] = *outer else {
+        return None;
+    };
+    (real_shape_of(elem)?.len() > 1).then_some((rows, elem))
+}
+
+pub(super) fn add_terms(emitter: &mut Emitter, primal: NodeId, terms: &[NodeId]) -> NodeId {
+    if terms.len() == 1 {
+        return terms[0];
+    }
+    if let Some(ty) = emitter.module.type_of(primal)
+        && (matches!(ty, Type::Record(_) | Type::Table { .. } | Type::Tuple(_))
+            || array_of_arrays(ty).is_some())
+    {
+        return add_typed(emitter, &ty.clone(), terms);
+    }
+    fold_add(&mut emitter.module, terms)
+}
+
+pub(super) fn add_typed(emitter: &mut Emitter, ty: &Type, terms: &[NodeId]) -> NodeId {
+    if terms.len() == 1 {
+        return terms[0];
+    }
+    if let Type::Record(fields) = ty {
+        crate::record::add(emitter, fields, terms, "record")
+    } else if let Some(columns) = crate::table::columns(ty) {
+        crate::record::add(emitter, &columns, terms, "table")
+    } else if let Type::Tuple(items) = ty {
+        crate::tuple::add(emitter, items, terms)
+    } else if let Some((count, _)) = nested_vector_type(ty) {
+        let m = &mut emitter.module;
+        let matrices: Vec<_> = terms
+            .iter()
+            .map(|&term| build_call(m, "rowstack", &[term]))
+            .collect();
+        let matrix = fold_add(m, &matrices);
+        callbacks::pack_rows(m, matrix, count)
+    } else if array_of_arrays(ty).is_some() {
+        let m = &mut emitter.module;
+        let mut entries = Vec::with_capacity(terms.len());
+        let cells: Vec<_> = (0..terms.len())
+            .map(|index| callbacks::callback_input(m, &format!("term_{index}"), &mut entries))
+            .collect();
+        let sum = fold_add(m, &cells);
+        let function = callbacks::reify(m, sum, entries);
+        let args: Vec<_> = std::iter::once(function)
+            .chain(terms.iter().copied())
+            .collect();
+        build_call(m, "broadcast", &args)
+    } else {
+        fold_add(&mut emitter.module, terms)
+    }
+}
+
+pub(super) fn numeric_shape(module: &Module, node: NodeId) -> Option<&[Dim]> {
+    const INTEGER: Type = Type::Scalar(ScalarType::Integer);
+    match module.type_of(node)? {
+        Type::Scalar(ScalarType::Integer) => Some(&[]),
+        Type::Array { shape, elem } if **elem == INTEGER && fixed(shape) => Some(shape),
+        _ => real_shape(module, node),
+    }
+}
+
+pub(super) fn matmul(module: &Module, args: &[NodeId]) -> bool {
+    matches!(
+        args,
+        [a, b] if matches!(numeric_shape(module, *a), Some([_, _]))
+            && matches!(numeric_shape(module, *b), Some([_] | [_, _]))
+    )
+}
+
+fn fixed(shape: &[Dim]) -> bool {
+    shape.iter().all(|dim| matches!(dim, Dim::Static(_)))
+}
+
+pub(super) fn boolean_shape(module: &Module, node: NodeId) -> bool {
+    const BOOL: Type = Type::Scalar(ScalarType::Boolean);
+    match module.type_of(node) {
+        Some(ty) if *ty == BOOL => true,
+        Some(Type::Array { shape, elem }) => **elem == BOOL && fixed(shape),
+        _ => false,
+    }
+}
+
+pub(super) fn zero_when_masked(
+    module: &mut Module,
+    bar: NodeId,
+    contribution: NodeId,
+    pointwise: bool,
+) -> NodeId {
+    // Select the result so an inactive lane cannot turn 0 * NaN into NaN.
+    let zero = real(module, 0.0);
+    let call = if pointwise { broadcast } else { build_call };
+    let inactive = call(module, "iszero", &[bar]);
+    call(module, "ifelse", &[inactive, zero, contribution])
+}
+
+/// Read the shaped cotangent in the original flat traversal order.
+pub(super) fn array_pullback(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    step: &Step<'_>,
+) -> Option<NodeId> {
+    let [data, _, order] = *step.args.as_slice() else {
+        return None;
+    };
+    let [Dim::Static(length)] = *real_shape(&emitter.module, data)? else {
+        return None;
+    };
+    let dimensions = real_shape(&emitter.module, step.node)?
+        .iter()
+        .map(|dim| match dim {
+            Dim::Static(size) if *size > 0 => Some(i64::from(*size)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let m = &mut emitter.module;
+    let mut strides = vec![0; dimensions.len()];
+    let mut stride = 1_i64;
+    for position in (0..dimensions.len()).rev() {
+        let position = int(m, position as i64);
+        let index = build_call(m, "get0", &[order, position]);
+        let axis = flatppl_infer::fixed_int_value(m, index)?.checked_sub(1)?;
+        let axis = usize::try_from(axis).ok()?;
+        let axis_stride = strides.get_mut(axis)?;
+        if *axis_stride != 0 {
+            return None;
+        }
+        *axis_stride = stride;
+        stride = stride.checked_mul(dimensions[axis])?;
+    }
+    if stride != i64::from(length) || dimensions.is_empty() {
+        return None;
+    }
+    if dimensions.len() == 1 {
+        return Some(bar);
+    }
+
+    let length = int(m, i64::from(length));
+    let shape = build_call(m, "zeros", &[length]);
+    let positions = build_call(m, "indicesof0", &[shape]);
+    let mut formals = Vec::new();
+    let position = callbacks::callback_input(m, "position", &mut formals);
+    let tensor = callbacks::callback_input(m, "cotangent", &mut formals);
+    let mut selectors = vec![tensor];
+    for (dimension, stride) in dimensions.into_iter().zip(strides) {
+        let stride = int(m, stride);
+        let dimension = int(m, dimension);
+        let index = build_call(m, "div", &[position, stride]);
+        selectors.push(build_call(m, "mod", &[index, dimension]));
+    }
+    let cell = build_call(m, "get0", &selectors);
+    let pick = callbacks::reify(m, cell, formals);
+    // A singleton collection supplies the same tensor to every index.
+    let held = build_call(m, "vector", &[bar]);
+    Some(build_call(m, "broadcast", &[pick, positions, held]))
+}
+
+pub(super) fn int(module: &mut Module, value: i64) -> NodeId {
+    module.alloc(Node::Lit(Scalar::Int(value)))
+}
+
+fn constant(module: &mut Module, name: &str) -> NodeId {
+    let name = module.intern(name);
+    module.alloc(Node::Const(name))
+}
+
+pub(super) fn broadcast(module: &mut Module, op: &str, args: &[NodeId]) -> NodeId {
+    let head = constant(module, op);
+    let args: Vec<_> = std::iter::once(head).chain(args.iter().copied()).collect();
+    build_call(module, "broadcast", &args)
+}
+
+pub(super) fn fill_like(emitter: &mut Emitter, value: NodeId, primal: NodeId) -> Option<NodeId> {
+    let ty = emitter.module.type_of(primal)?.clone();
+    fill_typed(emitter, value, primal, &ty)
+}
+
+pub(super) fn fill_typed(
+    emitter: &mut Emitter,
+    value: NodeId,
+    primal: NodeId,
+    ty: &Type,
+) -> Option<NodeId> {
+    if let Type::Record(fields) = ty {
+        return crate::record::fill(emitter, value, primal, fields, "record");
+    }
+    if let Some(columns) = crate::table::columns(ty) {
+        return crate::record::fill(emitter, value, primal, &columns, "table");
+    }
+    if let Type::Tuple(items) = ty {
+        return crate::tuple::fill(emitter, value, primal, items, None);
+    }
+    if let Some((rows, cols)) = nested_vector_type(ty) {
+        let m = &mut emitter.module;
+        let cols = int(m, i64::from(cols));
+        let row = build_call(m, "fill", &[value, cols]);
+        let rows = int(m, i64::from(rows));
+        return Some(build_call(m, "fill", &[row, rows]));
+    }
+    if let Some((outer, cell_type)) = array_of_arrays(ty) {
+        let size = shape_arg(emitter, primal, outer)?;
+        let cell = first_cell(&mut emitter.module, primal, outer.len());
+        let value = fill_typed(emitter, value, cell, cell_type)?;
+        return Some(build_call(&mut emitter.module, "fill", &[value, size]));
+    }
+    let shape = real_shape_of(ty)?;
+    if shape.is_empty() {
+        return Some(value);
+    }
+    let size = shape_arg(emitter, primal, shape)?;
+    Some(build_call(&mut emitter.module, "fill", &[value, size]))
+}
+
+pub(super) fn seed(emitter: &mut Emitter, name: &str, primal: NodeId) -> Result<NodeId, Error> {
+    let fail = || {
+        Error::new(
+            Some(primal),
+            "cannot declare a matching tangent or cotangent input",
+        )
+    };
+    let ty = emitter.module.type_of(primal).ok_or_else(fail)?.clone();
+    if let Type::Tuple(items) = &ty {
+        // A tuple has no valueset. The query ABI promotes this fixed binding.
+        let zero = real(&mut emitter.module, 0.0);
+        let input = crate::tuple::fill(emitter, zero, primal, items, None).ok_or_else(fail)?;
+        return Ok(emitter.define(name, input));
+    }
+    let set = seed_set(emitter, primal, &ty).ok_or_else(fail)?;
+    let input = build_call(&mut emitter.module, "elementof", &[set]);
+    Ok(emitter.define(name, input))
+}
+
+pub(super) fn seed_set(emitter: &mut Emitter, primal: NodeId, ty: &Type) -> Option<NodeId> {
+    if let Type::Record(fields) = ty {
+        return crate::record::seed_set(emitter, primal, fields);
+    }
+    if matches!(ty, Type::Table { .. }) {
+        return crate::table::seed_set(emitter, primal, ty);
+    }
+    let reals = constant(&mut emitter.module, "reals");
+    if let Some((rows, cols)) = nested_vector_type(ty) {
+        let m = &mut emitter.module;
+        let cols = int(m, i64::from(cols));
+        let row_set = build_call(m, "cartpow", &[reals, cols]);
+        let rows = int(m, i64::from(rows));
+        Some(build_call(m, "cartpow", &[row_set, rows]))
+    } else if let Some((outer, cell_type)) = array_of_arrays(ty) {
+        let size = shape_arg(emitter, primal, outer)?;
+        let cell = first_cell(&mut emitter.module, primal, outer.len());
+        let cell_set = seed_set(emitter, cell, cell_type)?;
+        Some(build_call(
+            &mut emitter.module,
+            "cartpow",
+            &[cell_set, size],
+        ))
+    } else {
+        let shape = real_shape_of(ty)?;
+        if shape.is_empty() {
+            Some(reals)
+        } else {
+            let size = shape_arg(emitter, primal, shape)?;
+            Some(build_call(&mut emitter.module, "cartpow", &[reals, size]))
+        }
+    }
+}
+
+pub(super) fn expand_like(
+    emitter: &mut Emitter,
+    term: NodeId,
+    primal: NodeId,
+) -> Result<NodeId, Error> {
+    let zero = emitter.zero_like(primal)?;
+    let m = &mut emitter.module;
+    let yes = m.alloc(Node::Lit(Scalar::Bool(true)));
+    Ok(broadcast(m, "ifelse", &[yes, term, zero]))
+}
+
+pub(super) fn insert(emitter: &mut Emitter, value: NodeId, index: i64, length: usize) -> NodeId {
+    let m = &mut emitter.module;
+    if length == 1 {
+        return build_call(m, "vector", &[value]);
+    }
+    let index = int(m, index);
+    let length = int(m, length as i64);
+    let basis = build_call(m, "onehot", &[index, length]);
+    build_call(m, "mul", &[basis, value])
+}
+
+fn cat_extent(module: &Module, input: NodeId) -> Option<(i64, bool)> {
+    if let Some((count, _)) = nested_vector(module, input) {
+        return Some((i64::from(count), true));
+    }
+    match numeric_shape(module, input)? {
+        [] => Some((1, false)),
+        [Dim::Static(n)] => Some((i64::from(*n), true)),
+        _ => None,
+    }
+}
+
+pub(super) fn cat_slice(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    args: &[NodeId],
+    slot: usize,
+) -> Option<NodeId> {
+    let &input = args.get(slot)?;
+    let offset = args[..slot].iter().try_fold(0i64, |offset, &arg| {
+        offset.checked_add(cat_extent(&emitter.module, arg)?.0)
+    })?;
+    let (_, is_vector) = cat_extent(&emitter.module, input)?;
+    let input = emitter.primal(input);
+    let m = &mut emitter.module;
+    let start = int(m, offset);
+    let selector = if is_vector {
+        let indices = build_call(m, "indicesof0", &[input]);
+        if offset == 0 {
+            indices
+        } else {
+            broadcast(m, "add", &[indices, start])
+        }
+    } else {
+        start
+    };
+    Some(build_call(m, "get0", &[bar, selector]))
+}
+
+pub(super) fn cat_embed(
+    emitter: &mut Emitter,
+    tangent: NodeId,
+    args: &[NodeId],
+    slot: usize,
+) -> Option<NodeId> {
+    let zero = real(&mut emitter.module, 0.0);
+    let parts = args
+        .iter()
+        .enumerate()
+        .map(|(index, &primal)| {
+            if index == slot {
+                return Some(tangent);
+            }
+            if nested_vector(&emitter.module, primal).is_some() {
+                return emitter.zero_like(primal).ok();
+            }
+            match numeric_shape(&emitter.module, primal)? {
+                [] => Some(zero),
+                [dim] => {
+                    let dim = *dim;
+                    let size = shape_arg(emitter, primal, &[dim])?;
+                    Some(build_call(&mut emitter.module, "fill", &[zero, size]))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(build_call(&mut emitter.module, "cat", &parts))
+}
+
+pub(super) fn stack_pick(module: &mut Module, bar: NodeId, index: i64, columns: bool) -> NodeId {
+    let index = int(module, index);
+    let all = constant(module, "all");
+    let selectors = if columns { [all, index] } else { [index, all] };
+    indexed(module, bar, &selectors)
+}
+
+pub(super) fn unstack(emitter: &mut Emitter, bar: NodeId, count: u32, columns: bool) -> NodeId {
+    let bar = emitter.primal(bar);
+    let module = &mut emitter.module;
+    let parts: Vec<_> = (1..=i64::from(count))
+        .map(|index| stack_pick(module, bar, index, columns))
+        .collect();
+    build_call(module, "vector", &parts)
+}
+
+pub(super) fn insert_nested(
+    module: &mut Module,
+    tangent: NodeId,
+    zero: NodeId,
+    slot: usize,
+    count: usize,
+) -> NodeId {
+    let mut parts = vec![zero; count];
+    parts[slot] = tangent;
+    build_call(module, "vector", &parts)
+}
+
+pub(super) fn stack_insert(
+    module: &mut Module,
+    tangent: NodeId,
+    zero: NodeId,
+    slot: usize,
+    count: usize,
+    columns: bool,
+) -> NodeId {
+    let vectors = insert_nested(module, tangent, zero, slot, count);
+    let op = if columns { "colstack" } else { "rowstack" };
+    build_call(module, op, &[vectors])
+}
+
+fn first_cell(module: &mut Module, value: NodeId, rank: usize) -> NodeId {
+    let one = int(module, 1);
+    indexed(module, value, &vec![one; rank])
+}
+
+fn shape_arg(emitter: &mut Emitter, primal: NodeId, shape: &[Dim]) -> Option<NodeId> {
+    let sizes = shape
+        .iter()
+        .map(|dim| match dim {
+            Dim::Static(n) => Some(*n),
+            Dim::Dynamic => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if sizes.contains(&0) {
+        // A runtime-derived size may contain zero.
+        let primal = emitter.primal(primal);
+        return Some(build_call(&mut emitter.module, "sizeof", &[primal]));
+    }
+    let sizes: Vec<_> = sizes
+        .into_iter()
+        .map(|n| int(&mut emitter.module, i64::from(n)))
+        .collect();
+    if let [n] = sizes.as_slice() {
+        Some(*n)
+    } else {
+        Some(build_call(&mut emitter.module, "vector", &sizes))
+    }
+}
+
+pub(super) fn mean_pullback(emitter: &mut Emitter, bar: NodeId, primal: NodeId) -> Option<NodeId> {
+    let shape = real_shape(&emitter.module, primal)?;
+    let count = shape.iter().try_fold(1u64, |size, dim| match dim {
+        Dim::Static(n) => size.checked_mul(u64::from(*n)),
+        Dim::Dynamic => None,
+    })?;
+    let count = real(&mut emitter.module, count as f64);
+    let value = build_call(&mut emitter.module, "divide", &[bar, count]);
+    fill_like(emitter, value, primal)
+}
+
+/// Sum exactly the axes that broadcast repeated. Restore singleton dimensions
+/// in their original positions, including singleton axes in the middle.
+pub(super) fn sum_to_shape(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    output: NodeId,
+    input: NodeId,
+) -> Result<NodeId, Error> {
+    let fail = || Error::new(Some(output), "pullback cannot reduce to the input shape");
+    let full = real_shape(&emitter.module, output).ok_or_else(fail)?;
+    let shape = real_shape(&emitter.module, input).ok_or_else(fail)?;
+    if full == shape {
+        return Ok(bar);
+    }
+    if shape.is_empty() {
+        return Ok(build_call(&mut emitter.module, "sum", &[bar]));
+    }
+    if full.len() != shape.len() {
+        return Err(fail());
+    }
+    let (kept, reduced): (Vec<_>, Vec<_>) =
+        (0..shape.len()).partition(|&axis| shape[axis] == full[axis]);
+    if reduced.iter().any(|&axis| shape[axis] != Dim::Static(1)) {
+        return Err(fail());
+    }
+    let rank = shape.len();
+    if kept.is_empty() {
+        let scalar = build_call(&mut emitter.module, "sum", &[bar]);
+        return fill_like(emitter, scalar, input).ok_or_else(fail);
+    }
+    let m = &mut emitter.module;
+    let axes = axes(m, rank);
+    let sliced = indexed(m, bar, &axes);
+    let kept_axes: Vec<_> = kept.iter().map(|&axis| axes[axis]).collect();
+    let sum = aggregate(m, &kept_axes, sliced);
+
+    let zero = int(m, 0);
+    let trailing = int(m, reduced.len() as i64);
+    let expanded = build_call(m, "addaxes", &[sum, zero, trailing]);
+    let order: Vec<_> = kept.into_iter().chain(reduced).collect();
+    if order.iter().copied().eq(0..rank) {
+        return Ok(expanded);
+    }
+    let reordered: Vec<_> = order.iter().map(|&axis| axes[axis]).collect();
+    let cells = indexed(m, expanded, &reordered);
+    Ok(aggregate(m, &axes, cells))
+}
+
+pub(super) fn drop_added_axes(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    leading: NodeId,
+    output: NodeId,
+) -> Option<NodeId> {
+    let rank = real_shape(&emitter.module, primal)?.len();
+    let output_rank = real_shape(&emitter.module, output)?.len();
+    let leading = flatppl_infer::fixed_int_value(&mut emitter.module, leading)?;
+    let start = usize::try_from(leading).ok()?;
+    let end = start.checked_add(rank)?;
+    if rank == 0 || end > output_rank {
+        return None;
+    }
+    let m = &mut emitter.module;
+    let one = int(m, 1);
+    let all = constant(m, "all");
+    let mut selectors = vec![one; output_rank];
+    selectors[start..end].fill(all);
+    Some(indexed(m, bar, &selectors))
+}
+
+pub(super) fn index_axes(module: &Module, selector: NodeId) -> Option<usize> {
+    if let Node::Const(name) = module.node(selector) {
+        return match module.resolve(*name) {
+            "all" => Some(1),
+            "only" => Some(0),
+            _ => None,
+        };
+    }
+    const INTEGER: Type = Type::Scalar(ScalarType::Integer);
+    match module.type_of(selector)? {
+        Type::Scalar(ScalarType::Integer) => Some(0),
+        Type::Array { shape, elem } if **elem == INTEGER && fixed(shape) => Some(shape.len()),
+        _ => None,
+    }
+}
+
+pub(super) fn full_array_cell_access(module: &Module, args: &[NodeId]) -> bool {
+    let Some((&array, indices)) = args.split_first() else {
+        return false;
+    };
+    module
+        .type_of(array)
+        .and_then(array_of_arrays)
+        .is_some_and(|(shape, _)| shape.len() > 1 && scalar_cell_indices(module, shape, indices))
+}
+
+fn scalar_cell_indices(module: &Module, shape: &[Dim], indices: &[NodeId]) -> bool {
+    shape.len() == indices.len()
+        && indices
+            .iter()
+            .zip(shape)
+            .all(|(&index, &dim)| match module.node(index) {
+                Node::Const(name) => module.resolve(*name) == "only" && dim == Dim::Static(1),
+                _ => index_axes(module, index) == Some(0),
+            })
+}
+
+pub(super) fn scatter(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    selectors: &[NodeId],
+    base: i64,
+) -> Option<NodeId> {
+    let ty = emitter.module.type_of(primal)?.clone();
+    scatter_typed(emitter, bar, primal, selectors, base, &ty)
+}
+
+pub(super) fn scatter_typed(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    selectors: &[NodeId],
+    base: i64,
+    ty: &Type,
+) -> Option<NodeId> {
+    if let Type::Record(fields) = ty {
+        return crate::record::scatter(emitter, bar, primal, fields, selectors, base, "record");
+    }
+    if let Type::Tuple(items) = ty {
+        return crate::tuple::scatter(emitter, bar, primal, items, selectors, base);
+    }
+    if matches!(ty, Type::Table { .. }) {
+        return crate::table::scatter(emitter, bar, primal, ty, selectors, base);
+    }
+    if let Some((count, _)) = nested_vector_type(ty) {
+        let [selector] = *selectors else {
+            return None;
+        };
+        let is_keyword = |keyword| {
+            matches!(
+                emitter.module.node(selector), Node::Const(name) if emitter.module.resolve(*name) == keyword
+            )
+        };
+        if is_keyword("all") {
+            return Some(bar);
+        }
+        if is_keyword("only") && count != 1 {
+            return None;
+        }
+        let rank = index_axes(&emitter.module, selector)?;
+        let primal = emitter.primal(primal);
+        let matrix = build_call(&mut emitter.module, "rowstack", &[primal]);
+        let bar = match rank {
+            0 => bar,
+            1 => build_call(&mut emitter.module, "rowstack", &[bar]),
+            _ => return None,
+        };
+        let matrix = scatter_axes(emitter, bar, matrix, selectors, base, 2)?;
+        return Some(unstack(emitter, matrix, count, false));
+    }
+    if let Some((_, cell_type)) = vector_of_arrays(ty) {
+        let [selector] = *selectors else {
+            return None;
+        };
+        return scatter_array_cells(emitter, bar, primal, selector, base, cell_type);
+    }
+    if let Some((shape, cell)) = array_of_arrays(ty)
+        && shape.len() > 1
+        && scalar_cell_indices(&emitter.module, shape, selectors)
+    {
+        return scatter_whole_cell(emitter, bar, shape, cell, selectors, base);
+    }
+    let rank = real_shape_of(ty)?.len();
+    scatter_axes(emitter, bar, primal, selectors, base, rank)
+}
+
+// Compare one axis coordinate at a time and place the whole cell where
+// every selector matches. The broadcast reconstructs the nested array.
+fn scatter_whole_cell(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    shape: &[Dim],
+    cell: &Type,
+    selectors: &[NodeId],
+    base: i64,
+) -> Option<NodeId> {
+    let zero = real(&mut emitter.module, 0.0);
+    let zero = fill_typed(emitter, zero, bar, cell)?;
+    let m = &mut emitter.module;
+    let mut boundary = Vec::new();
+    let mut operands = Vec::new();
+    let mut selected = None;
+    for (axis, (&size, &selector)) in shape.iter().zip(selectors).enumerate() {
+        let Dim::Static(size) = size else {
+            return None;
+        };
+        let dim = int(m, i64::from(size));
+        let zeros = build_call(m, "zeros", &[dim]);
+        let indices = build_call(
+            m,
+            if base == 0 { "indicesof0" } else { "indicesof" },
+            &[zeros],
+        );
+        let leading = int(m, axis as i64);
+        let trailing = int(m, (shape.len() - axis - 1) as i64);
+        operands.push(build_call(m, "addaxes", &[indices, leading, trailing]));
+        let position = callbacks::callback_input(m, &format!("position_{axis}"), &mut boundary);
+        let index = if matches!(m.node(selector), Node::Const(_)) {
+            int(m, base)
+        } else {
+            selector
+        };
+        operands.push(index);
+        let index = callbacks::callback_input(m, &format!("index_{axis}"), &mut boundary);
+        let same = build_call(m, "equal", &[position, index]);
+        selected = Some(selected.map_or(same, |previous| build_call(m, "land", &[previous, same])));
+    }
+    let adjoint = callbacks::callback_input(m, "adjoint", &mut boundary);
+    let empty = callbacks::callback_input(m, "empty", &mut boundary);
+    let one = int(m, 1);
+    let size = build_call(m, "vector", &vec![one; shape.len()]);
+    operands.push(build_call(m, "fill", &[bar, size]));
+    operands.push(build_call(m, "fill", &[zero, size]));
+    let value = build_call(m, "ifelse", &[selected?, adjoint, empty]);
+    let callback = callbacks::reify(m, value, boundary);
+    operands.insert(0, callback);
+    Some(build_call(m, "broadcast", &operands))
+}
+
+fn scatter_array_cells(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    selector: NodeId,
+    base: i64,
+    cell_type: &Type,
+) -> Option<NodeId> {
+    if matches!(emitter.module.node(selector), Node::Const(name) if emitter.module.resolve(*name) == "all")
+    {
+        return Some(bar);
+    }
+    let gather_rank = index_axes(&emitter.module, selector)?;
+    if gather_rank > 1 {
+        return None;
+    }
+    let zero = real(&mut emitter.module, 0.0);
+    let zero_cell = if gather_rank == 0 {
+        Some(fill_typed(emitter, zero, bar, cell_type)?)
+    } else {
+        None
+    };
+    let m = &mut emitter.module;
+    let mut entries = Vec::new();
+    let row = callbacks::callback_input(m, "row", &mut entries);
+    let selected = callbacks::callback_input(m, "selected", &mut entries);
+    let seed = callbacks::callback_input(m, "seed", &mut entries);
+    let body = if gather_rank == 0 {
+        let same = build_call(m, "equal", &[row, selected]);
+        let empty = callbacks::callback_input(m, "empty", &mut entries);
+        build_call(m, "ifelse", &[same, seed, empty])
+    } else {
+        let axis_nodes = axes(m, real_shape_of(cell_type)?.len() + 1);
+        let (&gather, cell_axes) = axis_nodes.split_first()?;
+        let selected = indexed(m, selected, &[gather]);
+        let value = indexed(m, seed, &axis_nodes);
+        let same = build_call(m, "equal", &[row, selected]);
+        let contribution = build_call(m, "ifelse", &[same, value, zero]);
+        aggregate(m, cell_axes, contribution)
+    };
+    let m = &mut emitter.module;
+    let function = callbacks::reify(m, body, entries);
+    let indices = if base == 0 { "indicesof0" } else { "indicesof" };
+    let rows = build_call(m, indices, &[primal]);
+    let selector = if matches!(m.node(selector), Node::Const(name) if m.resolve(*name) == "only") {
+        int(m, base)
+    } else {
+        selector
+    };
+    let selector = build_call(m, "vector", &[selector]);
+    let bar = build_call(m, "vector", &[bar]);
+    let mut args = vec![function, rows, selector, bar];
+    if let Some(zero) = zero_cell {
+        args.push(build_call(m, "vector", &[zero]));
+    }
+    Some(build_call(m, "broadcast", &args))
+}
+
+fn scatter_axes(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    primal: NodeId,
+    selectors: &[NodeId],
+    base: i64,
+    rank: usize,
+) -> Option<NodeId> {
+    if rank == 0 || selectors.len() > rank {
+        return None;
+    }
+    let gather_rank =
+        selectors
+            .iter()
+            .try_fold(0, |rank, &selector| match emitter.module.node(selector) {
+                Node::Const(_) => Some(rank),
+                _ => Some(rank + index_axes(&emitter.module, selector)?),
+            })?;
+    let selector_refs: Vec<_> = selectors.iter().map(|&id| emitter.primal(id)).collect();
+    let primal = emitter.primal(primal);
+    let m = &mut emitter.module;
+    let axis_nodes = axes(m, rank + gather_rank);
+    let (input_axes, mut gather_axes) = axis_nodes.split_at(rank);
+    let mut bar_axes = Vec::new();
+    let mut mask = None;
+    let indices = build_call(
+        m,
+        if base == 0 { "indicesof0" } else { "indicesof" },
+        &[primal],
+    );
+    for (axis, &input_axis) in input_axes.iter().enumerate() {
+        let Some(&selector) = selector_refs.get(axis) else {
+            bar_axes.push(input_axis);
+            continue;
+        };
+        if matches!(m.node(selector), Node::Const(name) if m.resolve(*name) == "all") {
+            bar_axes.push(input_axis);
+            continue;
+        }
+        let positions = if rank == 1 {
+            indices
+        } else {
+            let axis = int(m, axis as i64 + 1);
+            indexed(m, indices, &[axis])
+        };
+        let position = indexed(m, positions, &[input_axis]);
+        let selected = if matches!(m.node(selector), Node::Const(name) if m.resolve(*name) == "only")
+        {
+            int(m, base)
+        } else {
+            let dims = index_axes(m, selectors[axis])?;
+            let (selected_axes, rest) = gather_axes.split_at(dims);
+            gather_axes = rest;
+            bar_axes.extend_from_slice(selected_axes);
+            if selected_axes.is_empty() {
+                selector
+            } else {
+                indexed(m, selector, selected_axes)
+            }
+        };
+        let equal = build_call(m, "equal", &[position, selected]);
+        mask = Some(match mask {
+            Some(previous) => build_call(m, "land", &[previous, equal]),
+            None => equal,
+        });
+    }
+    let Some(mask) = mask else {
+        return Some(bar);
+    };
+    let cell = if bar_axes.is_empty() {
+        bar
+    } else {
+        indexed(m, bar, &bar_axes)
+    };
+    let zero = real(m, 0.0);
+    // Sum over all gathered uses so repeated indices accumulate.
+    let contribution = build_call(m, "ifelse", &[mask, cell, zero]);
+    Some(aggregate(m, input_axes, contribution))
+}
+
+fn axes(module: &mut Module, rank: usize) -> Vec<NodeId> {
+    (0..rank)
+        .map(|axis| {
+            let name = module.intern(&format!("ad{axis}"));
+            module.alloc(Node::Axis(Axis {
+                name,
+                variance: None,
+            }))
+        })
+        .collect()
+}
+
+fn indexed(module: &mut Module, value: NodeId, selectors: &[NodeId]) -> NodeId {
+    let args: Vec<_> = std::iter::once(value)
+        .chain(selectors.iter().copied())
+        .collect();
+    build_call(module, "get", &args)
+}
+
+pub(super) fn reduce_rows(module: &mut Module, operation: &str, matrix: NodeId) -> NodeId {
+    let axes = axes(module, 2);
+    let cell = indexed(module, matrix, &axes);
+    let row_axis = build_call(module, "vector", &axes[..1]);
+    let reduction = constant(module, operation);
+    build_call(module, "aggregate", &[reduction, row_axis, cell])
+}
+
+fn aggregate(module: &mut Module, output_axes: &[NodeId], expression: NodeId) -> NodeId {
+    let sum = constant(module, "sum");
+    let axes = build_call(module, "vector", output_axes);
+    build_call(module, "aggregate", &[sum, axes, expression])
+}
+
+pub(super) fn cumulative_extreme(
+    emitter: &mut Emitter,
+    bar: NodeId,
+    input: NodeId,
+    output: NodeId,
+    maximum: bool,
+    forward: bool,
+) -> Option<NodeId> {
+    let [length] = *real_shape(&emitter.module, input)? else {
+        return None;
+    };
+    if length == Dim::Static(0) {
+        return Some(bar);
+    }
+    let source = emitter.primal(input);
+    let prefix = emitter.primal(output);
+    let m = &mut emitter.module;
+    let indices = build_call(m, "indicesof", &[source]);
+    let one = int(m, 1);
+    let zero = int(m, 0);
+    let previous_indices = broadcast(m, "sub", &[indices, one]);
+    let previous_indices = broadcast(m, "max", &[previous_indices, one]);
+    let previous = build_call(m, "get", &[prefix, previous_indices]);
+    let first = broadcast(m, "equal", &[indices, one]);
+    // At equal values, keep the previous winner. A finite tie between
+    // distinct arguments is outside the smooth domain.
+    let compare = if maximum { "gt" } else { "lt" };
+    let better = broadcast(m, compare, &[source, previous]);
+    let took = broadcast(m, "lor", &[first, better]);
+    let changes = broadcast(m, "ifelse", &[took, indices, zero]);
+    let winners = build_call(m, "cummax", &[changes]);
+    m.set_type(
+        winners,
+        Type::Array {
+            shape: Box::new([length]),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        },
+    );
+    if forward {
+        Some(build_call(m, "get", &[bar, winners]))
+    } else {
+        scatter(emitter, bar, input, &[winners], 1)
+    }
+}
+
+pub(super) fn logsumexp(
+    emitter: &mut Emitter,
+    input: NodeId,
+    output: NodeId,
+    bar: NodeId,
+    forward: bool,
+) -> Option<NodeId> {
+    let [_] = real_shape(&emitter.module, input)? else {
+        return None;
+    };
+    let [] = real_shape(&emitter.module, output)? else {
+        return None;
+    };
+    let input = emitter.primal(input);
+    let m = &mut emitter.module;
+    // Subtracting the rounded logsumexp loses relative precision when the
+    // logarithmic coordinates share a large common offset.
+    let maximum = build_call(m, "maximum", &[input]);
+    let shifted = broadcast(m, "sub", &[input, maximum]);
+    let weights = broadcast(m, "exp", &[shifted]);
+    let total = build_call(m, "sum", &[weights]);
+    let weights = broadcast(m, "divide", &[weights, total]);
+    let term = broadcast(m, "mul", &[weights, bar]);
+    let term = zero_when_masked(m, bar, term, true);
+    Some(if forward {
+        build_call(m, "sum", &[term])
+    } else {
+        term
+    })
+}

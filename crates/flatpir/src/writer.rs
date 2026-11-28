@@ -59,6 +59,7 @@ pub(crate) fn write_verified(module: &Module) -> Result<(String, Vec<Sexpr>)> {
 /// Unguarded: an annotated module can render text past a reader resource guard
 /// (see [`try_write`]). Use [`try_write`] whenever the text will be read back.
 pub fn write(module: &Module) -> String {
+    let module = module.for_serialization();
     let mut out = String::from("(%module");
 
     // Public interface: `(%public name …)`. ALWAYS emitted, even when empty, so
@@ -79,7 +80,7 @@ pub fn write(module: &Module) -> String {
     // One `(%bind …)` stanza per binding, in source order, blank-line separated.
     for (id, binding) in module.bindings() {
         out.push_str("\n\n  ");
-        out.push_str(&render_bind(module, id, binding));
+        out.push_str(&render_bind(&module, id, binding));
     }
 
     out.push(')');
@@ -211,11 +212,13 @@ fn render_node(module: &Module, id: NodeId) -> String {
 
 fn render_scalar(lit: &Scalar) -> String {
     match lit {
+        // Its unsigned magnitude exceeds the largest integer atom.
+        Scalar::Int(i64::MIN) => format!("(sub (neg {}) 1)", i64::MAX),
+        Scalar::Int(n) if *n < 0 => format!("(neg {})", -n),
         Scalar::Int(n) => n.to_string(),
-        // FlatPIR has no NaN atom or signed literal. Preserve compiler-produced
-        // nonfinite values using existing expressions, including in JSON.
+        // FlatPIR uses expressions for NaN and signed literals, including -0.0.
         Scalar::Real(r) if r.is_nan() => "(divide 0.0 0.0)".to_string(),
-        Scalar::Real(r) if *r == f64::NEG_INFINITY => "(neg inf)".to_string(),
+        Scalar::Real(r) if r.is_sign_negative() => format!("(neg {})", render_real(-r)),
         Scalar::Real(r) => render_real(*r),
         Scalar::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Scalar::Str(s) => quote_string(s),

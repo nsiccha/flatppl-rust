@@ -62,12 +62,19 @@ use flatppl_cli::banner;
 use flatppl_cli::report;
 #[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_cli::resolve::CliResolver;
-#[cfg(feature = "convert")]
+#[cfg(any(feature = "convert", feature = "optimise"))]
 use flatppl_cli::write_module;
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
 #[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_fileaccess::Location;
+#[cfg(any(
+    feature = "optimise",
+    feature = "determinize",
+    feature = "stablehlo",
+    feature = "stan"
+))]
+use flatppl_optimise::{RulePolicy, RuleSelector};
 
 #[derive(Parser)]
 #[command(name = "flatppl", version, about = "FlatPPL toolchain driver")]
@@ -182,6 +189,29 @@ enum Command {
         #[arg(long)]
         no_header: bool,
     },
+    /// Optimise a model while keeping it in the FlatPPL language.
+    #[cfg(feature = "optimise")]
+    #[command(visible_alias = "optimize")]
+    Optimise {
+        /// Input model (`.flatppl` or `.flatpir`). Imported modules must be available locally.
+        input: PathBuf,
+        /// Output file. Writes to stdout if omitted.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Output form: FlatPPL source or annotated FlatPIR.
+        #[arg(long, value_enum, default_value_t = EmitForm::Flatppl)]
+        emit: EmitForm,
+        #[command(flatten)]
+        egglog: EgglogArgs,
+    },
+    /// List selectors for `--disable-egglog`.
+    #[cfg(any(
+        feature = "optimise",
+        feature = "determinize",
+        feature = "stablehlo",
+        feature = "stan"
+    ))]
+    EgglogRules,
     /// Prepare a model for offline use: fetch its remote dependencies into the cache.
     ///
     /// Walks each input model's transitive `load_module` (and `load_data`)
@@ -234,6 +264,37 @@ enum Command {
         /// Explain likelihood reductions and fallbacks on stderr.
         #[arg(long)]
         explain_reductions: bool,
+        #[command(flatten)]
+        egglog: EgglogArgs,
+    },
+    /// Emit FlatPPL source that returns query values and their derivatives.
+    #[cfg(feature = "autodiff")]
+    Autodiff {
+        /// FlatPPL model with declared inputs and outputs.
+        #[arg(required_unless_present = "list_rules")]
+        input: Option<PathBuf>,
+        /// Print every derivative rule key, one tab-separated line each
+        /// (catalog, operation, arity, slot; `*` matches any value), and exit.
+        #[arg(long, conflicts_with_all = ["input", "wrt", "empty_wrt", "explain_rules"])]
+        list_rules: bool,
+        /// Print the rule keys this derivative loads to stderr, one `rule` line each.
+        #[arg(long)]
+        explain_rules: bool,
+        /// Query input to differentiate (repeatable). Supports reals, fixed-shape arrays, records, fixed-row tables, and fixed tuples.
+        #[arg(long, required_unless_present_any = ["empty_wrt", "list_rules"])]
+        wrt: Vec<String>,
+        /// Differentiate with an explicitly empty selection of inputs.
+        #[arg(long, conflicts_with = "wrt")]
+        empty_wrt: bool,
+        /// Derivative transform to emit.
+        #[arg(long, value_enum, default_value_t = AdMode::Gradient)]
+        mode: AdMode,
+        /// Permit numerical integrals in the generated source.
+        #[arg(long)]
+        numerical_integrals: bool,
+        /// Output file. Write to stdout if omitted.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// Emit textual StableHLO for a FlatPPL model.
     ///
@@ -261,6 +322,14 @@ enum Command {
         /// Floating-point precision for emitted tensors.
         #[arg(long, default_value = "f32", value_parser = ["f32", "f64"])]
         dtype: String,
+        /// Differentiate this input before emitting StableHLO (repeatable).
+        #[cfg(feature = "autodiff")]
+        #[arg(long, conflicts_with = "prepare_data")]
+        ad_wrt: Vec<String>,
+        /// Source derivative transform.
+        #[cfg(feature = "autodiff")]
+        #[arg(long, value_enum, default_value_t = AdMode::Gradient, requires = "ad_wrt")]
+        ad_mode: AdMode,
         /// Lowering profile for the executing backend; the output runs on any backend.
         #[arg(long, default_value = "cpu", value_parser = ["cpu", "gpu"])]
         target: String,
@@ -305,6 +374,8 @@ enum Command {
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        egglog: EgglogArgs,
     },
     /// Write a Stan program for one target of a FlatPPL model.
     ///
@@ -337,6 +408,8 @@ enum Command {
         /// Output file (`.stan`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        egglog: EgglogArgs,
     },
     /// Print a shell completion script to stdout.
     ///
@@ -357,6 +430,32 @@ enum Command {
     /// Lint FlatPPL files: report style/hygiene/correctness issues.
     #[cfg(feature = "fmtlint")]
     Lint(flatppl_cli::LintArgs),
+}
+
+#[cfg(any(
+    feature = "optimise",
+    feature = "determinize",
+    feature = "stablehlo",
+    feature = "stan"
+))]
+#[derive(clap::Args)]
+struct EgglogArgs {
+    /// Disable an egglog rule, ruleset, optimiser pass or stage. Repeat for multiple selectors.
+    /// Use `all`, `rule:<id>`, `ruleset:<id>`, `pass:<id>`, or `stage:<id>` from `flatppl egglog-rules`.
+    #[arg(long, value_name = "SELECTOR")]
+    disable_egglog: Vec<RuleSelector>,
+}
+
+#[cfg(any(
+    feature = "optimise",
+    feature = "determinize",
+    feature = "stablehlo",
+    feature = "stan"
+))]
+impl EgglogArgs {
+    fn into_policy(self) -> RulePolicy {
+        RulePolicy::from_selectors(self.disable_egglog)
+    }
 }
 
 /// CLI mirror of [`flatppl_infer::Level`] (the library stays clap-free).
@@ -383,19 +482,26 @@ impl From<InferLevel> for flatppl_infer::Level {
     }
 }
 
-/// Output form selector for `determinize --emit`.
-///
-/// The surface printer spells a builtin call and a user call the same way —
-/// `f(x)` either way — so surface syntax alone cannot show an external gate
-/// whether a determinised module carries a residual user call. FlatPIR (§11)
-/// keeps the head distinction (`(%call …)` for a user application), so it can.
-#[cfg(feature = "determinize")]
+/// Output form for model-to-model transformations.
+/// FlatPIR keeps annotations and distinguishes builtin calls from user calls.
+#[cfg(any(feature = "determinize", feature = "optimise"))]
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EmitForm {
     /// Canonical FlatPPL surface syntax (the default).
     Flatppl,
     /// FlatPIR S-expressions.
     Flatpir,
+}
+
+#[cfg(feature = "autodiff")]
+#[derive(Clone, Copy, ValueEnum)]
+enum AdMode {
+    /// Gradient of one real scalar output.
+    Gradient,
+    /// Jacobian-vector product with an appended tangent for each selected input.
+    Jvp,
+    /// Vector-Jacobian product with an appended cotangent for each output.
+    Vjp,
 }
 
 /// A reduction family for `--reduce`. It names no emitter type, so other verbs
@@ -503,6 +609,35 @@ fn main() -> ExitCode {
             level,
             no_header,
         } => infer_cmd(&input, &output, level.into(), no_header),
+        #[cfg(feature = "optimise")]
+        Command::Optimise {
+            input,
+            output,
+            emit,
+            egglog,
+        } => optimise_cmd(&input, output.as_deref(), emit, &egglog.into_policy()),
+        #[cfg(any(
+            feature = "optimise",
+            feature = "determinize",
+            feature = "stablehlo",
+            feature = "stan"
+        ))]
+        Command::EgglogRules => {
+            println!("all");
+            for ruleset in flatppl_optimise::available_rulesets() {
+                println!("ruleset:{ruleset}");
+            }
+            for rule in flatppl_optimise::available_rules() {
+                println!("rule:{}\truleset:{}", rule.name, rule.ruleset);
+            }
+            for pass in flatppl_optimise::available_passes() {
+                println!("pass:{pass}");
+            }
+            for stage in flatppl_optimise::available_stages() {
+                println!("stage:{stage}");
+            }
+            Ok(())
+        }
         #[cfg(feature = "prepare")]
         Command::Prepare { files, update } => prepare_cmd(&files, update),
         #[cfg(feature = "determinize")]
@@ -516,6 +651,7 @@ fn main() -> ExitCode {
             emit,
             sufficient_statistics,
             explain_reductions,
+            egglog,
         } => determinize_cmd(
             &input,
             output.as_deref(),
@@ -529,7 +665,32 @@ fn main() -> ExitCode {
                 explain_reductions,
                 pack_summaries,
             },
+            &egglog.into_policy(),
         ),
+        #[cfg(feature = "autodiff")]
+        Command::Autodiff {
+            input,
+            list_rules,
+            explain_rules,
+            wrt,
+            empty_wrt,
+            mode,
+            numerical_integrals,
+            output,
+        } => match input {
+            _ if list_rules => list_rules_cmd(output.as_deref()),
+            Some(input) => autodiff_cmd(
+                &input,
+                if empty_wrt { &[] } else { &wrt },
+                mode,
+                numerical_integrals,
+                explain_rules,
+                output.as_deref(),
+            ),
+            None => Err(Failure::Usage(
+                "autodiff: an input model is required".into(),
+            )),
+        },
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             prepare_data,
@@ -548,7 +709,12 @@ fn main() -> ExitCode {
             integration_atol,
             integration_max_intervals,
             ode_sensitivity_control,
+            #[cfg(feature = "autodiff")]
+            ad_wrt,
+            #[cfg(feature = "autodiff")]
+            ad_mode,
             output,
+            egglog,
         } => stablehlo_cmd(
             &input,
             &mode,
@@ -581,6 +747,9 @@ fn main() -> ExitCode {
                 explain_reductions,
                 pack_summaries,
             },
+            #[cfg(feature = "autodiff")]
+            (&ad_wrt, ad_mode),
+            &egglog.into_policy(),
         ),
         #[cfg(feature = "stan")]
         Command::Stan {
@@ -591,6 +760,7 @@ fn main() -> ExitCode {
             data,
             manifest,
             output,
+            egglog,
         } => stan_cmd(
             &input,
             flatppl_stan::EmitOptions {
@@ -603,6 +773,7 @@ fn main() -> ExitCode {
             data.as_deref(),
             manifest.as_deref(),
             output.as_deref(),
+            &egglog.into_policy(),
         ),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1033,52 +1204,8 @@ fn infer_cmd(
             flatppl_cli::terminal_path(output)
         )));
     }
-    // The input is a local file; cross-module deps resolve from the local cache
-    // only (run `flatppl prepare` first for remote deps).
-    let source = resolver.read_string(&in_loc)?;
-    let mut module = match flatppl_cli::read_module(from, &source) {
-        Ok(module) => module,
-        Err((message, line, span)) => {
-            return Err(Failure::Diagnostic {
-                path: input.to_path_buf(),
-                source,
-                message,
-                line,
-                span,
-            });
-        }
-    };
-
-    // Assemble the cross-module bundle: resolve the model's transitive
-    // `load_module` dependencies from the local cache (+ local files) so the
-    // engine — which stays I/O-free — can type cross-module references. A
-    // cache-only resolver never touches the network; a remote dep that isn't
-    // cached errors with a "run `flatppl prepare`" hint. `load_data` sources are
-    // discovered but NOT resolved — inference never reads data.
-    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
-    let diags = flatppl_infer::infer_module(&mut module, &bundle, level);
-    let mut errors = 0u32;
-    for d in &diags {
-        match d.severity {
-            flatppl_infer::Severity::Error => {
-                errors += 1;
-                eprintln!(
-                    "error: {}",
-                    flatppl_cli::resolve::terminal_message(&d.message)
-                );
-            }
-            flatppl_infer::Severity::Note => eprintln!(
-                "note: {}",
-                flatppl_cli::resolve::terminal_message(&d.message)
-            ),
-        }
-    }
-    if errors > 0 {
-        return Err(Failure::Plain(format!(
-            "inference found {errors} error(s) in `{}`",
-            flatppl_cli::terminal_path(input)
-        )));
-    }
+    let (mut module, _) = read_source(input, &in_loc, from, &resolver)?;
+    infer_source(&mut module, input, &in_loc, &resolver, level)?;
 
     // `try_write`, not `write`: annotations nest as deep as an array's rank, so
     // a model well inside every source limit can render FlatPIR past the
@@ -1104,6 +1231,151 @@ fn infer_cmd(
             flatppl_cli::terminal_path(output)
         ))
     })
+}
+
+#[cfg(feature = "optimise")]
+fn optimise_cmd(
+    input: &Path,
+    output: Option<&Path>,
+    emit: EmitForm,
+    rules: &RulePolicy,
+) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
+    let from = resolver.model_format(&in_loc)?;
+    let preserve_source = matches!(from, Format::FlatPpl) && emit == EmitForm::Flatppl;
+    let source = resolver.read_string(&in_loc)?;
+    let parsed = if preserve_source {
+        flatppl_syntax::parse_with_assignment_spans(&source).map_err(|e| {
+            (
+                e.message,
+                e.line as usize,
+                e.span.map(|(start, end)| (start as usize, end as usize)),
+            )
+        })
+    } else {
+        flatppl_cli::read_module(from, &source).map(|module| (module, Vec::new()))
+    };
+    let (mut module, assignments) = match parsed {
+        Ok(model) => model,
+        Err(error) => return Err(source_error(input, source, error)),
+    };
+    let bundle = infer_source(
+        &mut module,
+        input,
+        &in_loc,
+        &resolver,
+        flatppl_infer::Level::Shape,
+    )?;
+    let optimised = flatppl_optimise::optimise_with_bundle_and_rules(
+        &module,
+        None,
+        flatppl_optimise::Profile::Portable,
+        &bundle,
+        rules,
+    );
+    let rendered = if preserve_source {
+        match optimised.as_ref() {
+            Some(rewritten) => {
+                flatppl_syntax::print_assignment_rewrites(&source, &assignments, &module, rewritten)
+            }
+            None => source,
+        }
+    } else {
+        let format = match emit {
+            EmitForm::Flatppl => Format::FlatPpl,
+            EmitForm::Flatpir => Format::FlatPir,
+        };
+        let mut text = write_module(
+            format,
+            optimised.as_ref().unwrap_or(&module),
+            flatppl_syntax::Syntax::Full,
+        )?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text
+    };
+    match output {
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        })?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+/// Type a source document using its cached imports without loading data or
+/// changing the source's relative paths.
+#[cfg(feature = "infer")]
+fn infer_source(
+    module: &mut flatppl_core::Module,
+    input: &Path,
+    location: &Location,
+    resolver: &CliResolver,
+    level: flatppl_infer::Level,
+) -> Result<flatppl_infer::ModuleBundle, Failure> {
+    let (bundle, _) = flatppl_cli::resolve::build_bundle(module, location, resolver)?;
+    let diagnostics = flatppl_infer::infer_module(module, &bundle, level);
+    report_inference(input, &diagnostics)?;
+    Ok(bundle)
+}
+
+#[cfg(feature = "infer")]
+fn read_source(
+    input: &Path,
+    location: &Location,
+    format: Format,
+    resolver: &CliResolver,
+) -> Result<(flatppl_core::Module, String), Failure> {
+    let source = resolver.read_string(location)?;
+    match flatppl_cli::read_module(format, &source) {
+        Ok(module) => Ok((module, source)),
+        Err(error) => Err(source_error(input, source, error)),
+    }
+}
+
+#[cfg(feature = "infer")]
+fn source_error(input: &Path, source: String, error: flatppl_cli::ReadError) -> Failure {
+    let (message, line, span) = error;
+    Failure::Diagnostic {
+        path: input.to_path_buf(),
+        source,
+        message,
+        line,
+        span,
+    }
+}
+
+#[cfg(feature = "infer")]
+fn report_inference(
+    input: &Path,
+    diagnostics: &[flatppl_infer::Diagnostic],
+) -> Result<(), Failure> {
+    let mut errors = 0u32;
+    for d in diagnostics {
+        let label = match d.severity {
+            flatppl_infer::Severity::Error => {
+                errors += 1;
+                "error"
+            }
+            flatppl_infer::Severity::Note => "note",
+        };
+        eprintln!(
+            "{label}: {}",
+            flatppl_cli::resolve::terminal_message(&d.message)
+        );
+    }
+    if errors > 0 {
+        return Err(Failure::Plain(format!(
+            "inference found {errors} error(s) in `{}`",
+            flatppl_cli::terminal_path(input)
+        )));
+    }
+    Ok(())
 }
 
 /// `flatppl prepare <file>… [--update]` — fetch each model's remote dependencies
@@ -1132,19 +1404,7 @@ fn load_and_infer(
     resolver: &CliResolver,
 ) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle, String), Failure> {
     let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
-    let source = resolver.read_string(&in_loc)?;
-    let mut module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
-        Ok(m) => m,
-        Err((message, line, span)) => {
-            return Err(Failure::Diagnostic {
-                path: input.to_path_buf(),
-                source,
-                message,
-                line,
-                span,
-            });
-        }
-    };
+    let (mut module, source) = read_source(input, &in_loc, Format::FlatPpl, resolver)?;
 
     // Assemble the cross-module bundle: resolve the model's transitive
     // `load_module` dependencies from the local cache (+ local files) so the
@@ -1152,28 +1412,7 @@ fn load_and_infer(
     let bundle = flatppl_cli::resolve::compilation_bundle(&mut module, &in_loc, resolver)?;
     let (diags, bundle) =
         flatppl_infer::infer_module_with_inputs(&mut module, bundle, flatppl_infer::Level::Shape);
-    let mut errors = 0u32;
-    for d in &diags {
-        match d.severity {
-            flatppl_infer::Severity::Error => {
-                errors += 1;
-                eprintln!(
-                    "error: {}",
-                    flatppl_cli::resolve::terminal_message(&d.message)
-                );
-            }
-            flatppl_infer::Severity::Note => eprintln!(
-                "note: {}",
-                flatppl_cli::resolve::terminal_message(&d.message)
-            ),
-        }
-    }
-    if errors > 0 {
-        return Err(Failure::Plain(format!(
-            "inference found {errors} error(s) in `{}`",
-            flatppl_cli::terminal_path(input)
-        )));
-    }
+    report_inference(input, &diags)?;
 
     Ok((module, bundle, source))
 }
@@ -1210,12 +1449,16 @@ fn refuse_message(
 /// a node the determiniser synthesized (in no source binding).
 #[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 fn enclosing_binding(module: &flatppl_core::Module, node: flatppl_core::NodeId) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
     for (_, binding) in module.bindings() {
         let mut queue = vec![binding.rhs];
         let mut qi = 0;
         while qi < queue.len() {
             let id = queue[qi];
             qi += 1;
+            if !seen.insert(id) {
+                continue;
+            }
             if id == node {
                 return Some(module.resolve(binding.name).to_string());
             }
@@ -1236,7 +1479,7 @@ fn line_col(source: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-#[cfg(feature = "determinize")]
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
 struct LikelihoodOutput<'a> {
     preparation: Option<(&'a Path, &'a [String])>,
     explain_reductions: bool,
@@ -1262,7 +1505,7 @@ fn analyze_cmd(input: &Path, data_inputs: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
-#[cfg(feature = "determinize")]
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
 fn print_reductions(stage: &str, report: &flatppl_determinizer::ReductionReport) {
     if !report.decisions.is_empty() {
         eprintln!("Likelihood reductions ({stage}):\n{report}");
@@ -1279,6 +1522,7 @@ fn determinize_cmd(
     emit: EmitForm,
     sufficient_statistics: bool,
     likelihood: LikelihoodOutput<'_>,
+    rules: &RulePolicy,
 ) -> Result<(), Failure> {
     let LikelihoodOutput {
         preparation,
@@ -1299,15 +1543,18 @@ fn determinize_cmd(
     };
     let mut report = flatppl_determinizer::ReductionReport::default();
     let lowered = if explain_reductions && preparation.is_none() {
-        flatppl_determinizer::determinize_with_options_and_report(
+        flatppl_determinizer::determinize_with_options_report_and_rules(
             &module,
             &bundle,
             roots,
             &lowering,
             &mut report,
+            rules,
         )
     } else {
-        flatppl_determinizer::determinize_with_options(&module, &bundle, roots, &lowering)
+        flatppl_determinizer::determinize_with_options_and_rules(
+            &module, &bundle, roots, &lowering, rules,
+        )
     };
     if explain_reductions && preparation.is_none() {
         print_reductions("lowering", &report);
@@ -1367,6 +1614,97 @@ fn determinize_cmd(
     Ok(())
 }
 
+#[cfg(feature = "autodiff")]
+fn autodiff_cmd(
+    input: &Path,
+    wrt: &[String],
+    mode: AdMode,
+    numerical_integrals: bool,
+    explain_rules: bool,
+    output: Option<&Path>,
+) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    let (surface, bundle, source) = load_and_infer(input, &resolver)?;
+    let options = if numerical_integrals {
+        flatppl_autodiff::NUMERICAL_SOURCE_OPTIONS
+    } else {
+        Default::default()
+    };
+    let mut lowered = flatppl_autodiff::determinize_query_with_options(&surface, &bundle, &options)
+        .map_err(|e| Failure::Refuse(refuse_message(input, &source, &surface, &e)))?;
+    load_fixed_data(&mut lowered, &resolver, input, &source, &surface)?;
+    if explain_rules {
+        // Report the keys before the transform, so a refusal still names them.
+        let wrt: Vec<_> = wrt.iter().map(String::as_str).collect();
+        let mode = match mode {
+            AdMode::Gradient => flatppl_autodiff::Mode::Gradient,
+            AdMode::Jvp => flatppl_autodiff::Mode::Jvp,
+            AdMode::Vjp => flatppl_autodiff::Mode::Vjp,
+        };
+        if let Ok(keys) = flatppl_autodiff::requested_rules(&lowered, &wrt, mode, &options) {
+            for key in keys {
+                eprintln!("rule\t{key}");
+            }
+        }
+    }
+    let mut derivative = differentiate(&lowered, wrt, mode, &options)?;
+    flatppl_autodiff::prepare_source_with_options(&mut derivative, &options)
+        .map_err(|error| Failure::Refuse(error.reason))?;
+    let rendered = flatppl_syntax::print(&derivative);
+    match output {
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        })?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "autodiff")]
+fn list_rules_cmd(output: Option<&Path>) -> Result<(), Failure> {
+    let keys = flatppl_autodiff::rule_catalog()
+        .map_err(|error| Failure::Plain(format!("autodiff: {error}")))?;
+    let rendered: String = keys.iter().map(|key| format!("{key}\n")).collect();
+    match output {
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        }),
+        None => {
+            print!("{rendered}");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "autodiff")]
+fn differentiate(
+    module: &flatppl_core::Module,
+    wrt: &[String],
+    mode: AdMode,
+    options: &flatppl_determinizer::LoweringOptions<'_>,
+) -> Result<flatppl_core::Module, Failure> {
+    let wrt: Vec<_> = wrt.iter().map(String::as_str).collect();
+    let transform = match mode {
+        AdMode::Gradient => flatppl_autodiff::gradient_with_options,
+        AdMode::Jvp => flatppl_autodiff::jvp_with_options,
+        AdMode::Vjp => flatppl_autodiff::vjp_with_options,
+    };
+    transform(module, &wrt, options).map_err(|error| {
+        let site = error
+            .node
+            .and_then(|node| enclosing_binding(module, node))
+            .map(|name| format!(" in `{name}`"))
+            .unwrap_or_default();
+        Failure::Refuse(format!("autodiff: refuse{site}: {error}"))
+    })
+}
+
 /// `flatppl stablehlo <in.flatppl> [--mode logdensity|sample] [-o out]` —
 /// determinize a FlatPPL model to FlatPDL, then emit textual StableHLO for
 /// `mode`, printing to `output`/stdout. An unrecognized `--mode` exits 2
@@ -1380,6 +1718,8 @@ fn stablehlo_cmd(
     opts: &flatppl_stablehlo::EmitOptions,
     output: Option<&Path>,
     likelihood: LikelihoodOutput<'_>,
+    #[cfg(feature = "autodiff")] ad: (&[String], AdMode),
+    rules: &RulePolicy,
 ) -> Result<(), Failure> {
     let LikelihoodOutput {
         preparation,
@@ -1428,26 +1768,38 @@ fn stablehlo_cmd(
         ));
     }
     let roots = Some(abi_syms);
+    #[cfg(feature = "autodiff")]
+    let source_ad = !ad.0.is_empty();
+    #[cfg(not(feature = "autodiff"))]
+    let source_ad = false;
+    if source_ad && !matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
+        return Err(Failure::Usage("--ad-wrt requires logdensity mode".into()));
+    }
 
     let lowering = flatppl_determinizer::LoweringOptions {
-        disable_sufficient_statistics: !opts.sufficient_statistics || preparation.is_some(),
+        disable_optimizations: source_ad,
+        disable_sufficient_statistics: source_ad
+            || !opts.sufficient_statistics
+            || preparation.is_some(),
         ..opts.lowering_options()
     };
     let mut report = flatppl_determinizer::ReductionReport::default();
     let lowered = if explain_reductions && preparation.is_none() {
-        flatppl_determinizer::determinize_with_options_and_report(
+        flatppl_determinizer::determinize_with_options_report_and_rules(
             &module,
             &bundle,
             roots.as_deref(),
             &lowering,
             &mut report,
+            rules,
         )
     } else {
-        flatppl_determinizer::determinize_with_options(
+        flatppl_determinizer::determinize_with_options_and_rules(
             &module,
             &bundle,
             roots.as_deref(),
             &lowering,
+            rules,
         )
     };
     if explain_reductions && preparation.is_none() {
@@ -1456,6 +1808,11 @@ fn stablehlo_cmd(
     let mut lowered =
         lowered.map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     load_fixed_data(&mut lowered, &resolver, input, &source, &module)?;
+    #[cfg(feature = "autodiff")]
+    if source_ad {
+        lowered = differentiate(&lowered, ad.0, ad.1, &lowering)?;
+        flatppl_determinizer::prepare_serialization(&mut lowered, None);
+    }
     if let Some((path, data_inputs)) = preparation {
         if !opts.sufficient_statistics || !matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
             return Err(Failure::Usage(
@@ -1473,10 +1830,11 @@ fn stablehlo_cmd(
             print_reductions("preparation", &report);
         }
         let prepared = prepared.map_err(|e| Failure::Refuse(e.reason))?;
-        let rendered = flatppl_stablehlo::emit(
+        let rendered = flatppl_stablehlo::emit_with_rules(
             &prepared.preparation,
             flatppl_stablehlo::Mode::LogDensity,
             opts,
+            rules,
         )
         .map_err(|e| Failure::Refuse(e.to_string()))?;
         fs::write(path, rendered)
@@ -1491,7 +1849,7 @@ fn stablehlo_cmd(
             flatppl_determinizer::sufficient_statistics(&mut lowered);
         }
     }
-    let rendered = flatppl_stablehlo::emit(&lowered, mode, opts)
+    let rendered = flatppl_stablehlo::emit_with_rules(&lowered, mode, opts, rules)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
         Some(path) => fs::write(path, rendered).map_err(|e| {
@@ -1515,9 +1873,10 @@ fn stan_cmd(
     data: Option<&Path>,
     manifest: Option<&Path>,
     output: Option<&Path>,
+    rules: &RulePolicy,
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
-    let (module, _bundle, source) = load_and_infer(input, &resolver)?;
+    let (module, bundle, source) = load_and_infer(input, &resolver)?;
     let refuse = |e: flatppl_stan::Refusal| {
         let mut site = String::new();
         if let Some(node) = e.node {
@@ -1534,7 +1893,8 @@ fn stan_cmd(
         }
         Failure::Refuse(format!("stan: {e}{site}"))
     };
-    let mut program = flatppl_stan::emit(&module, &opts).map_err(refuse)?;
+    let mut program =
+        flatppl_stan::emit_with_bundle_and_rules(&module, &bundle, &opts, rules).map_err(refuse)?;
     let write = |path: &Path, text: String| {
         fs::write(path, text).map_err(|e| {
             Failure::Plain(format!(

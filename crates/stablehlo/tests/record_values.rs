@@ -257,6 +257,71 @@ fn a_nested_record_scan_state_carries_each_leaf() {
     );
 }
 
+#[test]
+fn a_public_emitter_can_read_unlisted_scan_columns_in_either_order() {
+    use flatppl_stablehlo::{ElemKind, Emitter, MlirTy, Value};
+
+    let source = r#"
+seed = external(reals)
+xs = external(cartpow(reals, 5))
+step(state, x) = record(wanted = state.wanted + x, hidden = state.hidden * x)
+history = scan(step, record(wanted = seed, hidden = seed), xs)
+inputs = (seed, xs)
+other = history.hidden
+outputs = history.wanted
+"#;
+    let mut module = flatppl_syntax::parse(source).expect("parse");
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let mut module = flatppl_determinizer::determinize_with_options(
+        &module,
+        &flatppl_infer::ModuleBundle::new(),
+        None,
+        &flatppl_stablehlo::LOWERING_OPTIONS,
+    )
+    .expect("determinize both projections");
+    flatppl_determinizer::resolve_alias_chains(&mut module);
+    let [seed, xs, wanted, other] = ["seed", "xs", "outputs", "other"].map(|name| {
+        module
+            .bindings()
+            .find(|(_, binding)| module.resolve(binding.name) == name)
+            .unwrap_or_else(|| panic!("missing binding {name}"))
+            .1
+            .rhs
+    });
+
+    let options = EmitOptions::default();
+    let five_rows = MlirTy::Ranked(vec![Some(5)]);
+    for order in [[wanted, other], [other, wanted]] {
+        let mut emitter = Emitter::with_options(&module, &options);
+        for (node, ssa, ty) in [
+            (seed, "%arg0", MlirTy::Scalar),
+            (xs, "%arg1", five_rows.clone()),
+        ] {
+            emitter.bind(
+                node,
+                Value {
+                    ssa: ssa.to_owned(),
+                    ty,
+                    elem: ElemKind::Real,
+                },
+            );
+        }
+        let [first, second] = order.map(|node| emitter.lower_node(node).expect("read scan column"));
+        assert_eq!(first.ty, five_rows);
+        assert_eq!(second.ty, five_rows);
+        assert_ne!(first.ssa, second.ssa);
+    }
+
+    let query =
+        flatppl_stablehlo::emit(&module, Mode::LogDensity, &options).expect("declared query");
+    assert_eq!(
+        query.matches("stablehlo.dynamic_update_slice").count(),
+        1,
+        "{query}"
+    );
+}
+
 fn determinize(source: &str) -> flatppl_core::Module {
     let mut model = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut model);
@@ -491,6 +556,50 @@ fn record_set_membership_is_the_conjunction_of_field_memberships() {
              q in interval(0.0, 1.0)), 1.0, 0.0)\n"
         )),
     );
+}
+
+#[test]
+fn record_input_membership_uses_named_fields_at_each_level() {
+    let model = "p = elementof(cartprod(a = reals, inner = cartprod(b = cartpow(reals, 2))))\n\
+                 S = cartprod(inner = cartprod(b = cartpow(posreals, 2)), a = unitinterval)\n\
+                 inputs = p\n";
+    assert_eq!(
+        emit(&format!("{model}outputs = p in S\n")),
+        emit(&format!(
+            "{model}outputs = land(p.inner.b in cartpow(posreals, 2), p.a in unitinterval)\n"
+        )),
+    );
+    let promoted = "p = record(x = [-1.0, -2.0])\ninputs = p\n";
+    assert_eq!(
+        emit(&format!(
+            "{promoted}outputs = p in cartprod(x = cartpow(posreals, 2))\n"
+        )),
+        emit(&format!(
+            "{promoted}outputs = p.x in cartpow(posreals, 2)\n"
+        )),
+    );
+}
+
+#[test]
+fn a_table_row_and_its_column_record_have_their_own_sets() {
+    let model = "t = elementof(cartpow(cartprod(x = reals), 2))\ninputs = t\n";
+    assert_eq!(
+        emit(&format!(
+            "{model}outputs = t[1] in cartprod(x = posreals)\n"
+        )),
+        emit(&format!("{model}outputs = t.x[1] in posreals\n")),
+    );
+    assert_eq!(
+        emit(&format!(
+            "{model}outputs = record(t) in cartprod(x = cartpow(posreals, 2))\n"
+        )),
+        emit(&format!("{model}outputs = t.x in cartpow(posreals, 2)\n")),
+    );
+    let result = emit_mode(
+        &format!("{model}outputs = t in cartprod(x = cartpow(posreals, 2))\n"),
+        Mode::LogDensity,
+    );
+    assert!(result.unwrap_err().contains("table point"));
 }
 
 // The posteriorDB state_space port truncates a record-valued Lebesgue by a record

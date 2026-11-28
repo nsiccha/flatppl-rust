@@ -928,6 +928,26 @@ fn a_half_line_student_t_with_a_runtime_nu_uses_the_exact_mass() {
         pir_binding(&flatppl_flatpir::write(&actual), "lp"),
         pir_binding(&flatppl_flatpir::write(&expected), "lp")
     );
+    // Enabling a fallback for targets without a Student-t CDF must still use
+    // the exact endpoint probabilities.
+    let src = source(&format!("logdensityof(normalize({law}), 1.5)"));
+    let mut module = flatppl_syntax::parse(&src).unwrap();
+    let _ = flatppl_infer::infer(&mut module);
+    let numerical = flatppl_determinizer::determinize_with_options(
+        &module,
+        &flatppl_infer::ModuleBundle::new(),
+        None,
+        &flatppl_determinizer::LoweringOptions {
+            numerical_integrals: true,
+            supports_cdf: Some(|_| false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pir_binding(&flatppl_flatpir::write(&numerical), "lp"),
+        pir_binding(&flatppl_flatpir::write(&expected), "lp"),
+    );
 }
 
 #[test]
@@ -1605,18 +1625,7 @@ fn locscale_scalar_variate_matrix_scale_refuses() {
     assert!(msg.contains("refuse"), "got: {msg}");
 }
 
-#[test]
-fn locscale_vector_variate_scalar_scale_refuses() {
-    // A VECTOR-variate base (`MvNormal`) paired with a SCALAR `scale`: the true
-    // forward log-volume would be n*log|scale| (summed over all n axes), not
-    // the scalar form's single log|scale| — the same danger the vector-variate
-    // guard closes for plain `pushfwd`. Must refuse rather than mislower.
-    let msg = ls_refuse(
-        "d = locscale(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])), [1.0, 2.0], 3.0)\n\
-         lp = logdensityof(d, [0.5, 0.5])",
-    );
-    assert!(msg.contains("refuse"), "got: {msg}");
-}
+// A vector variate with a scalar scale: locscale_scalar_scale_golden.rs.
 
 #[test]
 fn locscale_zero_scalar_scale_refuses() {

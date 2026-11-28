@@ -25,6 +25,7 @@
 //! the same for its predicate operand.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type, ValueSet,
@@ -49,6 +50,8 @@ pub(crate) use integration::IntegralKind;
 mod ext_linalg;
 #[path = "factor_solve.rs"]
 mod factor_solve;
+#[path = "fixed_design.rs"]
+mod fixed_design;
 #[path = "hermitian.rs"]
 mod hermitian;
 #[path = "kronecker.rs"]
@@ -65,6 +68,9 @@ mod lu;
 mod matrix_eigen;
 #[path = "matrix_exp.rs"]
 mod matrix_exp;
+#[path = "matrix_projection.rs"]
+mod matrix_projection;
+
 #[path = "matrix_svd.rs"]
 mod matrix_svd;
 #[path = "ode.rs"]
@@ -165,6 +171,21 @@ impl AxisReduce {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum BoundTuple {
+    Items(Vec<Self>),
+    Value(Lowered),
+}
+
+impl BoundTuple {
+    pub(crate) fn leaves(&self, out: &mut Vec<Value>) {
+        match self {
+            Self::Items(items) => items.iter().for_each(|item| item.leaves(out)),
+            Self::Value(value) => value.clone().leaves(out),
+        }
+    }
+}
+
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
 #[derive(Clone)]
@@ -178,6 +199,8 @@ pub struct Emitter<'m> {
     restrict_enzyme_compatible: bool,
     check_parameters: bool,
     pub(crate) sufficient_statistics: bool,
+    /// A tentative fixed-design reduction can materialize small integer histories.
+    fold_design_scans: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
     /// Step odesolve on the error of its sensitivities too (see `ode.rs`).
@@ -188,6 +211,7 @@ pub struct Emitter<'m> {
     pub(crate) ode_coupled_pass: bool,
     /// The first pass lowered an odesolve with sensitivity directions.
     pub(crate) ode_coupled_needed: bool,
+    rules: crate::RulePolicy,
     /// The program is replayed over host batch axes after lowering.
     host_batch: bool,
     runtime_batch_rank: usize,
@@ -220,6 +244,8 @@ pub struct Emitter<'m> {
     expanded: HashMap<(String, Vec<Option<u64>>, Axes), Value>,
     axes: HashMap<String, Axes>,
     constants: HashMap<String, constants::Constant>,
+    /// Products lowered as one-element dots, by result SSA: the factors.
+    elementwise_products: HashMap<String, (Value, Value)>,
     broadcast_frame: Vec<Option<u64>>,
     call_frame: Vec<Option<u64>>,
     /// Nesting depth for region-local runtime checks.
@@ -244,6 +270,12 @@ pub struct Emitter<'m> {
     /// It stands for the scan's rng-state column, of which only the last row
     /// is kept.
     pub(crate) final_scan_keys: HashMap<String, u64>,
+    /// Proven output demand for top-level scans in this query.
+    scan_demand: Option<OnceLock<flatppl_optimise::ScanOutputDemand>>,
+    /// Terminal values are not interchangeable with full scan histories.
+    scan_terminals: HashMap<NodeId, Value>,
+    /// The scalar item and its inclusive bounds during a scan callback.
+    scan_index: Option<(String, i64, i64)>,
     /// The fan-out batch shape, set by [`crate::registry::lower_sample`] around
     /// a batched `builtin_sample(rng, ctor, input, n)` (spec §07 size dims).
     /// When `Some`, [`Emitter::rng`] OVERRIDES the per-element `out_ty` the
@@ -260,6 +292,7 @@ pub struct Emitter<'m> {
     /// `memo`; a field access reaching it resolves here instead
     /// ([`Emitter::lower_field`]).
     columns: HashMap<(NodeId, String), Lowered>,
+    tuple_inputs: HashMap<NodeId, BoundTuple>,
 }
 
 impl<'m> Emitter<'m> {
@@ -270,12 +303,14 @@ impl<'m> Emitter<'m> {
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             check_parameters: true,
             sufficient_statistics: true,
+            fold_design_scans: false,
             integration: None,
             target: crate::Target::Cpu,
             ode_sensitivity_control: false,
             ode_two_pass: false,
             ode_coupled_pass: false,
             ode_coupled_needed: false,
+            rules: crate::RulePolicy::default(),
             host_batch: false,
             runtime_batch_rank: 0,
             runtime_status: None,
@@ -294,6 +329,7 @@ impl<'m> Emitter<'m> {
             expanded: HashMap::new(),
             axes: HashMap::new(),
             constants: HashMap::new(),
+            elementwise_products: HashMap::new(),
             broadcast_frame: Vec::new(),
             call_frame: Vec::new(),
             region_depth: 0,
@@ -302,12 +338,25 @@ impl<'m> Emitter<'m> {
             cur_key: None,
             sample_keys: HashMap::new(),
             final_scan_keys: HashMap::new(),
+            scan_demand: None,
+            scan_terminals: HashMap::new(),
+            scan_index: None,
             batch_shape: None,
             columns: HashMap::new(),
+            tuple_inputs: HashMap::new(),
         }
     }
 
     pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
+        Self::with_options_and_rules(m, opts, &crate::RulePolicy::default())
+    }
+
+    /// Create an emitter using a caller-selected egglog rule policy.
+    pub fn with_options_and_rules(
+        m: &'m Module,
+        opts: &crate::EmitOptions,
+        rules: &crate::RulePolicy,
+    ) -> Self {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
         emitter.check_parameters = opts.check_parameters;
@@ -315,6 +364,26 @@ impl<'m> Emitter<'m> {
         emitter.integration = opts.integration;
         emitter.target = opts.target;
         emitter.ode_sensitivity_control = opts.ode_sensitivity_control;
+        emitter.rules = rules.clone();
+        emitter
+    }
+
+    /// Create an emitter for the validated `inputs` and `outputs` ABI. The
+    /// caller must bind those inputs and lower only leaves of those outputs.
+    #[doc(hidden)]
+    pub fn for_query(m: &'m Module, opts: &crate::EmitOptions) -> Self {
+        Self::for_query_with_rules(m, opts, &crate::RulePolicy::default())
+    }
+
+    #[doc(hidden)]
+    pub fn for_query_with_rules(
+        m: &'m Module,
+        opts: &crate::EmitOptions,
+        rules: &crate::RulePolicy,
+    ) -> Self {
+        let mut emitter = Self::with_options_and_rules(m, opts, rules);
+        emitter.scan_demand = (opts.target.serial_scans() && rules.enables_ruleset("scan-demand"))
+            .then(OnceLock::new);
         emitter
     }
 
@@ -333,6 +402,7 @@ impl<'m> Emitter<'m> {
         emitter.integration = self.integration;
         emitter.target = self.target;
         emitter.ode_sensitivity_control = self.ode_sensitivity_control;
+        emitter.rules = self.rules.clone();
         emitter.host_batch = self.host_batch;
         emitter.runtime_batch_rank = self.runtime_batch_rank;
         emitter.region_depth = self.region_depth + 1;
@@ -870,81 +940,6 @@ impl<'m> Emitter<'m> {
     /// (`invlogit.(linear_predictor)`) via the shared unary path.
     pub fn invlogit(&mut self, a: &Value) -> Value {
         self.unary_real("stablehlo.logistic", a)
-    }
-    /// The logit `z` of a probability `p` emitted as [`Emitter::invlogit`]`(z)`.
-    /// A density takes `log p = -softplus(-z)` and `log(1 - p) = -softplus(z)`
-    /// from it: once `p` is rounded, `1 - p` keeps only the leading digits of
-    /// `exp(-z)` and is zero from `z` ≈ 17 in f32 and ≈ 37 in f64, so
-    /// `log(1 - p)` is `-inf` with a NaN derivative.
-    ///
-    /// The logistic commutes with reshapes, slices, transposes and static cell
-    /// selections, which are replayed on `z`. Stacked group probabilities
-    /// select their cells this way. A select whose other branch is a fixed
-    /// probability `k` in (0, 1), such as a likelihood summary's stand-in 0.5
-    /// for an empty group, selects `logit(k)` instead. Anything else is
-    /// `None`, and the density scores `p` itself.
-    pub(crate) fn invlogit_operand(&mut self, p: &Value) -> Option<Value> {
-        match self.pointwise.get(&p.ssa)?.op.clone() {
-            Pointwise::Unary(op, z) if op == "stablehlo.logistic" => Some(z),
-            Pointwise::Reshape(a) => {
-                let z = self.invlogit_operand(&a)?;
-                let axes = self.axes_of(p);
-                Some(self.reshape_axes(&z, p.ty.clone(), axes))
-            }
-            Pointwise::Slice(a, starts, limits, strides) => {
-                let z = self.invlogit_operand(&a)?;
-                Some(self.slice(&z, &starts, &limits, &strides))
-            }
-            // A selection along a batch axis is not a cell gather; leave it.
-            Pointwise::Gather(a, axis, indices) => {
-                let cell_axis = axis.checked_sub(self.batch_rank(&a))?;
-                let z = self.invlogit_operand(&a)?;
-                let cells = indices
-                    .iter()
-                    .map(|&i| i64::try_from(i).ok().map(Scalar::Int))
-                    .collect::<Option<Vec<_>>>()?;
-                let ty = MlirTy::Ranked(vec![Some(cells.len() as u64)]);
-                let idx = self.folded_constant(cells, ty, Axes::default())?;
-                Some(self.gather_axis(&z, &idx, 0, cell_axis))
-            }
-            Pointwise::Transpose(a, perm) => {
-                let z = self.invlogit_operand(&a)?;
-                Some(self.transpose(&z, &perm))
-            }
-            Pointwise::Select(c, a, b) => {
-                let (za, zb) = match (self.invlogit_operand(&a), self.invlogit_operand(&b)) {
-                    (Some(za), Some(zb)) => (za, zb),
-                    (Some(za), None) => (za, self.fixed_logit(&b)?),
-                    (None, Some(zb)) => (self.fixed_logit(&a)?, zb),
-                    (None, None) => return None,
-                };
-                Some(self.select(&c, &za, &zb))
-            }
-            _ => None,
-        }
-    }
-    /// `logit(k)` shaped like `p` when `p` is a fixed splat probability `k`
-    /// strictly inside (0, 1).
-    fn fixed_logit(&mut self, p: &Value) -> Option<Value> {
-        let data = self.constants.get(&p.ssa)?;
-        let Some(Scalar::Real(k)) = data.get(0) else {
-            return None;
-        };
-        if !(0.0 < k && k < 1.0) || data.iter().any(|x| x != Scalar::Real(k)) {
-            return None;
-        }
-        Some(self.constant_like((k / (1.0 - k)).ln(), p))
-    }
-    /// `softplus(z) = log(1 + exp(z))` as `max(z, 0) + log1p(exp(-|z|))`, which
-    /// overflows in neither tail and has the derivative `invlogit(z)`.
-    pub(crate) fn softplus(&mut self, z: &Value) -> Value {
-        let abs = self.abs(z);
-        let negative = self.neg(&abs);
-        let ex = self.exp(&negative);
-        let tail = self.log1p(&ex);
-        let zero = self.scalar(0.0);
-        let positive = self.max(z, &zero);
-        self.add(&positive, &tail)
     }
     /// `stablehlo.sine` — a NEW op form for this crate (Task 14's Cauchy
     /// `@sample`, which needs `tan(t) = sin(t) / cos(t)`; no `chlo`/
@@ -2101,28 +2096,7 @@ impl<'m> Emitter<'m> {
             .map(|v| self.reshape(v, stacked_elem_ty.clone()))
             .collect();
 
-        let operand_ssas = reshaped
-            .iter()
-            .map(|v| v.ssa.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let operand_tys = reshaped
-            .iter()
-            .map(|v| v.ty.render(self.dtype, v.elem))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let result_ty_text = result_ty.render(self.dtype, elem_kind);
-
-        let ssa = self.pure_axes(format!(
-            "stablehlo.concatenate {operand_ssas}, dim = 0 : ({operand_tys}) -> {result_ty_text}"
-        ), axes);
-        let value = Value {
-            ssa,
-            ty: result_ty,
-            elem: elem_kind,
-        };
-        self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(reshaped, 0));
-        value
+        self.concatenate_parts(reshaped, 0, result_ty, axes)
     }
 
     /// Concatenate vector cells, preserving batch prefixes and nested cells.
@@ -2177,6 +2151,18 @@ impl<'m> Emitter<'m> {
         {
             return Ok(value);
         }
+        Ok(self.concatenate_parts(parts, axes.batch, ty, axes))
+    }
+
+    /// Join physically aligned parts along an axis of a known result shape.
+    fn concatenate_parts(
+        &mut self,
+        parts: Vec<Value>,
+        axis: usize,
+        ty: MlirTy,
+        axes: Axes,
+    ) -> Value {
+        let elem = parts[0].elem;
         let names = parts
             .iter()
             .map(|v| v.ssa.as_str())
@@ -2187,22 +2173,14 @@ impl<'m> Emitter<'m> {
             .map(|v| v.ty.render(self.dtype, v.elem))
             .collect::<Vec<_>>()
             .join(", ");
-        let result = ty.render(self.dtype, first.elem);
-        let axis = axes.batch;
+        let result = ty.render(self.dtype, elem);
         let ssa = self.pure_axes(
-            format!(
-                "stablehlo.concatenate {names}, dim = {} : ({types}) -> {result}",
-                axes.batch
-            ),
+            format!("stablehlo.concatenate {names}, dim = {axis} : ({types}) -> {result}"),
             axes,
         );
-        let value = Value {
-            ssa,
-            ty,
-            elem: first.elem,
-        };
+        let value = Value { ssa, ty, elem };
         self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(parts, axis));
-        Ok(value)
+        value
     }
 
     /// `%N = stablehlo.transpose %a, dims = [perm...] : (operand_ty) ->
@@ -2470,29 +2448,52 @@ impl<'m> Emitter<'m> {
 
     /// Accumulate native integer counts at already-validated zero-based bins.
     pub(crate) fn scatter_counts(&mut self, bins: u64, indices: &Value, updates: &Value) -> Value {
-        debug_assert_eq!(indices.elem, ElemKind::Int);
         debug_assert_eq!(updates.elem, ElemKind::Int);
-        let zero = self.int_value_const(0);
-        let ty = MlirTy::Ranked(vec![Some(bins)]);
+        self.scatter_add_rows(bins, indices, updates)
+    }
+
+    /// Add each update row at its zero-based index. Trailing dimensions form
+    /// the update window and stay in their original order.
+    pub(crate) fn scatter_add_rows(
+        &mut self,
+        rows: u64,
+        indices: &Value,
+        updates: &Value,
+    ) -> Value {
+        debug_assert_eq!(indices.elem, ElemKind::Int);
+        let zero = match updates.elem {
+            ElemKind::Int => self.int_value_const(0),
+            ElemKind::Real => self.scalar(0.0),
+            _ => unreachable!("scatter-add updates must be real or integer"),
+        };
+        let mut output_shape = shape(&updates.ty).to_vec();
+        output_shape[0] = Some(rows);
+        let update_window_dims = if output_shape.len() > 1 {
+            let dims: Vec<_> = (1..output_shape.len()).map(|dim| dim.to_string()).collect();
+            format!("update_window_dims = [{}], ", dims.join(", "))
+        } else {
+            String::new()
+        };
+        let ty = MlirTy::Ranked(output_shape);
         let initial = self.broadcast_in_dim(&zero, &[], ty.clone());
         let mut dims = shape(&indices.ty).to_vec();
         dims.push(Some(1));
         let indices = self.reshape(indices, MlirTy::Ranked(dims));
-        let scalar_ty = MlirTy::Scalar.render(self.dtype, ElemKind::Int);
-        let result_ty = ty.render(self.dtype, ElemKind::Int);
+        let scalar_ty = MlirTy::Scalar.render(self.dtype, updates.elem);
+        let result_ty = ty.render(self.dtype, updates.elem);
         let left = self.fresh();
         let right = self.fresh();
         let sum = self.fresh();
         let ssa = self.pure(format!(
-            "\"stablehlo.scatter\"({}, {}, {}) <{{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}}> ({{\n^bb0({left}: {scalar_ty}, {right}: {scalar_ty}):\n  {sum} = stablehlo.add {left}, {right} : {scalar_ty}\n  stablehlo.return {sum} : {scalar_ty}\n}}) : ({result_ty}, {}, {}) -> {result_ty}",
+            "\"stablehlo.scatter\"({}, {}, {}) <{{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<{update_window_dims}inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}}> ({{\n^bb0({left}: {scalar_ty}, {right}: {scalar_ty}):\n  {sum} = stablehlo.add {left}, {right} : {scalar_ty}\n  stablehlo.return {sum} : {scalar_ty}\n}}) : ({result_ty}, {}, {}) -> {result_ty}",
             initial.ssa, indices.ssa, updates.ssa,
             indices.ty.render(self.dtype, ElemKind::Int),
-            updates.ty.render(self.dtype, ElemKind::Int),
+            updates.ty.render(self.dtype, updates.elem),
         ));
         Value {
             ssa,
             ty,
-            elem: ElemKind::Int,
+            elem: updates.elem,
         }
     }
 
@@ -2804,7 +2805,12 @@ impl<'m> Emitter<'m> {
         if n == 1 {
             return a.clone();
         }
-        if self.target.serial_scans() {
+        // Enzyme differentiates the static slice/concatenate/multiply scan
+        // without taping a loop or dividing by a zero-valued prefix.
+        let enzyme_product = self.restrict_enzyme_compatible
+            && a.elem == ElemKind::Real
+            && combine_op == "stablehlo.multiply";
+        if self.target.serial_scans() && !enzyme_product {
             self.prefix_scan_loop(combine_op, identity_lit, a, &dims)
         } else {
             self.prefix_scan_doubling(combine_op, identity_lit, a, &dims)
@@ -4626,7 +4632,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// If `args` is `get`/`get0`'s `[container, index]` pair and `container`
-    /// resolves (one `(%ref self x)` hop, [`Emitter::resolve_ref_one`]) to a
+    /// resolves through refs and nested projections to a
     /// literal `tuple(...)` call with a literal-integer `index`, return the
     /// projected element's [`NodeId`]. The determiniser builds a
     /// `tuple(value, advanced_rng)` for a DESTRUCTURED `rand` (spec §07's full
@@ -4638,8 +4644,19 @@ impl<'m> Emitter<'m> {
     /// when `container` is not a tuple literal (the caller then tries
     /// [`Emitter::sample_tuple_slot`], else the ordinary tensor `get`).
     fn tuple_projection(&self, args: &[NodeId], base: i64) -> Option<NodeId> {
+        self.tuple_projection_at(args, base, 0)
+    }
+
+    fn tuple_projection_at(&self, args: &[NodeId], base: i64, depth: usize) -> Option<NodeId> {
         let [container, index] = <[NodeId; 2]>::try_from(args).ok()?;
-        let resolved = self.resolve_ref_one(container);
+        let resolved = if matches!(self.type_of(container), Some(Type::Tuple(_))) {
+            self.resolve_tuple_projections_at(container, depth + 1)
+        } else {
+            self.resolve_ref_one(container)
+        };
+        if self.memo.contains_key(&resolved) || self.tuple_input(resolved).is_some() {
+            return None;
+        }
         let elems = match self.m.node(resolved) {
             Node::Call(c) => match c.head {
                 CallHead::Builtin(sym) if self.m.resolve(sym) == "tuple" => &c.args,
@@ -4651,19 +4668,23 @@ impl<'m> Emitter<'m> {
             Node::Lit(Scalar::Int(i)) => *i,
             _ => return None,
         };
-        let idx = selector - base;
-        if idx < 0 || idx as usize >= elems.len() {
-            return None;
-        }
-        Some(elems[idx as usize])
+        let idx = usize::try_from(selector.checked_sub(base)?).ok()?;
+        elems.get(idx).copied()
     }
 
     /// Resolve refs and literal tuple projections before inspecting a record.
     /// Destructured `rand` values reach their record through `get(tuple, 1)`;
     /// lowering that projection as a tensor would lose the record's fields.
-    pub(crate) fn resolve_tuple_projections(&self, mut id: NodeId) -> NodeId {
+    pub(crate) fn resolve_tuple_projections(&self, id: NodeId) -> NodeId {
+        self.resolve_tuple_projections_at(id, 0)
+    }
+
+    fn resolve_tuple_projections_at(&self, mut id: NodeId, depth: usize) -> NodeId {
+        if depth >= flatppl_core::DEFAULT_MAX_DEPTH {
+            return id;
+        }
         let mut seen = HashSet::new();
-        while seen.insert(id) && !self.memo.contains_key(&id) {
+        while seen.insert(id) && !self.memo.contains_key(&id) && self.tuple_input(id).is_none() {
             let resolved = self.resolve_ref_one(id);
             if resolved != id {
                 id = resolved;
@@ -4677,7 +4698,7 @@ impl<'m> Emitter<'m> {
                 CallHead::Builtin(sym) if self.m.resolve(sym) == "get0" => 0,
                 _ => break,
             };
-            let Some(projected) = self.tuple_projection(&call.args, base) else {
+            let Some(projected) = self.tuple_projection_at(&call.args, base, depth) else {
                 break;
             };
             id = projected;
@@ -4699,6 +4720,47 @@ impl<'m> Emitter<'m> {
     pub fn bind_field(&mut self, container: NodeId, name: String, value: Lowered) {
         let container = self.column_container(container);
         self.columns.insert((container, name), value);
+    }
+
+    pub(crate) fn bind_tuple_input(&mut self, rhs: NodeId, value: BoundTuple) {
+        self.tuple_inputs.insert(rhs, value);
+    }
+
+    pub(crate) fn tuple_input(&self, mut node: NodeId) -> Option<&BoundTuple> {
+        if self.tuple_inputs.is_empty() {
+            return None;
+        }
+        let mut path = Vec::new();
+        loop {
+            let resolved = self.resolve_ref_one(node);
+            if let Some(input) = self.tuple_inputs.get(&resolved) {
+                return path.into_iter().rev().try_fold(input, |part, index| {
+                    let BoundTuple::Items(items) = part else {
+                        return None;
+                    };
+                    items.get(index)
+                });
+            }
+            let Node::Call(call) = self.m.node(resolved) else {
+                return None;
+            };
+            let base = match call.head {
+                CallHead::Builtin(head) if self.m.resolve(head) == "get" => 1,
+                CallHead::Builtin(head) if self.m.resolve(head) == "get0" => 0,
+                _ => return None,
+            };
+            let &[container, selector] = call.args.as_ref() else {
+                return None;
+            };
+            if !matches!(self.type_of(container), Some(Type::Tuple(_))) {
+                return None;
+            }
+            let Node::Lit(Scalar::Int(index)) = self.m.node(selector) else {
+                return None;
+            };
+            path.push(usize::try_from(index.checked_sub(base)?).ok()?);
+            node = container;
+        }
     }
 
     /// Resolve `id` through at most one level of `(%ref self x)` indirection
@@ -4858,6 +4920,84 @@ impl<'m> Emitter<'m> {
         Ok(value)
     }
 
+    /// Lower a guarded compact likelihood without evaluating its inactive arm.
+    /// The ordinary `ifelse` continues to lower eagerly with `stablehlo.select`.
+    pub(crate) fn lower_likelihood_choice(
+        &mut self,
+        id: NodeId,
+        predicate: NodeId,
+        grouped: NodeId,
+        original: NodeId,
+    ) -> Option<Result<Value, EmitError>> {
+        if !self.m.is_guarded_likelihood(id) {
+            return None;
+        }
+        if !self.sufficient_statistics
+            || self.target != crate::Target::Cpu
+            || self.host_batch
+            || self.region_depth != 0
+            || !self.call_frame.is_empty()
+        {
+            return Some(self.lower_node(original));
+        }
+        Some(self.likelihood_case(predicate, grouped, original))
+    }
+
+    fn likelihood_case(
+        &mut self,
+        predicate: NodeId,
+        grouped: NodeId,
+        original: NodeId,
+    ) -> Result<Value, EmitError> {
+        let predicate = self.lower_node(predicate)?;
+        if predicate.ty != MlirTy::Scalar || predicate.elem != ElemKind::Bool {
+            return self.lower_node(original);
+        }
+
+        let capture = |id, next| {
+            let mut region = self.clone();
+            region.next = next;
+            region.region_depth += 1;
+            region.body.clear();
+            region.pure_ops.clear();
+            region.expanded.clear();
+            region.runtime_status = None;
+            region.runtime_unmapped_check = false;
+            let value = region.lower_node(id).ok()?;
+            // Both generated arms contain only checked fixed gathers and
+            // Poisson parameters proven by exp. Keep the native expression
+            // if another lowering policy records any region-local status.
+            if region.runtime_status.is_some()
+                || region.runtime_unmapped_check
+                || value.ty != MlirTy::Scalar
+                || value.elem != ElemKind::Real
+            {
+                return None;
+            }
+            let body = region.live_lines(&region.body, &[&value]).join("\n");
+            Some((body, value, region.next))
+        };
+        let Some((native_body, native, next)) = capture(original, self.next) else {
+            return self.lower_node(original);
+        };
+        let Some((compact_body, compact, next)) = capture(grouped, next) else {
+            return self.lower_node(original);
+        };
+        self.next = next;
+        let index = self.pure(format!(
+            "stablehlo.convert {} : (tensor<i1>) -> tensor<i32>",
+            predicate.ssa
+        ));
+        let ty = native.ty.render(self.dtype, native.elem);
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = \"stablehlo.case\"({index}) ({{\n{native_body}\n stablehlo.return {} : {ty}\n}}, \
+             {{\n{compact_body}\n stablehlo.return {} : {ty}\n}}) : (tensor<i32>) -> {ty}",
+            native.ssa, compact.ssa,
+        ));
+        Ok(Value { ssa, ..native })
+    }
+
     /// Lower `broadcast(f, rest...)` (§04 sec:broadcasting): apply the callable
     /// `f` (`args[0]`) elementwise over `rest`, scalars auto-broadcasting.
     ///
@@ -4885,6 +5025,9 @@ impl<'m> Emitter<'m> {
         id: NodeId,
         args: &[NodeId],
     ) -> Result<Value, EmitError> {
+        if let Some(value) = self.lower_scan_history_map(id, args) {
+            return value;
+        }
         let f = *args
             .first()
             .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;
@@ -4957,7 +5100,10 @@ impl<'m> Emitter<'m> {
             }
         };
         let positional;
-        let rest = if matches!(fname.as_str(), "linsolve" | "conv" | "crosscorr" | "cross") {
+        let rest = if matches!(
+            fname.as_str(),
+            "linsolve" | "conv" | "crosscorr" | "cross" | "quadform"
+        ) {
             let named = match self.node(id) {
                 Node::Call(c) => c.named.as_ref(),
                 _ => &[],
@@ -4975,6 +5121,7 @@ impl<'m> Emitter<'m> {
                 let (first, second) = match fname.as_str() {
                     "linsolve" => ("A", "b"),
                     "cross" => ("a", "b"),
+                    "quadform" => ("A", "x"),
                     _ => ("v", "kernel"),
                 };
                 positional = [
@@ -5035,6 +5182,16 @@ impl<'m> Emitter<'m> {
                 | "cumprod"
                 | "cummax"
                 | "cummin"
+                | "reverse"
+                | "row_gram"
+                | "col_gram"
+                | "quadform"
+                | "self_outer"
+                | "softmax"
+                | "logsoftmax"
+                | "l2norm"
+                | "l1unit"
+                | "l2unit"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {
@@ -5314,6 +5471,9 @@ impl<'m> Emitter<'m> {
                         // bypasses this dispatch, so they keep broadcasting.
                         crate::ops::lower_bare_arith(self, id, &name, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
+                        if let Some(value) = self.lower_scan_terminal(id, &call.args) {
+                            return value;
+                        }
                         // `get0(builtin_sample(...), k)` / `get((%ref self
                         // <shared-latent>), k)`: a projection of a sampled
                         // `(value, new_rngstate)` pair (slot 0 = drawn value,
@@ -5325,6 +5485,11 @@ impl<'m> Emitter<'m> {
                         // ordinary case) falls through to `ops::lower_builtin`'s
                         // generic rank-1-tensor `get`/`get0`.
                         let base = if name == "get0" { 0 } else { 1 };
+                        if let Some(BoundTuple::Value(Lowered::Tensor(value))) =
+                            self.tuple_input(id)
+                        {
+                            return Ok(value.clone());
+                        }
                         if let Some((container, field)) = self.record_projection(&call.args) {
                             return match self.lower_field(container, &field)? {
                                 Lowered::Tensor(value) => Ok(value),

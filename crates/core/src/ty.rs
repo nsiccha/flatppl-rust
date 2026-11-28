@@ -55,7 +55,7 @@ pub fn variate_kind(t: &Type) -> Option<VariateKind> {
 }
 
 /// The structural category of a value / object (the FlatPIR `%meta` type slot).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     /// `%deferred` — not yet inferred.
     Deferred,
@@ -122,7 +122,7 @@ impl Type {
 }
 
 /// The four scalar value types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     Real,
     Integer,
@@ -134,7 +134,7 @@ pub enum ScalarType {
 /// strongest statically known class, in a strict hierarchy — `LocallyFinite`
 /// implies *infinite* total mass (a locally finite measure with finite total
 /// mass is `Finite`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mass {
     /// `%deferred` — not yet inferred.
     Deferred,
@@ -223,6 +223,26 @@ impl ValueSet {
             Scalar::Real(r) => ValueSet::Interval(*r, *r),
             Scalar::Bool(_) => ValueSet::Booleans,
             Scalar::Str(_) => ValueSet::Unknown,
+        }
+    }
+
+    /// The dimensions this set lacks against its scalar cell count: one per
+    /// `stdsimplex(n)`/`zerosum(n)` factor, whose §03 reference measure is the
+    /// coordinate Lebesgue measure of its n − 1 free coordinates. `None` for
+    /// such a factor repeated a dynamic number of times, and for
+    /// `corrcholesky(n)`, a lower-dimensional set §03 gives no reference
+    /// measure (the support of `LKJCholesky`).
+    pub fn chart_deficit(&self) -> Option<u64> {
+        match self {
+            ValueSet::StdSimplex(_) | ValueSet::ZeroSum(_) => Some(1),
+            ValueSet::CorrCholesky(_) => None,
+            ValueSet::CartPow(inner, n) => match (inner.chart_deficit()?, n) {
+                (0, _) => Some(0),
+                (d, Dim::Static(n)) => Some(d * u64::from(*n)),
+                (_, Dim::Dynamic) => None,
+            },
+            ValueSet::CartProd(parts) => parts.iter().map(ValueSet::chart_deficit).sum(),
+            _ => Some(0),
         }
     }
 
@@ -426,7 +446,7 @@ fn product_bounded<'a>(parts: impl Iterator<Item = &'a ValueSet>) -> Option<bool
 }
 
 /// An array dimension: a concrete size, or `%dynamic` (resolved at load / run time).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dim {
     Static(u32),
     Dynamic,

@@ -54,7 +54,8 @@ fn refuse_in(
         target: target.map(str::to_string),
         ..Default::default()
     };
-    let r = flatppl_stan::emit(&module, &opts).expect_err("refuses");
+    // As `flatppl stan` emits: `load_module` members are imported first.
+    let r = flatppl_stan::emit_with_bundle(&module, bundle, &opts).expect_err("refuses");
     let located = r.node.and_then(|node| enclosing_binding(&module, node));
     if let Some(name) = &located {
         assert!(!name.starts_with("__"), "located in `{name}`: {r}");
@@ -243,17 +244,244 @@ fn no_and_ambiguous_target() {
     assert!(r.reason.contains("a, b"), "{r}");
 }
 
+/// A Poisson process query `lp = logdensityof(<law>, <x>)` over `inputs`.
+fn process_query(decls: &str, law: &str, x: &str, inputs: &str) -> String {
+    format!("{decls}\nlp = logdensityof({law}, {x})\ninputs = {inputs}\noutputs = lp\n")
+}
+
+/// A function-weighted intensity has no closed mass here; Stan's
+/// `integrate_1d` and a polynomial's closed mass are later forms.
 #[test]
 fn point_process_is_not_yet() {
-    let r = refuse(
-        "rate ~ Gamma(shape = 2.0, rate = 1.0)\n\
-         y ~ BinnedPoissonProcess([0.0, 1.0, 2.0], weighted(rate, Lebesgue(support = interval(0.0, 2.0))))\n\
-         prior = lawof(record(rate = rate))\n\
-         L = likelihoodof(kernelof(record(y = y), rate = rate), record(y = [1, 2]))\n\
-         post = bayesupdate(L, prior)\n",
+    let r = refuse_with(
+        &process_query(
+            "a = elementof(nonnegreals)\n\
+             I = weighted((x, p) -> p * exp(x), Lebesgue(interval(0.0, 1.0)), a)",
+            "BinnedPoissonProcess([0.0, 0.5, 1.0], I)",
+            "[0, 1]",
+            "a",
+        ),
+        Some("lp"),
     );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("BinnedPoissonProcess"), "{r}");
+    assert!(
+        r.reason
+            .contains("an intensity weighted by a function of the variate"),
+        "{r}"
+    );
+}
+
+/// A truncation to an interval outside the support has no mass, and
+/// `normalize` of it has no density.
+#[test]
+fn normalized_truncation_outside_the_support_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "r = elementof(posreals)",
+            "normalize(truncate(Exponential(r), interval(-2.0, -1.0)))",
+            "0.5",
+            "r",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason
+            .contains("a truncation to an interval outside the support has zero mass"),
+        "{r}"
+    );
+}
+
+/// The same for a normalized intensity.
+#[test]
+fn normalized_intensity_of_zero_mass_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "r = elementof(posreals)",
+            "PoissonProcess(normalize(truncate(Exponential(r), interval(-2.0, -1.0))))",
+            "[0.5]",
+            "r",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains("§06") && r.reason.contains("has zero mass"),
+        "{r}"
+    );
+}
+
+#[test]
+fn discrete_intensity_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "r = elementof(posreals)",
+            "BinnedPoissonProcess([0.5, 1.5, 2.5], weighted(3.0, Poisson(r)))",
+            "[1, 2]",
+            "r",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a discrete intensity (`Poisson`)"), "{r}");
+}
+
+#[test]
+fn atom_intensity_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)",
+            "PoissonProcess(weighted(s, Dirac(1.0)))",
+            "[1.0]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("an intensity with an atom (`Dirac`)"),
+        "{r}"
+    );
+}
+
+/// §06 takes a finite-mass intensity: `Lebesgue(reals)` has none.
+#[test]
+fn infinite_mass_intensity_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "b = elementof(posreals)",
+            "PoissonProcess(weighted(b, Lebesgue(support = reals)))",
+            "[1.0]",
+            "b",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains("§06") && r.reason.contains("finite mass"),
+        "{r}"
+    );
+}
+
+/// The binned law takes a finite-mass intensity too (§06), even where each
+/// bin's mass is finite.
+#[test]
+fn infinite_mass_binned_intensity_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)",
+            "BinnedPoissonProcess([0.0, 1.0], weighted(s, Lebesgue(support = reals)))",
+            "[1]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(
+        r.reason.contains("§06") && r.reason.contains("finite mass"),
+        "{r}"
+    );
+}
+
+/// A negative literal weight is ill-formed (§06 `weighted`), as in a mixture.
+#[test]
+fn negative_intensity_weight_is_ill_formed() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)",
+            "PoissonProcess(weighted(-2.0, Normal(0.0, 1.0)))",
+            "[0.5]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::IllFormedModule, "{r}");
+    assert!(r.reason.contains("the weight -2 is negative"), "{r}");
+}
+
+#[test]
+fn kernel_intensity_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "mu = elementof(reals)\nK = functionof(weighted(2.0, Normal(mu, 1.0)), mu = mu)",
+            "PoissonProcess(K)",
+            "[0.5]",
+            "mu",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a kernel intensity"), "{r}");
+}
+
+#[test]
+fn record_bin_edges_are_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)\n\
+             I = weighted(s, joint(x = Uniform(interval(0, 2)), y = Uniform(interval(0, 3))))",
+            "BinnedPoissonProcess(record(x = [0, 0.5, 2], y = [0, 1, 2, 3]), I)",
+            "rowstack([[1, 1, 1], [3, 3, 3]])",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a record of edge vectors"), "{r}");
+}
+
+/// Record-valued points are a table, and a table value refuses before the
+/// process does: the record-point refusal waits for tables.
+#[test]
+fn record_valued_points_are_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "s = elementof(posreals)\npts = elementof(cartpow(cartprod(x = reals, y = reals), 2))",
+            "PoissonProcess(weighted(s, joint(x = Normal(0.0, 1.0), y = Normal(0.0, 1.0))))",
+            "pts",
+            "(s, pts)",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a record value"), "{r}");
+}
+
+#[test]
+fn intensity_without_lcdf_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "hep = standard_module(\"particle-physics\", \"0.1\")\ns = elementof(posreals)",
+            "BinnedPoissonProcess([5.0, 5.2, 5.4], weighted(s, hep.CrystalBall(5.28, 0.05, 1.5, 3.0)))",
+            "[1, 2]",
+            "s",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("the intensity law `CrystalBall`, which has no `_lcdf` in Stan"),
+        "{r}"
+    );
+}
+
+#[test]
+fn dynamic_bin_edge_count_is_not_yet() {
+    let r = refuse_with(
+        &process_query(
+            "n = elementof(posintegers)",
+            "BinnedPoissonProcess(linspace(0.0, 2.0, n), weighted(5.0, Normal(1.0, 0.5)))",
+            "[1, 3]",
+            "n",
+        ),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("a bin-edge vector of non-static length"),
+        "{r}"
+    );
 }
 
 #[test]
@@ -740,21 +968,311 @@ fn pushfwd_of_a_support_with_a_symbolic_end_names_the_end() {
 }
 
 #[test]
-fn pushfwd_through_a_bare_name_is_not_yet() {
-    for name in ["log", "sqrt"] {
-        let r = refuse(&posterior(
-            &format!("rho ~ pushfwd({name}, Gamma(2, 1))\ny ~ Normal(rho, 1)"),
+fn pushfwd_through_a_bare_name_outside_the_registry_is_not_yet() {
+    let r = refuse(&posterior(
+        "rho ~ pushfwd(sin, Normal(0, 1))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("pushfwd through `sin`, which is not in the §06 bijection registry"),
+        "{r}"
+    );
+}
+
+/// The emitted program of `post` for a model with a `pushfwd` map spelled
+/// `map`, as a prior field and as an observed law.
+fn bare_and_written(map: &str, base: &str, observed_base: &str) -> [flatppl_stan::StanProgram; 2] {
+    let opts = EmitOptions {
+        target: Some("post".to_string()),
+        ..Default::default()
+    };
+    let field = posterior(
+        &format!("rho ~ pushfwd({map}, {base})\ny ~ Normal(rho, 1)"),
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    );
+    let observed = posterior(
+        &format!("mu ~ Exponential(1)\ny ~ pushfwd({map}, {observed_base})"),
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    );
+    [field, observed].map(|source| {
+        let mut module = flatppl_syntax::parse(&source).expect("parse");
+        let diagnostics = flatppl_infer::infer(&mut module);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != flatppl_infer::Severity::Error),
+            "{source}: {diagnostics:?}"
+        );
+        flatppl_stan::emit(&module, &opts).unwrap_or_else(|r| panic!("{source}: {r}"))
+    })
+}
+
+#[test]
+fn a_bare_registry_name_prints_as_its_written_map() {
+    // §06 recognizes the registry maps by name: `pushfwd(log, M)` is
+    // `pushfwd(fn(log(_)), M)`, as a prior field and as an observed law.
+    let unbounded = ("Normal(0, 1)", "Normal(0, mu)");
+    let positive = ("Gamma(2, 1)", "Gamma(2, mu)");
+    let unit = ("Beta(2, 3)", "Beta(2, mu)");
+    for (name, (base, observed)) in [
+        ("exp", unbounded),
+        ("log", positive),
+        ("log10", positive),
+        ("log1p", positive),
+        ("expm1", unbounded),
+        ("logit", unit),
+        ("invlogit", unbounded),
+        ("probit", unit),
+        ("invprobit", unbounded),
+        ("atan", unbounded),
+        ("sinh", unbounded),
+        ("asinh", unbounded),
+        ("tanh", unbounded),
+        ("sqrt", positive),
+        ("neg", ("Exponential(2)", "Exponential(mu)")),
+    ] {
+        let bare = bare_and_written(name, base, observed);
+        let written = bare_and_written(&format!("fn({name}(_))"), base, observed);
+        for (b, w) in bare.iter().zip(&written) {
+            assert_eq!(b.code, w.code, "{name}");
+            assert_eq!(b.data, w.data, "{name}");
+        }
+    }
+}
+
+#[test]
+fn a_bare_name_outside_its_domain_refuses_as_its_written_map() {
+    let source = |map: &str| {
+        posterior(
+            &format!("rho ~ pushfwd({map}, Normal(0, 1))\ny ~ Normal(rho, 1)"),
             "lawof(record(rho = rho))",
             "kernelof(record(y = y), rho = rho)",
-        ));
-        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{name}: {r}");
-        assert!(
-            r.reason.contains(&format!(
-                "pushfwd through the bare name `{name}`; write `fn({name}(_))`"
-            )),
-            "{name}: {r}"
+        )
+    };
+    let (bare, written) = (refuse(&source("log")), refuse(&source("fn(log(_))")));
+    assert_eq!(
+        (&bare.kind, &bare.reason),
+        (&written.kind, &written.reason),
+        "{bare}"
+    );
+}
+
+#[test]
+fn a_bare_name_over_a_vector_law_is_an_inference_error_and_its_written_form_not_yet() {
+    // A scalar-domain name is no map of an array variate: inference reports
+    // it, naming `fn(exp.(_))`, which the emitter does not write yet.
+    let source = |map: &str| {
+        posterior(
+            &format!(
+                "mu ~ Normal(0, 1)\nv ~ pushfwd({map}, iid(Normal(mu, 1.0), 3))\ny ~ Normal(mu, 1)"
+            ),
+            "lawof(record(mu = mu))",
+            "kernelof(record(v = v, y = y), mu = mu)",
+        )
+        .replace("record(y = 0.5)", "record(v = [1.2, 0.5, 2.0], y = 0.5)")
+    };
+    let mut module = flatppl_syntax::parse(&source("exp")).expect("parse");
+    let diagnostics = flatppl_infer::infer_module(
+        &mut module,
+        &flatppl_infer::ModuleBundle::new(),
+        flatppl_infer::Level::Shape,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.severity == flatppl_infer::Severity::Error
+                && d.message
+                    .contains("Write the elementwise map `fn(exp.(_))`")),
+        "{diagnostics:?}"
+    );
+    for written in ["fn(broadcast(exp, _))", "fn(exp.(_))"] {
+        let written = refuse(&source(written));
+        assert_eq!(written.kind, RefusalKind::NotYetSupported, "{written}");
+    }
+}
+
+#[test]
+fn a_map_of_a_lower_dimensional_law_has_no_stan_form_but_a_uniform_scale() {
+    // §03/§06 fix the image's reference measure only for a uniform scale and
+    // shift of a stdsimplex or zerosum support; the rest has no density.
+    let source = |map: &str, base: &str, v: &str| {
+        posterior(
+            &format!("mu ~ Normal(0, 1)\nv ~ pushfwd({map}, {base})\ny ~ Normal(mu, 1)"),
+            "lawof(record(mu = mu))",
+            "kernelof(record(v = v, y = y), mu = mu)",
+        )
+        .replace("record(y = 0.5)", &format!("record(v = {v}, y = 0.5)"))
+    };
+    let dirichlet = "Dirichlet([2.0, 3.0, 4.0])";
+    let point = "[1.4, 1.6, 2.0]";
+    let lkj = "rowstack([[2.0, 0.0], [0.0, 2.0]])";
+    for (map, base, v) in [
+        ("fn(exp.(_))", dirichlet, point),
+        ("fn([2.0, 3.0, 4.0] .* _)", dirichlet, point),
+        ("fn(2.0 * _)", "LKJ(2, 2.0)", lkj),
+        ("fn(2.0 * _)", "LKJCholesky(2, 2.0)", lkj),
+    ] {
+        let r = refuse(&source(map, base, v));
+        assert_eq!(
+            r.kind,
+            RefusalKind::NonBijectivePushfwd,
+            "{map} {base}: {r}"
+        );
+        assert!(r.reason.contains("lower-dimensional support"), "{r}");
+    }
+    for map in [
+        "fn(2.0 .* _ .+ 1.0)",
+        "fn(2.0 * _ + [1.0, 1.0, 1.0])",
+        "neg",
+    ] {
+        let r = refuse(&source(map, dirichlet, point));
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{map}: {r}");
+    }
+    // A measure that is no law reaches the check through a log-density target,
+    // and a wrapper that keeps the support does not hide it.
+    let target = |m: &str| {
+        format!(
+            "y = elementof(cartpow(reals, 3))\nM = {m}\nlp = logdensityof(M, y)\n\
+             inputs = (y)\noutputs = (lp)\n"
+        )
+    };
+    for m in [
+        "pushfwd(fn(exp.(_)), Lebesgue(zerosum(3)))",
+        "pushfwd(fn(exp.(_)), Lebesgue(stdsimplex(3)))",
+        "pushfwd(fn(exp.(_)), normalize(Lebesgue(stdsimplex(3))))",
+        "pushfwd(fn(exp.(_)), logweighted(fn(-0.5 * sum(_ .^ 2)), Lebesgue(zerosum(3))))",
+    ] {
+        let r = refuse_with(&target(m), Some("lp"));
+        assert_eq!(r.kind, RefusalKind::NonBijectivePushfwd, "{m}: {r}");
+        assert!(r.reason.contains("lower-dimensional support"), "{r}");
+    }
+    let r = refuse_with(
+        &target("pushfwd(fn(2.0 .* _), Lebesgue(zerosum(3)))"),
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    // The support is the inferred value set: through `iid` and a binding too.
+    let nested = |m: &str| {
+        format!(
+            "y = elementof(cartpow(cartpow(reals, 3), 2))\nM = {m}\n\
+             lp = logdensityof(M, y)\ninputs = (y)\noutputs = (lp)\n"
+        )
+    };
+    for (source, never) in [
+        (
+            nested("pushfwd(fn(broadcast(fn(exp.(_)), _)), iid(Dirichlet([2.0, 3.0, 4.0]), 2))"),
+            true,
+        ),
+        (
+            nested("pushfwd(fn(2.0 .* _), iid(Dirichlet([2.0, 3.0, 4.0]), 2))"),
+            false,
+        ),
+        (
+            target("pushfwd(fn(exp.(_)), D)").replace("y =", "D = Dirichlet([2.0, 3.0, 4.0])\ny ="),
+            true,
+        ),
+    ] {
+        let r = refuse_with(&source, Some("lp"));
+        if never {
+            assert_eq!(r.kind, RefusalKind::NonBijectivePushfwd, "{source}: {r}");
+        } else {
+            assert_eq!(r.kind, RefusalKind::NotYetSupported, "{source}: {r}");
+        }
+    }
+}
+
+#[test]
+fn a_map_of_a_mapped_simplex_law_keeps_the_determinizer_class() {
+    // A bijection keeps the dimension of its support, and the uniform affine set
+    // is the determinizer's (`flatppl_infer::uniform_affine_steps`).
+    let target = |y: &str, m: &str| {
+        format!(
+            "D = Dirichlet([2.0, 3.0, 4.0])\ny = elementof({y})\nM = {m}\n\
+             lp = logdensityof(M, y)\ninputs = (y)\noutputs = (lp)\n"
+        )
+    };
+    let v3 = "cartpow(reals, 3)";
+    for (m, kind) in [
+        (
+            "pushfwd(fn(3.0 .* _), pushfwd(fn(2.0 .* _), D))",
+            RefusalKind::NotYetSupported,
+        ),
+        ("pushfwd(fn(_ ./ 2.0), D)", RefusalKind::NotYetSupported),
+        (
+            "pushfwd(fn(exp.(_)), pushfwd(fn(2.0 .* _), D))",
+            RefusalKind::NonBijectivePushfwd,
+        ),
+        (
+            "pushfwd(fn(exp.(_)), pushfwd(neg, D))",
+            RefusalKind::NonBijectivePushfwd,
+        ),
+    ] {
+        let r = refuse_with(&target(v3, m), Some("lp"));
+        assert_eq!(r.kind, kind, "{m}: {r}");
+    }
+    let dims =
+        "superpose(weighted(0.5, iid(Normal(0.0, 1.0), 2)), weighted(0.5, Dirichlet([1.0, 1.0])))";
+    let r = refuse_with(&target("cartpow(reals, 2)", dims), Some("lp"));
+    assert_eq!(r.kind, RefusalKind::MixedReference, "{r}");
+    assert!(r.reason.contains("different dimension"), "{r}");
+}
+
+#[test]
+fn a_bare_array_name_over_an_array_law_refuses_as_its_written_map() {
+    // `neg` takes scalars or arrays and `inv` a matrix: over an array law each
+    // bare name takes the path of `fn(name(_))`, with its refusal.
+    for (map, written, law, point) in [
+        (
+            "neg",
+            "fn(neg(_))",
+            "iid(Normal(mu, 1.0), 3)",
+            "[-1.2, -0.5, -2.0]",
+        ),
+        (
+            "inv",
+            "fn(inv(_))",
+            "Wishart(4.0, rowstack([[1.0, 0.2], [0.2, 1.0]]))",
+            "rowstack([[1.0, 0.1], [0.1, 1.0]])",
+        ),
+    ] {
+        let source = |m: &str| {
+            posterior(
+                &format!("mu ~ Normal(0, 1)\nv ~ pushfwd({m}, {law})\ny ~ Normal(mu, 1)"),
+                "lawof(record(mu = mu))",
+                "kernelof(record(v = v, y = y), mu = mu)",
+            )
+            .replace("record(y = 0.5)", &format!("record(v = {point}, y = 0.5)"))
+        };
+        let (bare, written) = (refuse(&source(map)), refuse(&source(written)));
+        assert_eq!(
+            (&bare.kind, &bare.reason),
+            (&written.kind, &written.reason),
+            "{map}: {bare}"
         );
     }
+}
+
+#[test]
+fn a_bare_name_over_a_discrete_base_refuses_as_its_written_map() {
+    let source = |exp: &str, neg: &str| {
+        posterior(
+            &format!("mu ~ Normal(0, 1)\ny ~ pushfwd({exp}, pushfwd({neg}, Poisson(3.0)))"),
+            "lawof(record(mu = mu))",
+            "kernelof(record(y = y), mu = mu)",
+        )
+    };
+    let bare = refuse(&source("exp", "neg"));
+    let written = refuse(&source("fn(exp(_))", "fn(neg(_))"));
+    assert_eq!(
+        (&bare.kind, &bare.reason),
+        (&written.kind, &written.reason),
+        "{bare}"
+    );
 }
 
 #[test]
@@ -1027,14 +1545,21 @@ fn locscale_truncated_scale_of_unknown_sign_is_not_yet() {
 }
 
 #[test]
-fn locscale_scale_of_unknown_sign_is_not_yet() {
+fn locscale_vector_shift_over_a_non_family_base_is_not_yet() {
     let r = refuse(&posterior(
-        "m ~ Normal(0, 1)\nsigma ~ locscale(Cauchy(0, 1), 0, m)\ny ~ Normal(sigma, 1)",
-        "lawof(record(m = m, sigma = sigma))",
-        "kernelof(record(y = y), m = m, sigma = sigma)",
+        "mu ~ Normal(0, 5)\ntau ~ Exponential(1)\n\
+         theta ~ locscale(iid(Exponential(1.0), 3), fill(mu, 3), tau)\ny ~ Normal(theta[1], 1.0)",
+        "lawof(record(theta = theta, mu = mu, tau = tau))",
+        "kernelof(record(y = y), theta = theta, mu = mu, tau = tau)",
     ));
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("scale of unknown sign"), "{r}");
+    assert!(
+        r.reason.contains(
+            "locscale with a vector shift over an iid Exponential law (only Normal, Cauchy, \
+             Logistic, Laplace and StudentT bases)"
+        ),
+        "{r}"
+    );
 }
 
 #[test]
@@ -1262,7 +1787,53 @@ fn custom_density_with_array_parameters_is_not_yet() {
         None,
     );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("array parameters"), "{r}");
+    assert!(
+        r.reason
+            .contains("the law `CrystalBall` broadcast over `m0`"),
+        "{r}"
+    );
+}
+
+/// A GLM custom row has no overload for an argument above its declared rank.
+#[test]
+fn custom_glm_broadcast_is_not_yet() {
+    let r = refuse_with(
+        "reg = standard_module(\"regression\", \"0.1\")\n\
+         x = rowstack([[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]])\n\
+         a ~ iid(Normal(0, 1), 2)\nbeta ~ iid(Normal(0, 1), 2)\n\
+         y ~ reg.GammaLogGLM.([x, x], a, [beta, beta], 2.0)\n\
+         L = likelihoodof(kernelof(record(y = y), a = a, beta = beta), \
+         record(y = [[0.5, 1.3, 2.2], [0.5, 1.3, 2.2]]))\n\
+         post = bayesupdate(L, lawof(record(a = a, beta = beta)))\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("the law `GammaLogGLM` broadcast over `x`"),
+        "{r}"
+    );
+}
+
+/// An iid of a GLM would flatten the response matrix into one GLM call.
+#[test]
+fn iid_of_a_glm_is_not_yet() {
+    let r = refuse_with(
+        "reg = standard_module(\"regression\", \"0.1\")\n\
+         x = rowstack([[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]])\n\
+         beta ~ iid(Normal(0, 1), 2)\n\
+         y ~ iid(reg.NormalGLM(x, 0.0, beta, 1.0), 2)\n\
+         L = likelihoodof(kernelof(record(y = y), beta = beta), \
+         record(y = [[0.0, 1.0, 2.0], [1.0, 0.0, 3.0]]))\n\
+         post = bayesupdate(L, lawof(record(beta = beta)))\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("an iid of the regression law `NormalGLM`"),
+        "{r}"
+    );
 }
 
 #[test]
@@ -2289,25 +2860,125 @@ fn observation_forms(head: &str, obs: &str) -> [String; 3] {
 /// The module the module-member tests load as `mod.flatppl`.
 const MODULE_LEN: &str = "flatppl_compat = \"0.1\"\nlen = 3\n";
 
+/// The Stan text of `source`, with `dependency` loaded as `mod.flatppl`.
+fn emit_with_module(source: &str, dependency: &str, target: Option<&str>) -> String {
+    let bundle = module_bundle(dependency);
+    let mut module = flatppl_syntax::parse(source).expect("parse");
+    let diagnostics =
+        flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+    let opts = EmitOptions {
+        target: target.map(str::to_string),
+        ..Default::default()
+    };
+    flatppl_stan::emit_with_bundle(&module, &bundle, &opts)
+        .unwrap_or_else(|r| panic!("{source}: {r}"))
+        .code
+}
+
 #[test]
-fn an_iid_count_from_a_module_member_is_not_yet() {
-    // The count's value is not in the module the emitter receives, so data of
-    // another length would score silently. Matching data refuses too.
-    for obs in ["[0.9, 1.1]", "[0.9, 1.1, 0.3]"] {
-        let head =
-            "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), m.len)\n";
-        for form in observation_forms(head, obs) {
-            let (r, located) = refuse_with_module(&form, MODULE_LEN, Some("post"));
-            assert_eq!(r.kind, RefusalKind::NotYetSupported, "{form}: {r}");
-            assert!(
-                r.reason.contains(
-                    "an `iid` count `m.len` that the Stan program cannot read as an integer"
-                ),
-                "{form}: {r}"
-            );
-            assert_eq!(located.as_deref(), Some("b"), "{form}: {r}");
-        }
+fn an_iid_count_from_a_module_member_sizes_the_data() {
+    // The member is imported, so the count is the program's own integer.
+    let head = "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), m.len)\n";
+    for form in observation_forms(head, "[0.9, 1.1, 0.3]") {
+        let code = emit_with_module(&form, MODULE_LEN, Some("post"));
+        assert!(code.contains("vector[len] b;"), "{form}:\n{code}");
     }
+    // Observed data of another length than the imported count is a static
+    // mismatch, which inference sees once the member is imported.
+    for form in observation_forms(head, "[0.9, 1.1]") {
+        let (r, _) = refuse_with_module(&form, MODULE_LEN, Some("post"));
+        assert_eq!(r.kind, RefusalKind::IllFormedModule, "{form}: {r}");
+        assert!(r.reason.contains("array of real [2]"), "{form}: {r}");
+    }
+}
+
+#[test]
+fn an_iid_count_from_a_clashing_module_member_keeps_its_bound() {
+    // The host's own `len` renames the import; the bound comes from the
+    // member's name in its module, and the import prints as `m_len`.
+    let head = "m = load_module(\"mod.flatppl\")\nlen = 0.5\na ~ Normal(len, 1)\n\
+                b ~ iid(Normal(a, 1), m.len)\n";
+    for form in observation_forms(head, "[0.9, 1.1, 0.3]") {
+        let code = emit_with_module(&form, MODULE_LEN, Some("post"));
+        assert!(code.contains("int<lower=0> m_len;"), "{form}:\n{code}");
+        assert!(code.contains("vector[m_len] b;"), "{form}:\n{code}");
+        assert!(code.contains("real len;"), "{form}:\n{code}");
+    }
+}
+
+#[test]
+fn a_member_behind_an_unprinted_alias_keeps_its_name() {
+    // `f_b = common.f_b` in the loaded module is an alias the program never
+    // prints, so the function it names keeps `f_b`: no prefix and no suffix.
+    let mut bundle = module_bundle(
+        "flatppl_compat = \"0.1\"\ncommon = load_module(\"common.flatppl\", c = c_scaling)\n\
+         c_scaling = 5\nf_b = common.f_b\ntheta1 ~ Normal(0, 1)\ntheta2 ~ Exponential(1)\n\
+         a = common.f_a(theta2)\nb = f_b(theta1, theta2)\nobs ~ iid(Normal(mu = a, sigma = b), 3)\n\
+         joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))\n\
+         posterior = restrict(joint_model, record(obs = [1.2, 3.4, 5.1]))\n",
+    );
+    bundle.insert(
+        "common.flatppl",
+        std::sync::Arc::new(
+            flatppl_syntax::parse(
+                "flatppl_compat = \"0.1\"\nc = external(reals)\nf_a = par -> c * par\n\
+                 f_b = fn(abs(_) * _)\n",
+            )
+            .expect("parse common"),
+        ),
+    );
+    let mut module = flatppl_syntax::parse(
+        "flatppl_compat = \"0.1\"\nm = load_module(\"mod.flatppl\")\n\
+         lp = logdensityof(m.posterior, record(theta1 = 0.5, theta2 = 1.0))\n",
+    )
+    .expect("parse");
+    let diagnostics =
+        flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+    let opts = EmitOptions {
+        target: Some("lp".to_string()),
+        ..Default::default()
+    };
+    let code = flatppl_stan::emit_with_bundle(&module, &bundle, &opts)
+        .unwrap_or_else(|r| panic!("{r}"))
+        .code;
+    assert!(code.contains("real f_a(real par, int c_scaling)"), "{code}");
+    assert!(code.contains("real f_b(real arg1, real arg2)"), "{code}");
+    assert!(code.contains("real b = f_b(theta1, theta2);"), "{code}");
+    assert!(!code.contains("m_f_b"), "{code}");
+}
+
+#[test]
+fn a_member_from_several_instances_prints_with_each_alias() {
+    // One member name from three instances: every one is prefixed, so the
+    // text does not depend on which instance was imported first.
+    let code = emit_with_module(
+        "flatppl_compat = \"0.1\"\nm1 = load_module(\"mod.flatppl\", c = 1.0)\nm2 = load_module(\"mod.flatppl\", c = 2.0)\n\
+         m3 = load_module(\"mod.flatppl\", c = 3.0)\nx = elementof(reals)\n\
+         lp = logdensityof(m1.M, x) + logdensityof(m2.M, x) + logdensityof(m3.M, x)\n\
+         inputs = x\noutputs = lp\n",
+        "flatppl_compat = \"0.1\"\nc = external(reals)\nM = Normal(c, 1.0)\n",
+        Some("lp"),
+    );
+    for k in 1..=3 {
+        assert!(code.contains(&format!("real m{k}_c;")), "{code}");
+        assert!(
+            code.contains(&format!("x ~ normal(m{k}_c, 1.0);")),
+            "{code}"
+        );
+    }
+    assert!(!code.contains("real c;"), "{code}");
 }
 
 #[test]
@@ -2513,13 +3184,42 @@ fn an_iid_count_from_an_untyped_load_is_not_yet() {
 }
 
 #[test]
-fn an_iid_shape_with_a_module_member_is_not_yet() {
+fn an_iid_shape_with_a_module_member_sizes_the_data() {
     let head =
         "m = load_module(\"mod.flatppl\")\na ~ Normal(0, 1)\nb ~ iid(Normal(a, 1), [2, m.len])\n";
-    let [explicit, ..] = observation_forms(head, "rowstack([[1.0, 2.0], [3.0, 4.0]])");
-    let (r, _) = refuse_with_module(&explicit, MODULE_LEN, Some("post"));
+    let [explicit, ..] = observation_forms(head, "rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])");
+    let code = emit_with_module(&explicit, MODULE_LEN, Some("post"));
+    assert!(code.contains("matrix[2, len] b;"), "{code}");
+}
+
+#[test]
+fn a_refusal_inside_a_module_member_is_located_at_its_reader() {
+    // The member is imported under its own name; the refusal names the host
+    // binding that reads it, never a binding the user did not write here.
+    let (r, located) = refuse_with_module(
+        "m = load_module(\"mod.flatppl\")\nx = elementof(reals)\n\
+         lp = logdensityof(m.W, x)\ninputs = x\noutputs = lp\n",
+        "flatppl_compat = \"0.1\"\nW = Dirac(0.5)\n",
+        Some("lp"),
+    );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("an `iid` count `m.len`"), "{r}");
+    assert!(r.reason.contains("the law `Dirac` in this form"), "{r}");
+    assert_eq!(located.as_deref(), Some("lp"), "{r}");
+}
+
+#[test]
+fn an_applied_module_kernel_is_not_yet() {
+    // The imported `functionof` law applied to an argument is the local form
+    // the emitter does not write yet.
+    let (r, located) = refuse_with_module(
+        "m = load_module(\"mod.flatppl\")\nlp = logdensityof(m.obs_kernel(0.0), 0.5)\n",
+        "flatppl_compat = \"0.1\"\ncenter = elementof(reals)\n\
+         obs_kernel = functionof(Normal(mu = center, sigma = 1.0), center = center)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a law from a user callable"), "{r}");
+    assert_eq!(located.as_deref(), Some("lp"), "{r}");
 }
 
 #[test]
@@ -2547,27 +3247,32 @@ fn an_lkj_dimension_from_an_untyped_load_is_not_yet() {
 fn a_multinomial_count_the_program_cannot_read_is_not_yet() {
     // The guard `sum(y) != n` needs n: a count with no Stan form refuses by
     // name, never drops the guard.
-    for (head, count) in [
-        ("m = load_module(\"mod.flatppl\")\n", "m.len"),
-        ("k = load_data(\"n.json\", anything)\n", "k"),
-    ] {
-        let (r, _) = refuse_with_module(
-            &format!(
-                "{head}p ~ Dirichlet([1.0, 1.0, 1.0])\nc ~ Multinomial({count}, p)\n\
-                 prior = lawof(record(p = p))\nK = kernelof(record(c = c), p = p)\n\
-                 post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)\n"
-            ),
-            MODULE_LEN,
-            Some("post"),
-        );
-        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{count}: {r}");
-        assert!(
-            r.reason.contains(&format!(
-                "a `Multinomial` count `{count}` that the Stan program cannot read as an integer"
-            )),
-            "{count}: {r}"
-        );
-    }
+    let r = refuse_with(
+        "k = load_data(\"n.json\", anything)\np ~ Dirichlet([1.0, 1.0, 1.0])\n\
+         c ~ Multinomial(k, p)\nprior = lawof(record(p = p))\n\
+         K = kernelof(record(c = c), p = p)\n\
+         post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("a `Multinomial` count `k` that the Stan program cannot read as an integer"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_multinomial_count_from_a_module_member_is_guarded() {
+    let code = emit_with_module(
+        "m = load_module(\"mod.flatppl\")\np ~ Dirichlet([1.0, 1.0, 1.0])\n\
+         c ~ Multinomial(m.len, p)\nprior = lawof(record(p = p))\n\
+         K = kernelof(record(c = c), p = p)\n\
+         post = bayesupdate(likelihoodof(K, record(c = [1, 0, 2])), prior)\n",
+        MODULE_LEN,
+        Some("post"),
+    );
+    assert!(code.contains("if (sum(c) != len)"), "{code}");
 }
 
 #[test]
@@ -2620,4 +3325,15 @@ fn an_iid_of_an_iid_of_a_multinomial_is_not_yet() {
     );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("a nested iid of this law"), "{r}");
+}
+
+#[test]
+fn a_refusal_in_an_optimised_value_is_located_in_the_written_binding() {
+    let model = "m = elementof(cartpow(reals, [4, 3]))\n\
+                 z = sum(sum(transpose(transpose(m))))\n\
+                 lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))\n\
+                 inputs = m\noutputs = lp\n";
+    let (r, located) = refuse_located(model, Some("lp"));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert_eq!(located.as_deref(), Some("z"), "{r}");
 }

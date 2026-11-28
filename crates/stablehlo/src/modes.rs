@@ -75,11 +75,11 @@ use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
 };
 
-use crate::EmitOptions;
-use crate::emitter::Emitter;
+use crate::emitter::{BoundTuple, Emitter};
 use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 use crate::types::{mlir_type_of, mlir_type_of_ty};
+use crate::{EmitOptions, RulePolicy};
 
 /// The compilation ABI declared by the reserved `inputs = …` / `outputs = …`
 /// top-level bindings (design doc
@@ -277,9 +277,8 @@ pub(crate) fn emit_logdensity_abi(
     m: &Module,
     abi: &Abi,
     opts: &EmitOptions,
+    rules: &RulePolicy,
 ) -> Result<String, EmitError> {
-    let mut e = Emitter::with_options(m, opts);
-
     check_query_inputs(m, &abi.outputs, &abi.inputs.iter().copied().collect(), &[])?;
 
     if abi.outputs.is_empty() {
@@ -288,6 +287,15 @@ pub(crate) fn emit_logdensity_abi(
         ));
     }
 
+    let optimised = crate::optimise_query_with_rules(m, opts, rules);
+    let optimised_outputs;
+    let (m, outputs) = if let Some((m, root)) = &optimised {
+        optimised_outputs = tuple_elems(m, *root);
+        (m, optimised_outputs.as_slice())
+    } else {
+        (m, abi.outputs.as_slice())
+    };
+    let mut e = Emitter::for_query_with_rules(m, opts, rules);
     let mut args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
     let mut next_arg = 0usize;
     for &sym in &abi.inputs {
@@ -296,14 +304,10 @@ pub(crate) fn emit_logdensity_abi(
     check_arity(abi, args.len())?;
 
     let lower_outputs = |e: &mut Emitter| -> Result<Vec<Value>, EmitError> {
-        let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
-        for &node in &abi.outputs {
+        let mut rets_vals: Vec<Value> = Vec::with_capacity(outputs.len());
+        for &node in outputs {
             let before = rets_vals.len();
-            if let Some(indices) = crate::indices::outputs(e, node) {
-                rets_vals.extend(indices?);
-            } else {
-                lower_output(e, node, &mut rets_vals)?;
-            }
+            lower_output(e, node, &mut rets_vals)?;
             // A drawn successor state is threaded by `@sample` (spec §07 rng ABI,
             // §13 output reduction). A key computed from a seed is an ordinary value.
             if rets_vals[before..].iter().any(|v| v.ty == MlirTy::Key) && reaches_sample(m, node) {
@@ -318,7 +322,7 @@ pub(crate) fn emit_logdensity_abi(
         Ok(rets_vals)
     };
     // odesolve sensitivity control lowers the outputs twice (`ode.rs`).
-    let rets_vals = e.lower_outputs_with_ode_sensitivities(&abi.outputs, lower_outputs)?;
+    let rets_vals = e.lower_outputs_with_ode_sensitivities(outputs, lower_outputs)?;
     let rets: Vec<&Value> = rets_vals.iter().collect();
     Ok(e.finish("logdensity", &args, &rets))
 }
@@ -370,9 +374,8 @@ pub(crate) fn emit_sample_abi(
     m: &Module,
     abi: &Abi,
     opts: &EmitOptions,
+    rules: &RulePolicy,
 ) -> Result<String, EmitError> {
-    let mut e = Emitter::with_options(m, opts);
-
     if abi.outputs.is_empty() {
         return Err(EmitError::whole(
             "`outputs` ABI binding is missing or empty; a sample query needs at least one \
@@ -391,6 +394,7 @@ pub(crate) fn emit_sample_abi(
         )
     })?;
     let key_name = "%key".to_string();
+    let mut e = Emitter::for_query_with_rules(m, opts, rules);
     let resolved_src = resolve_self_ref(m, src);
     let source_input = match m.node(src) {
         Node::Ref(Ref {
@@ -512,7 +516,7 @@ pub(crate) fn emit_sample_abi(
 }
 
 /// Whether `root` reads a `builtin_sample` draw.
-fn reaches_sample(m: &Module, root: NodeId) -> bool {
+pub(crate) fn reaches_sample(m: &Module, root: NodeId) -> bool {
     let mut pending = vec![root];
     let mut seen = HashSet::new();
     while let Some(node) = pending.pop() {
@@ -604,9 +608,27 @@ fn lower_sample_output(
     lower_output(e, resolved, out)
 }
 
-/// Append the result(s) of one output: one per tensor leaf, depth-first in
-/// declared field order, so a record output becomes one result per field.
+/// Append the tensor leaves of an output, depth-first in tuple or field order.
 fn lower_output(e: &mut Emitter, node: NodeId, out: &mut Vec<Value>) -> Result<(), EmitError> {
+    if matches!(e.type_of(node), Some(Type::Tuple(_))) {
+        if let Some(input) = e.tuple_input(node) {
+            input.leaves(out);
+            return Ok(());
+        }
+        let resolved = e.resolve_tuple_projections(node);
+        if let Some(indices) = crate::indices::outputs(e, resolved) {
+            out.extend(indices?);
+            return Ok(());
+        }
+        if let Node::Call(call) = e.node(resolved)
+            && matches!(call.head, CallHead::Builtin(head) if e.resolve(head) == "tuple")
+        {
+            for item in call.args.clone() {
+                lower_output(e, item, out)?;
+            }
+            return Ok(());
+        }
+    }
     let start = out.len();
     e.lower_value(node)?.leaves(out);
     if out.len() == start {
@@ -624,7 +646,8 @@ fn lower_output(e: &mut Emitter, node: NodeId, out: &mut Vec<Value>) -> Result<(
 /// `value` slot; every other query shape (a value-terminal `get0(sample, 0)`,
 /// a `record(...)`, a bare ref) is already the value and is returned unchanged.
 fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
-    if let Node::Call(c) = m.node(query_rhs)
+    if m.is_sample_result(query_rhs)
+        && let Node::Call(c) = m.node(query_rhs)
         && let CallHead::Builtin(sym) = c.head
         && m.resolve(sym) == "tuple"
         && c.args.len() == 2
@@ -871,6 +894,12 @@ fn bind_input(
         ));
     }
 
+    if let Some(ty @ Type::Tuple(_)) = m.type_of(rhs) {
+        let mut path = vec![m.resolve(sym).to_owned()];
+        let value = bind_tuple_leaves(m, e, rhs, ty, &mut path, opts, args, next_arg)?;
+        e.bind_tuple_input(rhs, value);
+        return Ok(());
+    }
     if let Some(columns) = aggregate_columns(m, rhs) {
         // An aggregate with no columns would contribute no argument at all and
         // shrink the emitted arity below the declared one — refuse instead.
@@ -909,6 +938,31 @@ fn bind_input(
     );
     args.push((ssa, ty, elem));
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_tuple_leaves(
+    m: &Module,
+    e: &mut Emitter,
+    rhs: NodeId,
+    ty: &Type,
+    path: &mut Vec<String>,
+    opts: &EmitOptions,
+    args: &mut Vec<(String, MlirTy, ElemKind)>,
+    next_arg: &mut usize,
+) -> Result<BoundTuple, EmitError> {
+    let Type::Tuple(items) = ty else {
+        return bind_leaves(m, e, rhs, ty, path, opts, args, next_arg).map(BoundTuple::Value);
+    };
+    let mut values = Vec::with_capacity(items.len());
+    for (index, ty) in items.iter().enumerate() {
+        path.push((index + 1).to_string());
+        values.push(bind_tuple_leaves(
+            m, e, rhs, ty, path, opts, args, next_arg,
+        )?);
+        path.pop();
+    }
+    Ok(BoundTuple::Items(values))
 }
 
 /// Allocate one argument per tensor leaf of `ty`, depth-first in declared field

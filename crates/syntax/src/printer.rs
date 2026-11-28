@@ -22,8 +22,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use flatppl_core::{
-    Axis, Call, CallHead, Doc, Inputs, Markup, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar,
-    Symbol, Variance,
+    Axis, BindingId, Call, CallHead, Doc, Inputs, Markup, Module, NamedArg, Node, NodeId, Ref,
+    RefNs, Scalar, Span, Symbol, Variance,
 };
 
 use crate::parser::is_placeholder;
@@ -55,7 +55,8 @@ pub fn print(module: &Module) -> String {
 /// Render `module` as canonical FlatPPL text at the given [`Syntax`] level
 /// (no trailing newline).
 pub fn print_with(module: &Module, syntax: Syntax) -> String {
-    let printer = Printer::new(module, syntax);
+    let module = module.for_serialization();
+    let printer = Printer::new(&module, syntax);
     let mut out = String::new();
     for (idx, (_, binding)) in module.bindings().enumerate() {
         if idx > 0 {
@@ -67,6 +68,59 @@ pub fn print_with(module: &Module, syntax: Syntax) -> String {
         }
         out.push_str(&printer.binding_text(binding));
     }
+    out
+}
+
+/// Render one right-hand side in full syntax at `column`, without adding
+/// declarations or surrounding statement syntax.
+#[doc(hidden)]
+pub fn print_expression(module: &Module, id: NodeId, column: usize) -> String {
+    Printer::new(module, Syntax::Full).body_w(id, column)
+}
+
+/// Apply assignment rewrites to the original source while retaining its
+/// statement forms. `assignments` comes from `parse_with_assignment_spans`.
+/// The rewritten module retains the original binding IDs.
+pub fn print_assignment_rewrites(
+    source: &str,
+    assignments: &[(BindingId, Span)],
+    original: &Module,
+    rewritten: &Module,
+) -> String {
+    let rewritten = rewritten.for_serialization();
+    let printer = Printer::new(&rewritten, Syntax::Full);
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0;
+    let mut references = HashSet::new();
+    for &(binding, span) in assignments {
+        let rhs = rewritten.binding(binding).rhs;
+        if original.binding(binding).rhs == rhs {
+            continue;
+        }
+        // Decomposition and serialization can introduce temporary bindings
+        // that have no declaration in the original source.
+        references.clear();
+        rewritten.collect_referenced_names(rhs, &mut references);
+        if references.iter().any(|&name| {
+            rewritten
+                .binding_by_name(name)
+                .is_some_and(|id| rewritten.binding(id).synthetic)
+        }) {
+            continue;
+        }
+        let start = span.start as usize;
+        let end = span.end as usize;
+        let col = source[..start]
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .count();
+        out.push_str(&source[cursor..start]);
+        out.push_str(&printer.body_w(rhs, col));
+        cursor = end;
+    }
+    out.push_str(&source[cursor..]);
     out
 }
 
