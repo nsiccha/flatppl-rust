@@ -85,6 +85,13 @@ impl Emitter<'_> {
         if let Some(value) = self.bound_field(container, name) {
             return Ok(value);
         }
+        if let Some(BoundTuple::Value(Lowered::Record(fields))) = self.tuple_input(container) {
+            return fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| unknown_field(container, name));
+        }
         let resolved = self.resolve_tuple_projections(container);
         if let Some(value) = self.bound_field(resolved, name) {
             return Ok(value);
@@ -175,7 +182,11 @@ impl Emitter<'_> {
                 found.ok_or_else(|| unknown_field(container, name))
             }
             ("scan" | "reduce", _) => {
-                let parts = self.lower_sequence(resolved, &args, head == "reduce")?;
+                let parts = if head == "scan" {
+                    self.lower_scan_histories(resolved, &args)?
+                } else {
+                    self.lower_sequence(resolved, &args, true)?
+                };
                 let index = parts
                     .fields
                     .as_ref()

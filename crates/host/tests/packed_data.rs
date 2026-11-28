@@ -152,9 +152,84 @@ fn packed_vectors_lower_as_their_literal_vectors() {
     let plain = "mu=elementof(reals)\ninputs=mu\n\
                  outputs=logdensityof(Normal.(mu,[1.0,2.0,0.5]),[0.25,-1.5,3.0])"
         .to_string();
-    for source in [partition, histogram, repeated, regression, plain] {
+    // Seventy sites with five small counts each: an indexed Poisson score the
+    // emitter's rules partition by site.
+    let sites = |cell: &dyn Fn(usize) -> String| (0..350).map(cell).collect::<Vec<_>>().join(",");
+    let indexed_poisson = format!(
+        "alpha=elementof(cartpow(reals,70))\nsite=[{}]\ninputs=alpha\n\
+         outputs=logdensityof(Poisson.(exp.(alpha[site])),[{}])",
+        sites(&|i| (i % 70 + 1).to_string()),
+        sites(&|i| ((i * 7) % 5).to_string()),
+    );
+    // A fixed vector stacked as the single column of a matrix.
+    let stacked = "x=[0.5,1.5,2.5]\nb=elementof(cartpow(reals,1))\ninputs=b\n\
+                   outputs=sum(colstack([x])*b)"
+        .to_string();
+    for source in [
+        partition,
+        histogram,
+        repeated,
+        regression,
+        plain,
+        indexed_poisson,
+        stacked,
+    ] {
         assert_eq!(reduced(&source, false), reduced(&source, true), "{source}");
     }
+}
+
+/// Loaded observations are fixed data in the packed spelling. A rule that asks
+/// for fixed observations takes them as it takes the written vector: eighty
+/// distinct predictor rows are more groups than runtime observations may have.
+#[test]
+fn loaded_observations_take_the_rules_of_written_ones() -> Result<(), Box<dyn std::error::Error>> {
+    use flatppl_host::{Context, ReductionOutcome};
+    let rows = 640;
+    let cells = |cell: &dyn Fn(usize) -> String| (0..rows).map(cell).collect::<Vec<_>>().join(",");
+    let g = cells(&|i| ((i / 8) % 40 + 1).to_string());
+    let x = cells(&|i| format!("{:.1}", (i / 320) as f64));
+    let y = cells(&|i| format!("{:.4}", (0.37 * i as f64).sin()));
+    let path =
+        std::env::temp_dir().join(format!("flatppl-packed-rows-{}.json", std::process::id()));
+    std::fs::write(&path, format!("{{\"g\":[{g}],\"x\":[{x}],\"y\":[{y}]}}"))?;
+    let written = format!("data=record(g=[{g}],x=[{x}],y=[{y}])");
+    let loaded = format!(
+        "data=load_data({path:?},cartprod(g=cartpow(posintegers,{rows}),\
+         x=cartpow(reals,{rows}),y=cartpow(reals,{rows})))"
+    );
+    let mut context = Context::default();
+    for data in [written, loaded] {
+        let query = context.parse(
+            &format!(
+                "mu=elementof(cartpow(reals,40))\nb=elementof(reals)\nsigma=elementof(posreals)\n\
+                 {data}\ninputs=(mu,b,sigma)\n\
+                 outputs=logdensityof(Normal.(mu[data.g] .+ b .* data.x,sigma),data.y)"
+            ),
+            None,
+            None,
+        )?;
+        let report = context.analyze_query(&query, &[], false, true)?;
+        let partition =
+            report
+                .reductions
+                .decisions
+                .iter()
+                .find_map(|decision| match &decision.outcome {
+                    ReductionOutcome::Reduced {
+                        rule: "repeated predictor rows",
+                        partition,
+                    } => partition.as_ref(),
+                    _ => None,
+                });
+        assert_eq!(
+            partition.map(|p| (p.observations, p.groups, p.singletons)),
+            Some((640, 80, 0)),
+            "{}",
+            &data[..40]
+        );
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
 }
 
 #[test]

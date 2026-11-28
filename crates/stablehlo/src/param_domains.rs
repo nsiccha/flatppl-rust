@@ -15,6 +15,7 @@
 //! their declared sets are not enforced at the ABI.
 
 use flatppl_infer::ParamSet;
+use flatppl_optimise::{SimplexRowCheck, plan_simplex_rows_with_rules};
 
 use super::constants::element_count;
 use super::*;
@@ -40,14 +41,45 @@ impl Emitter<'_> {
         }
     }
 
+    /// XLA keeps a batched one-element dot as a library call once it has a
+    /// second reader, which costs the gradient more than the product itself.
+    /// A check reads such a product, and a chain of them, as plain multiplies
+    /// of the leaf factors, so no dot gains a reader. The multiplies feed only
+    /// a comparison, so they have no adjoint to preserve.
+    fn product_from_factors(&mut self, value: &Value) -> Value {
+        let Some((a, b)) = self.elementwise_dot_operands(value) else {
+            return value.clone();
+        };
+        let a = self.product_from_factors(&a);
+        let b = self.product_from_factors(&b);
+        let ty = a.ty.render(self.dtype, a.elem);
+        let ssa = self.pure_like(
+            format!("stablehlo.multiply {}, {} : {ty}", a.ssa, b.ssa),
+            &a,
+        );
+        let product = Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: a.elem,
+        };
+        if product.ty == value.ty {
+            product
+        } else {
+            self.reshape(&product, value.ty.clone())
+        }
+    }
+
     pub(crate) fn check_finite_parameter(
         &mut self,
         id: NodeId,
         name: &str,
         value: &Value,
     ) -> Result<(), EmitError> {
-        if let Some(values) = self.constant_elements(value) {
-            if values.iter().any(|v| !v.is_finite()) {
+        let finite = self
+            .stored_constant_finite(value)
+            .or_else(|| Some(self.constant_elements(value)?.iter().all(|v| v.is_finite())));
+        if let Some(finite) = finite {
+            if !finite {
                 return Err(EmitError::at(
                     id,
                     format!("regression parameter '{name}' must be finite"),
@@ -65,8 +97,9 @@ impl Emitter<'_> {
         if self.region_depth == 0 {
             self.checked_parameters.insert(key);
         }
-        let magnitude = self.abs(value);
-        let infinity = self.inf_like(value);
+        let value = self.product_from_factors(value);
+        let magnitude = self.abs(&value);
+        let infinity = self.inf_like(&value);
         let finite = self.compare("LT", &magnitude, &infinity);
         self.record_runtime_error(&finite, PARAMETER_DOMAIN_STATUS);
         Ok(())
@@ -120,6 +153,12 @@ impl Emitter<'_> {
                 continue;
             }
             if !self.check_parameters {
+                continue;
+            }
+            // A callback parameter may be a view of an invlogit whose source
+            // expression is outside this lexical scope. Its range is still
+            // [0, 1], including the limits at infinite logits.
+            if set == ParamSet::UnitInterval && self.invlogit_operand(&value).is_some() {
                 continue;
             }
             // A check outside every region holds wherever the value is used.
@@ -493,8 +532,42 @@ impl Emitter<'_> {
         let p = self.convert(&gathered.rows, ElemKind::Real);
         let row_least = self.reduce_axis("stablehlo.minimum", pos_inf_literal(self.dtype), &p, 1);
         let row_total = self.reduce_sum_last_axis(&p);
-        let least = self.gather(&row_least, &gathered.index, 0);
-        let total = self.gather(&row_total, &gathered.index, 0);
+        let selector = if self.sufficient_statistics
+            && self.target == crate::Target::Cpu
+            && let [Some(rows), Some(_)] = shape(&p.ty)
+            && let [Some(occurrences)] = shape(&gathered.index.ty)
+        {
+            match plan_simplex_rows_with_rules(
+                *rows,
+                *occurrences,
+                |at| match self.fixed_scalar_at(&gathered.index, at)? {
+                    Scalar::Int(row) => Some(row),
+                    _ => None,
+                },
+                &self.rules,
+            ) {
+                Some(SimplexRowCheck::All) => None,
+                Some(SimplexRowCheck::Select(rows)) => {
+                    let ty = MlirTy::Ranked(vec![Some(rows.len() as u64)]);
+                    let values = rows.into_iter().map(Scalar::Int).collect();
+                    Some(
+                        self.folded_constant(values, ty, Axes::default())
+                            .unwrap_or_else(|| gathered.index.clone()),
+                    )
+                }
+                None => Some(gathered.index.clone()),
+            }
+        } else {
+            Some(gathered.index.clone())
+        };
+        let (least, total) = if let Some(selector) = selector {
+            (
+                self.gather(&row_least, &selector, 0),
+                self.gather(&row_total, &selector, 0),
+            )
+        } else {
+            (row_least, row_total)
+        };
         let zero = self.scalar(0.0);
         let least = self.per_call(&least, false);
         let negative = self.compare("LT", &least, &zero);

@@ -643,28 +643,10 @@ impl<'m> Emitter<'m> {
 
     /// The map of `pushfwd(f, M)`, or of a derived prior field, as its
     /// body, its input and M.
-    /// A built-in name as the map (`pushfwd(log, M)`) is not supported yet:
-    /// inference leaves its variate untyped.
-    pub(super) fn bare_pushfwd_map(&self, m: NodeId) -> Result<()> {
-        let m = self.resolve(m);
-        if self.head(m) == Some("pushfwd")
-            && let Some(&f) = self.call(m).unwrap().args.first()
-            && let Node::Const(name) = self.m.node(self.resolve(f))
-        {
-            let name = self.name(*name);
-            return Err(Refusal::not_yet(
-                Some(m),
-                format!("pushfwd through the bare name `{name}`; write `fn({name}(_))`"),
-            ));
-        }
-        Ok(())
-    }
-
     fn pushfwd_parts(&mut self, m: NodeId) -> Result<(NodeId, Ref, NodeId)> {
         if let Some(&parts) = self.derived.get(&m) {
             return Ok(parts);
         }
-        self.bare_pushfwd_map(m)?;
         self.pushfwd_projection(m)?;
         let c = self.call(m).unwrap();
         if c.args.len() != 2 || !c.named.is_empty() {
@@ -681,8 +663,100 @@ impl<'m> Emitter<'m> {
         Ok((body, x, base))
     }
 
+    /// `pushfwd(f, M)` of a law on a lower-dimensional support has a density
+    /// only where §03 and §06 fix the image's reference measure: a uniform
+    /// scale and shift of a `stdsimplex(n)` or `zerosum(n)` support. The
+    /// support is read by `flatppl_infer::measure_chart`, as in the determinizer:
+    /// a map's base through any depth, `LKJ` and `LKJCholesky` by name.
+    fn lower_dimensional(&mut self, m: NodeId) -> Result<()> {
+        use flatppl_infer::MeasureChart;
+        let Some(c) = self.call(m).filter(|_| self.head(m) == Some("pushfwd")) else {
+            return Ok(());
+        };
+        let [f, base] = c.args[..] else {
+            return Ok(());
+        };
+        // A point mass beside a continuous law keeps the mixture refusals of its
+        // own law (`mixture.rs`), so it never reaches a volume element here.
+        let chart = match flatppl_infer::measure_chart(self.m, base) {
+            MeasureChart::Deficit(0) | MeasureChart::PointMass | MeasureChart::PointMassMix => {
+                return Ok(());
+            }
+            MeasureChart::Deficit(_) => true,
+            MeasureChart::NoReference | MeasureChart::MixedDimension => false,
+        };
+        if chart && self.uniform_affine(f)? {
+            return Ok(());
+        }
+        Err(Refusal::new(
+            RefusalKind::NonBijectivePushfwd,
+            Some(m),
+            "pushfwd",
+            "the image of a law on a lower-dimensional support has no density: §03 and §06 fix \
+             its reference measure only for a stdsimplex(n) or zerosum(n) support under a \
+             uniform scale and shift (a .* x .+ b, scalar a)",
+        ))
+    }
+
+    /// `true` when `f` is `neg` or one of the uniform affine maps the determinizer
+    /// derives (`flatppl_infer::uniform_affine_steps`), so one map takes one class.
+    fn uniform_affine(&mut self, f: NodeId) -> Result<bool> {
+        if let Node::Const(name) = self.m.node(self.resolve(f)) {
+            return Ok(self.name(*name) == "neg");
+        }
+        let Some(fun) = self.user_callee(f) else {
+            return Ok(false);
+        };
+        let (body, entries) = self.callable_parts(fun)?;
+        let [(_, x)] = entries[..] else {
+            return Ok(false);
+        };
+        Ok(flatppl_infer::uniform_affine_steps(
+            self.m,
+            body,
+            &|n| self.resolve(n),
+            &|n| matches!(self.m.node(n), Node::Ref(r) if *r == x),
+            &|n| self.reads(n, x),
+            &|n| self.shape(n).is_some_and(|s| s.rank == 0),
+        )
+        .is_some())
+    }
+
     /// The bijection of `pushfwd(f, M)` and M.
     fn bijection(&mut self, m: NodeId) -> Result<(Bijection, NodeId)> {
+        self.lower_dimensional(m)?;
+        // A built-in name as the map (`pushfwd(log, M)`, §06: engines
+        // recognize the maps by name) is the one-step chain of that map.
+        if !self.derived.contains_key(&m)
+            && let Some(c) = self.call(m)
+            && let [f, base] = c.args[..]
+            && c.named.is_empty()
+            && let Node::Const(name) = self.m.node(self.resolve(f))
+        {
+            // A scalar-domain name over an array variate is an inference
+            // error, written `fn(name.(_))`. `neg` and a name outside the
+            // registry take the path of `fn(name(_))`.
+            let name = self.name(*name);
+            let step = match name {
+                "sqrt" => Step::Pow(0.5),
+                "neg" => Step::Affine(Affine {
+                    a: lit(-1.0),
+                    b: lit(0.0),
+                }),
+                _ => match STEPS.iter().find(|r| r.name == name) {
+                    Some(row) => Step::Row(row),
+                    None => {
+                        return Err(Refusal::not_yet(
+                            Some(m),
+                            format!(
+                                "pushfwd through `{name}`, which is not in the §06 bijection registry"
+                            ),
+                        ));
+                    }
+                },
+            };
+            return Ok((Bijection { steps: vec![step] }, base));
+        }
         let (body, x, base) = self.pushfwd_parts(m)?;
         let Some(steps) = self.steps(body, x, m)? else {
             return Err(Refusal::new(

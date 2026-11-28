@@ -1,179 +1,205 @@
-//! A prepared compile runs the data-only setup of fixed-data likelihood
-//! summaries once, in `Export::preparation`, instead of on every call.
+use flatppl_host::{BatchSpec, Context, Dtype, EmitOptions, Export, Schema, Target};
 
-use std::path::PathBuf;
-
-use flatppl_host::{BatchSpec, Context, Dtype, EmitOptions, Export, LoadedModule, Schema};
-
-fn directory(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "flatppl-host-prepared-{name}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
-}
-
-fn options() -> EmitOptions {
-    EmitOptions {
-        dtype: Dtype::F64,
-        ..Default::default()
-    }
-}
-
-fn leaves(schema: &Schema) -> usize {
-    match schema {
-        Schema::Tensor { .. } => 1,
-        Schema::Record { fields } | Schema::Table { fields, .. } => {
-            fields.iter().map(|f| leaves(&f.value)).sum()
+#[test]
+fn grouped_normal_scale_follows_the_scoring_target_in_inline_and_prepared_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "a=elementof(cartpow(reals,2))\ns=elementof(posreals)\ng=[1,2,1,2]\ninputs=(a,s)\noutputs=logdensityof(Normal.(a[g],s),[0.4,1.0,1.3,2.0])", None, None)?;
+    let explicit = context.prepare_likelihood(&query, &[])?;
+    for target in [Target::Cpu, Target::Gpu] {
+        for dtype in [Dtype::F32, Dtype::F64] {
+            let options = EmitOptions {
+                dtype,
+                target,
+                ..Default::default()
+            };
+            for export in [
+                query.compile(&options)?,
+                query.compile_prepared(&options)?,
+                explicit.score.compile(&options)?,
+                explicit.score.compile_prepared(&options)?,
+            ] {
+                assert_eq!(
+                    export.stablehlo.contains("stablehlo.compare GE,"),
+                    matches!((dtype, target), (Dtype::F32, Target::Gpu))
+                );
+            }
         }
-        Schema::Tuple { items } => items.iter().map(leaves).sum(),
+    }
+    Ok(())
+}
+
+fn summary_count(preparation: &Export) -> usize {
+    match &preparation.output {
+        Schema::Tuple { items } => items.len(),
+        Schema::Tensor { .. } => 1,
+        _ => panic!("summaries must be tensors"),
     }
 }
 
-/// Arguments of the entry point.
-fn arguments(stablehlo: &str) -> usize {
-    let main = stablehlo
+fn main_arguments(source: &str) -> usize {
+    let entry = source
         .lines()
-        .find(|line| line.contains("func.func @main"))
+        .find(|line| line.contains("func.func @main("))
         .unwrap();
-    main.split("->").next().unwrap().matches("%arg").count()
-}
-
-fn codes(export: &Export) -> Vec<i64> {
-    export
-        .runtime_status
-        .as_ref()
-        .map_or_else(Vec::new, |status| status.codes.clone())
-}
-
-/// A Gaussian regression on 40 fixed rows: an intercept and two features.
-fn regression(context: &mut Context, name: &str) -> std::sync::Arc<LoadedModule> {
-    let dir = directory(name);
-    let rows: Vec<[f64; 3]> = (0..40)
-        .map(|i| {
-            let t = f64::from(i);
-            [
-                1.0,
-                (0.37 * t).sin() * 3.0,
-                (0.11 * t).cos() * 2.0 + 0.1 * t,
-            ]
-        })
-        .collect();
-    let y: Vec<f64> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| 0.5 + 1.5 * r[1] - 0.7 * r[2] + 0.3 * (1.3 * i as f64).sin())
-        .collect();
-    std::fs::write(dir.join("X.json"), serde_json::to_string(&rows).unwrap()).unwrap();
-    std::fs::write(dir.join("y.json"), serde_json::to_string(&y).unwrap()).unwrap();
-    let source = "n = 40\np = 3\n\
-        X = load_data(\"X.json\", cartpow(interval(-100.0, 100.0), [n, p]))\n\
-        y_data = load_data(\"y.json\", cartpow(interval(-100.0, 100.0), n))\n\
-        beta = elementof(cartpow(reals, p))\nsigma = elementof(posreals)\n\
-        inputs = (beta, sigma)\n\
-        outputs = logdensityof(Normal.(X * beta, sigma), y_data)";
-    let path = dir.join("query.flatppl");
-    context.parse(source, None, path.to_str()).unwrap()
+    entry.split_once(" -> ").unwrap().0.matches("%arg").count()
 }
 
 #[test]
-fn fixed_regression_setup_runs_in_the_preparation_only() {
-    let mut context = Context::default();
-    let module = regression(&mut context, "regression");
-    let ordinary = module.compile(&options()).unwrap();
-    assert!(ordinary.preparation.is_none());
-    // Without preparation, every call repeats the bounded QR setup.
-    assert!(ordinary.stablehlo.contains("stablehlo.while"));
-
-    let prepared = module.compile_prepared(&options()).unwrap();
-    let preparation = prepared.preparation.as_deref().expect("a preparation");
-    assert!(preparation.inputs.is_empty());
-    assert!(preparation.stablehlo.contains("stablehlo.while"));
-    assert!(!prepared.stablehlo.contains("stablehlo.while"));
-    // The declared ABI is unchanged; prepared leaves follow it.
-    let names: Vec<_> = prepared.inputs.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, ["beta", "sigma"]);
-    let declared: usize = prepared.inputs.iter().map(|f| leaves(&f.value)).sum();
-    assert_eq!(declared, 2);
-    let summaries = leaves(&preparation.output);
-    assert!(summaries > 0);
-    assert_eq!(arguments(&prepared.stablehlo), declared + summaries);
-    assert_eq!(arguments(&ordinary.stablehlo), declared);
-    // Data-only checks report once, during preparation.
-    for code in codes(preparation) {
-        assert!(
-            codes(&ordinary).contains(&code),
-            "preparation code {code} is new"
-        );
+fn fixed_regression_uses_fewer_qr_levels_in_double_precision()
+-> Result<(), Box<dyn std::error::Error>> {
+    let values = (0..257)
+        .map(|i| format!("{}.0", i % 31))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        "x=[{values}]\ndata=record(x=x,y=x)\nX=colstack([ones(257),data.x])\n\
+         beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\n\
+         inputs=(beta,sigma)\noutputs=logdensityof(Normal.(X*beta,sigma),data.y)"
+    );
+    let query = Context::default().parse(&source, None, None)?;
+    let mut loops = Vec::new();
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let options = EmitOptions {
+            dtype,
+            ..Default::default()
+        };
+        let setup = query.compile_prepared(&options)?.preparation.unwrap();
+        loops.push(setup.stablehlo.matches("stablehlo.while").count());
     }
-    let json = serde_json::to_value(&prepared).unwrap();
-    assert!(json["preparation"]["stablehlo"].is_string());
-    assert!(
-        serde_json::to_value(&ordinary)
-            .unwrap()
-            .get("preparation")
-            .is_none()
-    );
+    assert!(loops[1] > 0 && loops[1] < loops[0]);
+    Ok(())
 }
 
 #[test]
-fn prepared_leaves_are_shared_by_batch_cells() {
+fn fixed_regression_runs_qr_and_checks_the_solve_in_preparation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("flatppl-fixed-regression-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join("X.json"),
+        "[[1,0],[1,1],[1,-1],[1,2],[1,3],[1,-2]]",
+    )?;
+    std::fs::write(dir.join("y.json"), "[0.5,1.4,-0.1,2.8,3.1,-2.0]")?;
     let mut context = Context::default();
-    let module = regression(&mut context, "batched");
-    let prepared = module.compile_prepared(&options()).unwrap();
-    let summaries = leaves(&prepared.preparation.as_deref().unwrap().output);
-    let mut input_axes = vec![vec![Some(0)], vec![Some(0)]];
-    input_axes.extend(std::iter::repeat_n(vec![None], summaries));
-    let batch = BatchSpec {
-        shape: vec![3],
-        input_axes: input_axes.clone(),
-    };
-    let batched = module.compile_batched_prepared(&options(), &batch).unwrap();
-    assert!(batched.preparation.is_some());
-    assert!(!batched.stablehlo.contains("stablehlo.while"));
-    assert_eq!(batched.batch_shape, [3]);
-    input_axes[2] = vec![Some(0)];
-    let error = module
-        .compile_batched_prepared(
-            &options(),
-            &BatchSpec {
-                shape: vec![3],
-                input_axes,
-            },
-        )
-        .err()
-        .expect("a mapped prepared leaf is refused");
-    assert!(
-        error.message.contains("take no batch axis"),
-        "{}",
-        error.message
-    );
-}
-
-#[test]
-fn a_query_without_summaries_compiles_as_before() {
-    let mut context = Context::default();
-    let module = context
-        .parse(
-            "x = elementof(reals)\ninputs = x\noutputs = logdensityof(Normal(0.0, 1.0), x)",
-            None,
-            None,
-        )
-        .unwrap();
-    let ordinary = module.compile(&options()).unwrap();
-    let prepared = module.compile_prepared(&options()).unwrap();
-    assert!(prepared.preparation.is_none());
-    assert_eq!(prepared.stablehlo, ordinary.stablehlo);
+    let query = context.parse(
+        "X=load_data(\"X.json\",cartpow(interval(-10,10),[6,2]))\n\
+         y=load_data(\"y.json\",cartpow(interval(-10,10),6))\n\
+         beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\n\
+         inputs=(beta,sigma)\nscore=logdensityof(Normal.(X*beta,sigma),y)\noutputs=score",
+        None,
+        dir.join("query.flatppl").to_str(),
+    )?;
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let options = EmitOptions {
+            dtype,
+            check_parameters: true,
+            ..Default::default()
+        };
+        let ordinary = query.compile(&options)?;
+        let score = query.compile_prepared(&options)?;
+        let setup = score.preparation.as_deref().unwrap();
+        assert!(ordinary.stablehlo.contains("stablehlo.while"));
+        assert!(setup.stablehlo.contains("stablehlo.while"));
+        assert!(!score.stablehlo.contains("stablehlo.while"));
+        assert!(setup.inputs.is_empty());
+        assert_eq!(main_arguments(&setup.stablehlo), 0);
+        assert_eq!(main_arguments(&score.stablehlo), 2 + summary_count(setup));
+        assert_eq!(
+            serde_json::to_value(&score.inputs)?,
+            serde_json::to_value(&ordinary.inputs)?
+        );
+        assert_eq!(score.output_names, ordinary.output_names);
+        let solve = setup.runtime_status.as_ref().unwrap();
+        assert!(solve.codes.contains(&4));
+        assert_eq!(solve.index, summary_count(setup));
+        assert_eq!(score.runtime_status.as_ref().unwrap().codes, [9]);
+    }
     let disabled = EmitOptions {
         sufficient_statistics: false,
-        ..options()
+        ..Default::default()
     };
-    let module = regression(&mut context, "disabled");
-    let prepared = module.compile_prepared(&disabled).unwrap();
-    assert!(prepared.preparation.is_none());
     assert_eq!(
-        prepared.stablehlo,
-        module.compile(&disabled).unwrap().stablehlo
+        serde_json::to_value(query.compile_prepared(&disabled)?)?,
+        serde_json::to_value(query.compile(&disabled)?)?,
+    );
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn grouped_summaries_are_shared_while_a_promoted_input_remains_live()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "p=elementof(cartpow(reals,3))\ng=[2,1,2,3,2,1]\ny=[true,false,true,false,false,true]\n\
+         prior_data=load_data(\"missing-fixed-data.json\",cartpow(interval(-10,10),6))\n\
+         z=logdensityof(iid(Normal(0.0,1.0),6),prior_data)\nraw=z\ninputs=(p,raw)\n\
+         lp=logdensityof(Bernoulli.(p[g]),y)+logdensityof(Normal(p[1],1.0),z)\noutputs=(lp,z)",
+        None,
+        Some("/model/query.flatppl"),
+    )?;
+    let options = EmitOptions::default();
+    let scalar = query.compile_prepared(&options)?;
+    let setup = scalar.preparation.as_deref().unwrap();
+    let count = summary_count(setup);
+    let mut batch = BatchSpec {
+        shape: vec![4],
+        input_axes: vec![vec![Some(0)], vec![None]],
+    };
+    batch
+        .input_axes
+        .extend(std::iter::repeat_n(vec![None], count));
+    let score = query.compile_batched_prepared(&options, &batch)?;
+    assert_eq!(
+        score.preparation.as_ref().unwrap().stablehlo,
+        setup.stablehlo
+    );
+    assert_eq!(main_arguments(&score.stablehlo), 2 + count);
+    assert_eq!(
+        score
+            .inputs
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        ["p", "raw"]
+    );
+    assert_eq!(score.output_names, [Some("lp".into()), Some("z".into())]);
+    batch.input_axes[2][0] = Some(0);
+    assert!(query.compile_batched_prepared(&options, &batch).is_err());
+    Ok(())
+}
+
+#[test]
+fn promoted_observations_without_fixed_summaries_use_the_ordinary_export()
+-> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "mu=elementof(reals)\ny=[1.0,2.0,4.0]\nalias=y\ninputs=(mu,alias)\n\
+         outputs=logdensityof(iid(Normal(mu,1.0),3),y)",
+        None,
+        None,
+    )?;
+    let options = EmitOptions::default();
+    let ordinary = serde_json::to_value(query.compile(&options)?)?;
+    assert!(ordinary.get("preparation").is_none());
+    assert_eq!(
+        serde_json::to_value(query.compile_prepared(&options)?)?,
+        ordinary
+    );
+    Ok(())
+}
+
+#[test]
+fn a_missing_output_keeps_the_ordinary_compiler_diagnostic() {
+    let query = Context::default()
+        .parse("x=elementof(reals)\ninputs=x", None, None)
+        .unwrap();
+    let options = EmitOptions::default();
+    let ordinary = query.compile(&options).err().unwrap();
+    let prepared = query.compile_prepared(&options).err().unwrap();
+    assert_eq!(
+        serde_json::to_value(prepared).unwrap(),
+        serde_json::to_value(ordinary).unwrap()
     );
 }

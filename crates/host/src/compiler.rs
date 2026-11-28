@@ -11,13 +11,20 @@ use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs};
 use flatppl_fileaccess::{Cache, DenyAll, Location, OfflineFetcher, Resolver};
 use flatppl_hs3::PyhfOptions;
 use flatppl_infer::{Level, ModuleBundle, Severity};
-use flatppl_stablehlo::{BatchSpec, EmitOptions};
+use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, RulePolicy};
 use serde::Serialize;
 
 use crate::Constant;
-use crate::export::{Export, emit_query};
+use crate::export::{Export, emit_prepared, emit_query};
 use crate::inspect::{self, BindingKind, Domain, InputInfo};
 use crate::posterior::{PosteriorTrace, PosteriorUpdate};
+
+fn real_precision(dtype: Dtype) -> flatppl_determinizer::RealPrecision {
+    match dtype {
+        Dtype::F32 => flatppl_determinizer::RealPrecision::F32,
+        Dtype::F64 => flatppl_determinizer::RealPrecision::F64,
+    }
+}
 
 /// A compiler error. `span` holds byte offsets into the text of `source`.
 #[derive(Debug, Serialize)]
@@ -133,6 +140,7 @@ pub struct LoadedModule {
     typed: Module,
     bundle: ModuleBundle,
     data: Arc<Mutex<HashMap<String, DataSource>>>,
+    shared_normal_scale_score: Option<Arc<LoadedModule>>,
 }
 
 /// Data preparation and scoring queries with an explicit summary boundary.
@@ -273,7 +281,16 @@ impl LoadedModule {
     }
 
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
-        self.compile_export(options, None, false)
+        self.compile_with_rules(options, &RulePolicy::default())
+    }
+
+    /// Compile this query with explicit egglog rule controls.
+    pub fn compile_with_rules(
+        &self,
+        options: &EmitOptions,
+        rules: &RulePolicy,
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, None, false, rules)
     }
 
     /// Compile independent calls over explicit host batch axes.
@@ -282,58 +299,91 @@ impl LoadedModule {
         options: &EmitOptions,
         batch: &BatchSpec,
     ) -> Result<Export, Diagnostic> {
-        self.compile_export(options, Some(batch), false)
+        self.compile_batched_with_rules(options, batch, &RulePolicy::default())
     }
 
-    /// Compile like [`Self::compile`], but move the data-only likelihood
-    /// summaries of fixed data into [`Export::preparation`], which a host runs
-    /// once. Each call then scores with the prepared summaries instead of
-    /// repeating their setup. A query without such summaries, or one whose
-    /// summaries cannot be split, compiles as [`Self::compile`] does.
+    /// Compile a batched query with explicit egglog rule controls.
+    pub fn compile_batched_with_rules(
+        &self,
+        options: &EmitOptions,
+        batch: &BatchSpec,
+        rules: &RulePolicy,
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, Some(batch), false, rules)
+    }
+
+    /// Compile fixed-data likelihood summaries into an optional zero-input
+    /// [`Export::preparation`]. Queries without summaries compile normally.
     pub fn compile_prepared(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
-        self.compile_export(options, None, true)
+        self.compile_prepared_with_rules(options, &RulePolicy::default())
     }
 
-    /// [`Self::compile_prepared`] over explicit host batch axes. `batch`
-    /// gives an axis entry for every argument leaf, the prepared leaves
-    /// included; prepared leaves are shared by all batch cells and stay
-    /// unmapped.
+    /// Compile a query and its fixed-data preparation with the same rule policy.
+    pub fn compile_prepared_with_rules(
+        &self,
+        options: &EmitOptions,
+        rules: &RulePolicy,
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, None, true, rules)
+    }
+
+    /// Batch a prepared score. The batch spec covers every physical argument,
+    /// with an unmapped row for each trailing preparation result.
     pub fn compile_batched_prepared(
         &self,
         options: &EmitOptions,
         batch: &BatchSpec,
     ) -> Result<Export, Diagnostic> {
-        self.compile_export(options, Some(batch), true)
+        self.compile_batched_prepared_with_rules(options, batch, &RulePolicy::default())
+    }
+
+    /// Compile a batched score and its preparation with the same rule policy.
+    pub fn compile_batched_prepared_with_rules(
+        &self,
+        options: &EmitOptions,
+        batch: &BatchSpec,
+        rules: &RulePolicy,
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, Some(batch), true, rules)
     }
 
     fn compile_export(
         &self,
         options: &EmitOptions,
         batch: Option<&BatchSpec>,
-        prepare: bool,
+        prepare_fixed_data: bool,
+        rules: &RulePolicy,
     ) -> Result<Export, Diagnostic> {
-        let typed = &self.typed;
-        let fail = |e: flatppl_stablehlo::EmitError| {
-            let node = e.node.filter(|id| id.index() < typed.node_count());
-            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(typed, node, self.source())
-        };
-        let lowered = self.lower_query(options, None)?;
-        if prepare && options.sufficient_statistics {
-            // Some reductions match fixed data only before `load_data` becomes
-            // literals, so preparation splits the ordinarily reduced query.
-            // Its data are literals, so no data input is named. A refusal
-            // means there is nothing to split; ordinary emission is the same
-            // query with its summaries inline.
-            if let Ok(prepared) = flatppl_determinizer::prepare_likelihood_with_options(
-                &lowered,
-                &[],
-                &flatppl_determinizer::PreparationOptions::default(),
-                None,
-            ) {
-                return crate::export::emit_prepared(prepared, typed, options, batch).map_err(fail);
-            }
+        if options.lowering_options().share_normal_scale
+            && let Some(score) = &self.shared_normal_scale_score
+        {
+            return score.compile_export(options, batch, prepare_fixed_data, rules);
         }
-        emit_query(lowered, typed, options, batch).map_err(fail)
+        let typed = &self.typed;
+        let lowered = self.lower_query(options, None, rules)?;
+        let locate = |stage, node: Option<NodeId>, message| {
+            Diagnostic::new(stage, self.source_name(), message).at(
+                typed,
+                node.filter(|id| id.index() < typed.node_count()),
+                self.source(),
+            )
+        };
+        // Some fixed-data rules match before load_data is materialized.
+        // Split the ordinarily lowered query to retain their summary bindings.
+        let split = if prepare_fixed_data && options.sufficient_statistics {
+            flatppl_determinizer::prepare_fixed_likelihood_for_precision(
+                &lowered,
+                real_precision(options.dtype),
+            )
+            .map_err(|e| locate("prepare_likelihood", Some(e.node), e.reason))?
+        } else {
+            None
+        };
+        match split {
+            Some(prepared) => emit_prepared(prepared, typed, options, batch, rules),
+            None => emit_query(lowered, Some(typed), options, batch, rules),
+        }
+        .map_err(|e| locate("stablehlo", e.node, e.msg))
     }
 
     pub(crate) fn may_have_posteriors(&self) -> bool {
@@ -370,13 +420,15 @@ impl LoadedModule {
         enabled: bool,
     ) -> Result<(flatppl_determinizer::ReductionReport, Vec<PosteriorUpdate>), Diagnostic> {
         let mut report = flatppl_determinizer::ReductionReport::default();
-        let mut trace = PosteriorTrace::default();
+        let rules = RulePolicy::default();
+        let mut trace = PosteriorTrace::new(&rules);
         let lowered = self.lower_query(
             &EmitOptions {
                 sufficient_statistics: enabled,
                 ..Default::default()
             },
             Some((&mut report, &mut trace)),
+            &rules,
         );
         let updates = trace.finish(lowered.as_ref().ok());
         match lowered {
@@ -390,8 +442,9 @@ impl LoadedModule {
         options: &EmitOptions,
         mut report: Option<(
             &mut flatppl_determinizer::ReductionReport,
-            &mut PosteriorTrace,
+            &mut PosteriorTrace<'_>,
         )>,
+        rules: &RulePolicy,
     ) -> Result<Module, Diagnostic> {
         let typed = &self.typed;
         let roots: Vec<_> = typed
@@ -411,19 +464,23 @@ impl LoadedModule {
             ..options.lowering_options()
         };
         let mut lowered = match report.as_mut() {
-            Some((reductions, trace)) => flatppl_determinizer::determinize_with_sampling_report(
+            Some((reductions, trace)) => {
+                flatppl_determinizer::determinize_with_sampling_report_and_rules(
+                    typed,
+                    &self.bundle,
+                    Some(&roots),
+                    &lowering,
+                    reductions,
+                    *trace,
+                    rules,
+                )
+            }
+            None => flatppl_determinizer::determinize_with_options_and_rules(
                 typed,
                 &self.bundle,
                 Some(&roots),
                 &lowering,
-                reductions,
-                *trace,
-            ),
-            None => flatppl_determinizer::determinize_with_options(
-                typed,
-                &self.bundle,
-                Some(&roots),
-                &lowering,
+                rules,
             ),
         }
         .map_err(|e| {
@@ -444,11 +501,11 @@ impl LoadedModule {
             )
         })?;
         if options.sufficient_statistics {
-            if let Some((report, _)) = report {
-                flatppl_determinizer::sufficient_statistics_with_report(&mut lowered, report);
-            } else {
-                flatppl_determinizer::sufficient_statistics(&mut lowered);
-            }
+            flatppl_determinizer::sufficient_statistics_for_target(
+                &mut lowered,
+                lowering.share_normal_scale,
+                report.map(|(reductions, _)| reductions),
+            );
         }
         Ok(lowered)
     }
@@ -643,10 +700,7 @@ impl Context {
         let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
         crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
             .map_err(|error| fail(error.to_string()))?;
-        let precision = match dtype {
-            flatppl_stablehlo::Dtype::F32 => flatppl_determinizer::CoordinatePrecision::F32,
-            flatppl_stablehlo::Dtype::F64 => flatppl_determinizer::CoordinatePrecision::F64,
-        };
+        let precision = real_precision(dtype);
         let plan = flatppl_determinizer::prepare_normal_coordinate_at_path(
             &lowered,
             data_inputs,
@@ -679,10 +733,7 @@ impl Context {
         let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
         crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
             .map_err(|error| fail(error.to_string()))?;
-        let precision = match dtype {
-            flatppl_stablehlo::Dtype::F32 => flatppl_determinizer::CoordinatePrecision::F32,
-            flatppl_stablehlo::Dtype::F64 => flatppl_determinizer::CoordinatePrecision::F64,
-        };
+        let precision = real_precision(dtype);
         let plan = flatppl_determinizer::prepare_normal_coordinates(
             &lowered,
             data_inputs,
@@ -763,6 +814,22 @@ impl Context {
         data_inputs: &[String],
         options: &flatppl_determinizer::PreparationOptions,
     ) -> Result<PreparedLikelihood, Diagnostic> {
+        self.prepare_likelihood_with_options_and_rules(
+            module,
+            data_inputs,
+            options,
+            &RulePolicy::default(),
+        )
+    }
+
+    /// Prepare a likelihood with explicit summary layout and source rule controls.
+    pub fn prepare_likelihood_with_options_and_rules(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+        options: &flatppl_determinizer::PreparationOptions,
+        rules: &RulePolicy,
+    ) -> Result<PreparedLikelihood, Diagnostic> {
         let fail =
             |message: String| Diagnostic::new("prepare_likelihood", module.source_name(), message);
         if !self.owns(module) {
@@ -774,7 +841,7 @@ impl Context {
             .filter(|(_, b)| matches!(typed.resolve(b.name), "inputs" | "outputs"))
             .map(|(_, b)| b.name)
             .collect();
-        let mut lowered = flatppl_determinizer::determinize_with_options(
+        let mut lowered = flatppl_determinizer::determinize_with_options_and_rules(
             typed,
             &module.bundle,
             Some(&roots),
@@ -783,6 +850,7 @@ impl Context {
                 preserve_rand_tuple: true,
                 ..Default::default()
             },
+            rules,
         )
         .map_err(|e| fail(e.reason).at(typed, Some(e.node), module.source()))?;
         crate::load_fixed_data(&mut lowered, |source| module.read_data(source)).map_err(|e| {
@@ -799,9 +867,17 @@ impl Context {
             let node = (e.node.index() < typed.node_count()).then_some(e.node);
             fail(e.reason).at(typed, node, module.source())
         })?;
+        let optimized = prepared.shared_normal_scale_score();
+        let preparation = self.prepared_query(module, prepared.preparation)?;
+        let mut score = self.prepared_query(module, prepared.score)?;
+        if let Some(optimized) = optimized {
+            Arc::get_mut(&mut score)
+                .expect("newly instantiated score")
+                .shared_normal_scale_score = Some(self.prepared_query(module, optimized)?);
+        }
         Ok(PreparedLikelihood {
-            preparation: self.prepared_query(module, prepared.preparation)?,
-            score: self.prepared_query(module, prepared.score)?,
+            preparation,
+            score,
             summaries: prepared.summaries,
         })
     }
@@ -1231,6 +1307,7 @@ impl Context {
             typed,
             bundle,
             data: self.data.clone(),
+            shared_normal_scale_score: None,
         }))
     }
 

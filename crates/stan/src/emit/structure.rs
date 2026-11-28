@@ -1,7 +1,7 @@
 //! Target decomposition and the `~` statements.
 
 use super::pattern;
-use super::{Emitter, Ex, Flat, P_ATOM, PriorField, RowSize};
+use super::{Emitter, Ex, Flat, P_ADD, P_ATOM, P_MUL, PriorField, RowSize};
 use crate::ManifestParam;
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
@@ -48,6 +48,8 @@ pub(super) struct Law {
     pub tail: String,
     /// The position among the Stan arguments of the row's `floor` argument.
     pub floor_arg: Option<usize>,
+    /// The position among the Stan arguments of the row's `ceil` argument.
+    pub ceil_arg: Option<usize>,
     /// Statements the law adds after its `~` line (`target += lgamma(K + 1);`).
     pub extra: Vec<String>,
     /// The restriction lives in the variate's declaration (`ordered[K]`):
@@ -61,9 +63,13 @@ pub(super) struct Law {
     pub stan_name: String,
     /// The FlatPPL law the row maps (`Poisson`), for messages.
     pub flatppl: String,
-    /// A user-defined `_lpdf` row (`kind: custom_lpdf`): its overloads take
-    /// `vector` variates, not integer arrays.
-    pub custom: bool,
+    /// The row's Stan function takes a `vector` variate, not `reals` (the row
+    /// lists `y` in `real_container_args`): an integer array observation
+    /// prints as `to_vector(…)`.
+    pub vector_variate: bool,
+    /// A regression GLM (module `regression`): one law over the whole
+    /// response vector, though its `variate` type is the element's.
+    pub glm: bool,
     /// The row's Stan function does not enforce `bounds` (von Mises): a
     /// variate whose declaration does not state them is tested against them.
     pub unchecked_support: bool,
@@ -97,26 +103,32 @@ impl Law {
         s
     }
 
-    /// The literal ends of the law's support: its variate bounds, or the
-    /// argument its row names as `floor`.
-    fn support_ends(&self) -> (Option<String>, Option<String>) {
+    /// The ends of the law's support: its literal variate bounds, or the
+    /// arguments its row names as `floor` and `ceil`.
+    pub(super) fn support_ends(&self) -> (Option<String>, Option<String>) {
+        let open = self.call.find('(').unwrap_or(self.call.len());
+        let args = self.call[open..]
+            .strip_prefix('(')
+            .and_then(|v| v.strip_suffix(')'))
+            .map(super::mixture::split_args)
+            .unwrap_or_default();
+        self.support_ends_in(|k| args.get(k).cloned().unwrap_or_default())
+    }
+
+    /// The support's ends with an argument end printed by `arg` (its
+    /// position among the Stan arguments).
+    pub(super) fn support_ends_in(
+        &self,
+        arg: impl Fn(usize) -> String,
+    ) -> (Option<String>, Option<String>) {
         // A literal end: a number, or von Mises's `±pi()`.
         let num = |b: &Option<String>| {
             b.clone()
                 .filter(|v| v.parse::<f64>().is_ok() || matches!(v.as_str(), "pi()" | "-pi()"))
         };
-        let floor = match self.floor_arg {
-            Some(k) => {
-                let open = self.call.find('(').unwrap_or(self.call.len());
-                self.call[open..]
-                    .strip_prefix('(')
-                    .and_then(|v| v.strip_suffix(')'))
-                    .map(super::mixture::split_args)
-                    .and_then(|a| a.get(k).cloned())
-            }
-            None => num(&self.bounds.0),
-        };
-        (floor, num(&self.bounds.1))
+        let floor = self.floor_arg.map(&arg).or_else(|| num(&self.bounds.0));
+        let ceil = self.ceil_arg.map(&arg).or_else(|| num(&self.bounds.1));
+        (floor, ceil)
     }
 
     fn pick(&self, x: &str, b: &str, larger: bool) -> String {
@@ -705,10 +717,16 @@ impl<'m> Emitter<'m> {
         for f in fields {
             let lhs = self.fields[&f.field].clone();
             self.relies_on_bounds = false;
-            let mut lines = match f.law {
-                Some(law) => self.tilde(&lhs, law)?,
-                None => vec![],
+            // The caller's test below is the law's support and window unless
+            // the field carries its own point guard.
+            self.point_statement =
+                self.point_fields.contains(&f.field) && !self.point_guards.contains_key(&f.field);
+            let lines = match f.law {
+                Some(law) => self.tilde(&lhs, law),
+                None => Ok(vec![]),
             };
+            self.point_statement = false;
+            let mut lines = lines?;
             let relies_on_bounds = std::mem::take(&mut self.relies_on_bounds);
             // A field set from a point is tested against its support only where
             // the line alone gives a finite value outside it: a declared set's
@@ -976,7 +994,8 @@ impl<'m> Emitter<'m> {
             Some(ValueSet::RecordSet(s)) => s.to_vec(),
             _ => vec![],
         };
-        for f in fields {
+        for i in self.param_order(fields) {
+            let f = &fields[i];
             let ty = types
                 .iter()
                 .find(|(n, _)| *n == f.field)
@@ -988,10 +1007,6 @@ impl<'m> Emitter<'m> {
                 .iter()
                 .find(|(n, _)| *n == f.field)
                 .map(|(_, v)| v.clone());
-            // The bare-name refusal comes before the untyped variate's.
-            if let Some(law) = f.law {
-                self.bare_pushfwd_map(law)?;
-            }
             if ty_is_int(&ty) {
                 return Err(Refusal::new(
                     RefusalKind::DiscreteParameter,
@@ -1054,6 +1069,19 @@ impl<'m> Emitter<'m> {
                 }
                 t.support = Some(s);
                 t.bounds = Default::default();
+            }
+            // The non-centred parameterization of a location-scale law: the same
+            // parameter and density, sampled on the standardized scale.
+            if let Some(law) = f.law
+                && t.support.is_none()
+                && t.bounds.lower.is_none()
+                && t.bounds.upper.is_none()
+                && self.locscale_affine_deps(law, fields).is_some_and(|deps| {
+                    deps.iter()
+                        .all(|d| self.fields.contains_key(&fields[*d].field))
+                })
+            {
+                t.bounds.affine = Some(self.locscale_affine(law)?);
             }
             self.params.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
@@ -1814,6 +1842,13 @@ impl<'m> Emitter<'m> {
     fn observe(&mut self, obs: Vec<Observation>) -> Result<()> {
         let mut conditioned = Vec::new();
         let mut factors = Vec::new();
+        // Every law sees each observed draw's declaration source, in any
+        // field order (`declared_int`).
+        for o in &obs {
+            if let Some(d) = o.draw {
+                self.observed_at.insert(d, o.value);
+            }
+        }
         for o in obs {
             let lhs = match self.observed_value(&o) {
                 Ok(lhs) => lhs,
@@ -1989,7 +2024,15 @@ impl<'m> Emitter<'m> {
         }
         let stan = self.fresh(&o.name);
         let t = self.declare(o.value, None, false, &stan, &[])?;
-        self.tdata.push(format!("{} = {};", t.render(&stan), e.s));
+        let line = format!("{} = {};", t.render(&stan), e.s);
+        // A point computed from parameters (`logdensityof(M, exp(eta))` for an
+        // input `eta`) is no data: it goes where values that depend on
+        // parameters go.
+        if self.m.phase_of(o.value) == Some(Phase::Fixed) {
+            self.tdata.push(line);
+        } else {
+            self.put(false, vec![line]);
+        }
         self.record_decl(&stan, t);
         Ok(stan)
     }
@@ -1998,6 +2041,9 @@ impl<'m> Emitter<'m> {
 
     /// Sampling statements for `lhs ~ measure`.
     fn tilde(&mut self, lhs: &str, measure: NodeId) -> Result<Vec<String>> {
+        if self.is_process(measure) {
+            return self.process_statements(lhs, measure);
+        }
         self.constrain_variate(lhs, measure)?;
         let lhs_rank = self.lhs_rank(lhs);
         let m = self.resolve(measure);
@@ -2051,13 +2097,26 @@ impl<'m> Emitter<'m> {
                 return self.nested_iid(lhs, m);
             }
             // An iid product of one law: the law's arguments are shared.
-            Some("iid") => (self.law(self.call(m).unwrap().args[0], false)?, false),
+            Some("iid") => {
+                let law = self.law(self.call(m).unwrap().args[0], false)?;
+                // A GLM is a law over the whole response vector: an iid of it
+                // is one GLM per response row, not the flattened rows.
+                if law.glm {
+                    return Err(Refusal::not_yet(
+                        Some(m),
+                        format!("an iid of the regression law `{}`", law.flatppl),
+                    ));
+                }
+                (law, false)
+            }
             Some("broadcast") => {
                 self.flat = flat;
                 let law = self.law(m, true);
                 self.flat = None;
                 (law?, true)
             }
+            // One law per cell, as for an iid of one law, with per-cell arguments.
+            Some("locscale") if self.locscale_iid(m) => (self.law(m, false)?, true),
             // A joint of different laws: one statement per component.
             Some("joint") if self.call(m).unwrap().named.is_empty() => match self.law(m, false) {
                 Ok(law) => (law, false),
@@ -2104,7 +2163,8 @@ impl<'m> Emitter<'m> {
             let n = self.extent_of(lhs);
             let index = per_element.then_some(i.as_str());
             let row = format!("{lhs}[{i}]");
-            let statement = law.statement(m, &law.lhs(&row), &law.call_text(index))?;
+            let variate = self.variate_text(&law, lhs, &row, 1);
+            let statement = law.statement(m, &law.lhs(&variate), &law.call_text(index))?;
             // A row guard of a vector law (`Multinomial`: each row sums to n)
             // tests each row, inside the loop.
             let per_row = law.multivariate && law.guard.is_some();
@@ -2160,19 +2220,7 @@ impl<'m> Emitter<'m> {
                 };
                 (target, law.call_text(None))
             }
-            // A user-defined `_lpdf` takes real variates: integer observations
-            // of a custom row (ContinuedPoisson counts) as a vector. Stan's
-            // built-in densities take the integer array itself.
-            _ if law.custom
-                && !law.discrete
-                && self
-                    .decls
-                    .get(lhs)
-                    .is_some_and(|t| t.is_int() && t.rank() == 1) =>
-            {
-                (format!("to_vector({lhs})"), law.call_text(None))
-            }
-            _ => (lhs.to_string(), law.call_text(None)),
+            _ => (self.variate_text(&law, lhs, lhs, 0), law.call_text(None)),
         };
         let mut out = vec![law.statement(m, &law.lhs(&target), &rhs)?];
         out.extend(law.extra.iter().cloned());
@@ -2400,7 +2448,7 @@ impl<'m> Emitter<'m> {
         Ok(vec![rl.statement(lhs, &n)])
     }
 
-    fn fresh_index(&mut self) -> String {
+    pub(super) fn fresh_index(&mut self) -> String {
         for c in ["i", "j", "k", "n"] {
             if !self.used.contains(c) && !self.reserved.contains(c) {
                 self.used.insert(c.to_string());
@@ -2433,6 +2481,26 @@ impl<'m> Emitter<'m> {
 
     /// `D_lpdf(y | args)` (`_lpmf` for a discrete law) for a variate already
     /// printed, per element at `index` when given.
+    /// The text a law's Stan function takes for the variate `expr`, the
+    /// declared `name` with `indices` indices. A function with a `vector`
+    /// variate (a user `_lpdf`, `normal_id_glm`: the row lists `y` in
+    /// `real_container_args`) takes an integer observation (ContinuedPoisson
+    /// counts) as `to_vector(…)`. Stan's other densities take `reals`, so the
+    /// integer array itself.
+    pub(super) fn variate_text(&self, law: &Law, name: &str, expr: &str, indices: usize) -> String {
+        if law.vector_variate
+            && !law.discrete
+            && self
+                .decls
+                .get(name)
+                .is_some_and(|t| t.is_int() && t.rank() == indices + 1)
+        {
+            format!("to_vector({expr})")
+        } else {
+            expr.to_string()
+        }
+    }
+
     pub(super) fn law_density(
         &mut self,
         at: NodeId,
@@ -2449,7 +2517,7 @@ impl<'m> Emitter<'m> {
             .ok_or_else(|| Refusal::not_yet(Some(at), "the log density of this law"))?;
         let (name, args) = (&call[..open], &call[open + 1..call.len() - 1]);
         let suffix = if law.discrete { "_lpmf" } else { "_lpdf" };
-        let y = law.lhs(y);
+        let y = law.lhs(&self.variate_text(law, y, y, 0));
         Ok(if args.is_empty() {
             format!("{name}{suffix}({y})")
         } else {
@@ -2458,6 +2526,9 @@ impl<'m> Emitter<'m> {
     }
 
     pub(super) fn density_call(&mut self, id: NodeId, m: NodeId, x: NodeId) -> Result<String> {
+        if self.is_process(m) {
+            return self.process_density(id, m, x);
+        }
         let mut law = self.law(m, false)?;
         let restricted = law
             .trunc
@@ -2504,6 +2575,7 @@ impl<'m> Emitter<'m> {
         };
         let lp = if normalized {
             let mass = self.interval_lmass(&law, lo.as_deref(), hi.as_deref());
+            let mass = self.nonzero_normalizer(mass);
             format!("{lp} - {mass}")
         } else {
             lp
@@ -2811,6 +2883,11 @@ impl<'m> Emitter<'m> {
                 };
                 let member = self.name(r.name);
                 let args = self.law_args(member, m)?;
+                if module == "regression"
+                    && let Some(law) = self.regression_on_parameters(m, member, &args)?
+                {
+                    return Ok(law);
+                }
                 self.table_law_in(m, member, Some(&module), &args, false)
             }
             // `locscale(normalize(truncate(D, I)), m, s)` with s > 0 is
@@ -3360,60 +3437,244 @@ impl<'m> Emitter<'m> {
         Ok(law)
     }
 
-    /// The law of `locscale(D, m, s)`: D's `locscale` row where it has one
-    /// (`StudentT`), else, for a location-scale family `D(a, b)`, the law
-    /// `D(m + s·a, s·b)` (the pushforward of x ↦ m + s·x), with s > 0 provable.
+    /// The law of `locscale(D, m, s)`: for a symmetric location-scale family
+    /// `D(a, b)` (StudentT standard: a = 0, b = 1), the law `D(m + s·a, |s|·b)`,
+    /// scalar or per cell of an `iid` (the pushforward of x ↦ m + s·x); else
+    /// D's `locscale` row where it has one.
     fn locscale_law(&mut self, m: NodeId, [d, loc, scale]: [NodeId; 3]) -> Result<Law> {
-        let row = self.table_law(m, "locscale", &[d, loc, scale], false);
+        if self.locscale_iid_args([d, loc, scale]) {
+            let inner = self.call(self.resolve(d)).unwrap().args[0];
+            return self.locscale_family_law(m, inner, loc, scale, true);
+        }
         let dr = self.resolve(d);
-        let family = self
-            .head(dr)
-            .filter(|h| matches!(*h, "Normal" | "Cauchy" | "Logistic" | "Laplace"));
-        let (Err(no_row), Some(family)) = (&row, family) else {
-            return row;
-        };
-        if no_row.kind.is_never() {
-            return row;
-        }
-        if !self.positive_value(scale) {
-            return Err(Refusal::not_yet(
-                Some(m),
-                "locscale with a scale of unknown sign",
-            ));
-        }
         let scalar = |me: &Self, x: NodeId| me.shape(x).is_some_and(|s| s.rank == 0);
-        if !scalar(self, loc) || !scalar(self, scale) {
-            return Err(Refusal::not_yet(
+        if matches!(
+            self.head(dr),
+            Some("Normal" | "Cauchy" | "Logistic" | "Laplace" | "StudentT")
+        ) && scalar(self, loc)
+            && scalar(self, scale)
+        {
+            return self.locscale_family_law(m, d, loc, scale, false);
+        }
+        let row = self.table_law(m, "locscale", &[d, loc, scale], false);
+        let family = matches!(
+            self.head(dr),
+            Some("Normal" | "Cauchy" | "Logistic" | "Laplace")
+        );
+        match &row {
+            Err(no_row) if family && !no_row.kind.is_never() => Err(Refusal::not_yet(
                 Some(m),
                 "locscale with an array location or scale",
-            ));
+            )),
+            _ => row,
         }
-        let params = self.law_args(family, dr)?;
-        let [a, b] = params[..] else {
-            return Err(Refusal::not_yet(Some(m), "locscale of this law"));
-        };
-        let (mv, sv, av, bv) = (
-            self.folded(loc)?,
-            self.folded(scale)?,
-            self.folded(a)?,
-            self.folded(b)?,
-        );
-        let location = fold_add(&mv, &fold_mul(&sv, &av));
-        let spread = fold_mul(&sv, &bv);
-        let names = flatppl_infer::distribution_param_names(family).unwrap_or_default();
-        let general = format!("{family}({})", names.join(", "));
-        let Some(row) = tables::law_rows_by_head(family, None)
-            .into_iter()
-            .find(|r| r.pattern == general)
-        else {
-            return Err(Refusal::not_yet(Some(m), "locscale of this law"));
-        };
-        let pat = pattern::parse(&row.pattern);
-        let mut binds = HashMap::new();
-        for (n, v) in names.iter().zip([location, spread]) {
-            binds.insert(n.to_string(), pattern::Bound::Expr(v.1));
+    }
+
+    /// `locscale(iid(D, J), loc, s)` with a scalar `s` and a vector `loc`: §07
+    /// `mul` scales every cell by `s`, so it is the uniform map `s .* x .+ loc`.
+    pub(super) fn locscale_iid_args(&self, [d, loc, scale]: [NodeId; 3]) -> bool {
+        self.head(self.resolve(d)) == Some("iid")
+            && self.shape(scale).is_some_and(|s| s.rank == 0)
+            && self.shape(loc).is_some_and(|s| s.rank == 1)
+    }
+
+    /// The order `declare_params` declares `fields` in: as given, except that a
+    /// field taking `<offset, multiplier>` follows the fields those name, since
+    /// Stan reads them in the declaration. No other field moves.
+    fn param_order(&self, fields: &[PriorField]) -> Vec<usize> {
+        let mut order = Vec::with_capacity(fields.len());
+        let mut pending: Vec<(usize, Vec<usize>)> = Vec::new();
+        for i in 0..fields.len() {
+            match fields[i]
+                .law
+                .and_then(|law| self.locscale_affine_deps(law, fields))
+            {
+                Some(deps) if !deps.iter().all(|d| order.contains(d)) => pending.push((i, deps)),
+                _ => order.push(i),
+            }
+            while let Some(k) = pending
+                .iter()
+                .position(|(_, d)| d.iter().all(|x| order.contains(x)))
+            {
+                order.push(pending.remove(k).0);
+            }
         }
-        self.law_from_row(m, family, row, pat, binds, false)
+        // A field naming itself, directly or through another deferred field.
+        order.extend(pending.into_iter().map(|(i, _)| i));
+        order
+    }
+
+    /// The prior fields named by the offset and multiplier of the law `law`
+    /// when it takes them: `locscale(iid(D(a, b), J), loc, s)` of a
+    /// location-scale family with `b > 0` and `s ≥ 0` provable (Stan's
+    /// multiplier must be positive; a parameter declared `lower=0` is, off its
+    /// boundary), naming only prior fields and fixed values (a model-block local
+    /// cannot appear in a parameter declaration).
+    fn locscale_affine_deps(&self, law: NodeId, fields: &[PriorField]) -> Option<Vec<usize>> {
+        let law = self.resolve(law);
+        if !self.locscale_iid(law) {
+            return None;
+        }
+        let [_, loc, scale] = self.call(law)?.args[..] else {
+            return None;
+        };
+        let d = self.resolve(self.call(law)?.args[0]);
+        let inner = self.resolve(self.call(d)?.args[0]);
+        let mut nodes = vec![loc, scale];
+        match self.head(inner)? {
+            "StudentT" => {}
+            "Normal" | "Cauchy" | "Logistic" | "Laplace" => {
+                let c = self.call(inner)?;
+                let [a, b] = c.args[..] else {
+                    return None;
+                };
+                if !self.positive_value(b) {
+                    return None;
+                }
+                nodes.extend([a, b]);
+            }
+            _ => return None,
+        }
+        if !self.nonnegative_value(scale) {
+            return None;
+        }
+        let mut deps = Vec::new();
+        let mut stack = nodes;
+        let mut seen = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Node::Ref(r) = self.m.node(n)
+                && r.ns == RefNs::SelfMod
+            {
+                if let Some(k) = fields.iter().position(|f| f.binding == Some(r.name)) {
+                    deps.push(k);
+                    continue;
+                }
+                let b = self.m.binding_by_name(r.name)?;
+                if self.m.phase_of(self.m.binding(b).rhs) != Some(Phase::Fixed) {
+                    return None;
+                }
+                continue;
+            }
+            self.m.for_each_child(n, |c| stack.push(c));
+        }
+        Some(deps)
+    }
+
+    /// The `<offset, multiplier>` texts of [`Self::locscale_affine_deps`]'s law:
+    /// `loc + s·a` and `s·b` (`a = 0`, `b = 1` for StudentT).
+    fn locscale_affine(&mut self, law: NodeId) -> Result<(String, String)> {
+        let law = self.resolve(law);
+        let [d, loc, scale] = self.call(law).unwrap().args[..] else {
+            unreachable!("locscale_affine_deps checked the call");
+        };
+        let inner = self.resolve(self.call(self.resolve(d)).unwrap().args[0]);
+        let (lv, sv) = ((None, self.expr(loc)?, false), self.folded(scale)?);
+        let (location, spread) = if self.head(inner) == Some("StudentT") {
+            (lv, sv)
+        } else {
+            let c = self.call(inner).unwrap();
+            let (a, b) = (c.args[0], c.args[1]);
+            let (av, bv) = (self.folded(a)?, self.folded(b)?);
+            (fold_add(&lv, &fold_mul(&sv, &av)), fold_mul(&sv, &bv))
+        };
+        Ok((location.1.s, spread.1.s))
+    }
+
+    /// The `locscale` call `m` when it is [`Self::locscale_iid_args`]'s shape.
+    pub(super) fn locscale_iid(&self, m: NodeId) -> bool {
+        let m = self.resolve(m);
+        self.head(m) == Some("locscale") && self.call(m).is_some_and(|c| {
+            c.named.is_empty()
+                && matches!(c.args[..], [d, loc, scale] if self.locscale_iid_args([d, loc, scale]))
+        })
+    }
+
+    /// The law of `locscale(D, loc, s)` for a symmetric location-scale family D:
+    /// D(loc + s·a, |s|·b), per cell of a vector `loc` when `cells`. Each family
+    /// is symmetric about a, so z − a and a − z share a law, and
+    /// loc + s·z = (loc + s·a) + s·(z − a) has the spread |s|·b.
+    fn locscale_family_law(
+        &mut self,
+        m: NodeId,
+        d: NodeId,
+        loc: NodeId,
+        scale: NodeId,
+        cells: bool,
+    ) -> Result<Law> {
+        let inner = self.resolve(d);
+        let head = self.head(inner).unwrap_or("this law").to_string();
+        let known_sign = self.nonnegative_value(scale);
+        // Operands print in the order the row reads them (loc, s, a, b), which
+        // fixes the order Stan declares the data they name.
+        let spread_of = |sv: &Folded| -> Folded {
+            match (known_sign, sv.0) {
+                (true, _) => sv.clone(),
+                (false, Some(n)) => number_ex(n.abs()),
+                (false, None) => (None, Ex::atom(format!("abs({})", sv.1.s)), false),
+            }
+        };
+        match head.as_str() {
+            "Normal" | "Cauchy" | "Logistic" | "Laplace" => {
+                let params = self.law_args(&head, inner)?;
+                let [a, b] = params[..] else {
+                    return Err(Refusal::not_yet(Some(m), "locscale of this law"));
+                };
+                let lv = if cells {
+                    (None, self.expr(loc)?, false)
+                } else {
+                    self.folded(loc)?
+                };
+                let sv = self.folded(scale)?;
+                let spread_scale = spread_of(&sv);
+                let (av, bv) = (self.folded(a)?, self.folded(b)?);
+                let location = fold_add(&lv, &fold_mul(&sv, &av));
+                let spread = fold_mul(&spread_scale, &bv);
+                let names = flatppl_infer::distribution_param_names(&head).unwrap_or_default();
+                let general = format!("{head}({})", names.join(", "));
+                let row = tables::law_rows_by_head(&head, None)
+                    .into_iter()
+                    .find(|r| r.pattern == general)
+                    .ok_or_else(|| Refusal::not_yet(Some(m), "locscale of this law"))?;
+                let pat = pattern::parse(&row.pattern);
+                let binds = names
+                    .iter()
+                    .zip([location, spread])
+                    .map(|(n, v)| (n.to_string(), pattern::Bound::Expr(v.1)))
+                    .collect();
+                self.law_from_row(m, &head, row, pat, binds, cells)
+            }
+            // The `locscale(StudentT(nu), mu, sigma)` row takes loc and s as given.
+            "StudentT" if known_sign => self.table_law(m, "locscale", &[d, loc, scale], cells),
+            "StudentT" => {
+                let params = self.law_args(&head, inner)?;
+                let [nu] = params[..] else {
+                    return Err(Refusal::not_yet(Some(m), "locscale of this law"));
+                };
+                let row = tables::law_rows_by_head("locscale", None)
+                    .into_iter()
+                    .find(|r| r.pattern == "locscale(StudentT(nu), mu, sigma)")
+                    .ok_or_else(|| Refusal::not_yet(Some(m), "locscale of this law"))?;
+                let pat = pattern::parse(&row.pattern);
+                let (nv, lv) = (self.expr(nu)?, self.expr(loc)?);
+                let sv = self.folded(scale)?;
+                let binds = HashMap::from([
+                    ("nu".to_string(), pattern::Bound::Expr(nv)),
+                    ("mu".to_string(), pattern::Bound::Expr(lv)),
+                    ("sigma".to_string(), pattern::Bound::Expr(spread_of(&sv).1)),
+                ]);
+                self.law_from_row(m, &head, row, pat, binds, cells)
+            }
+            _ => Err(Refusal::not_yet(
+                Some(m),
+                format!(
+                    "locscale with a vector shift over an iid {head} law (only Normal, Cauchy, \
+                     Logistic, Laplace and StudentT bases)"
+                ),
+            )),
+        }
     }
 
     /// A positive literal, or a value of a positive set.
@@ -3568,6 +3829,11 @@ impl<'m> Emitter<'m> {
         if self.literal_number(one) != Some(1.0) || self.literal_number(zero) != Some(0.0) {
             return None;
         }
+        self.positive_finite_test(cond).map(|a| (cond, a))
+    }
+
+    /// `s > 0.0 && isfinite(s)`, either order of the two tests: `s`.
+    fn positive_finite_test(&self, cond: NodeId) -> Option<NodeId> {
         let cr = self.resolve(cond);
         if self.head(cr) != Some("land") {
             return None;
@@ -3590,7 +3856,63 @@ impl<'m> Emitter<'m> {
             (Some(a), Some(b), _, _) | (_, _, Some(b), Some(a)) => (a, b),
             _ => return None,
         };
-        self.m.structural_eq(a, b).then_some((cond, a))
+        self.m.structural_eq(a, b).then_some(a)
+    }
+
+    /// `ifelse(s > 0.0 && isfinite(s), s, …)` where that condition holds
+    /// ([`Self::constant_weight_law`]'s `true_conds`): the first branch, a
+    /// positive `s`.
+    fn positive_under_true_cond(&self, x: NodeId) -> bool {
+        let x = self.resolve(x);
+        if self.head(x) != Some("ifelse") {
+            return false;
+        }
+        let Some(&[cond, first, _]) = self.call(x).map(|c| &c.args[..]) else {
+            return false;
+        };
+        self.true_conds
+            .iter()
+            .any(|&t| self.m.structural_eq(t, cond))
+            && self
+                .positive_finite_test(cond)
+                .is_some_and(|s| self.m.structural_eq(s, first))
+    }
+
+    /// [`Self::positive_value`], a positive branch under a condition known to
+    /// hold, a value of a set that excludes negatives (`nonnegreals`,
+    /// `interval(0, …)`), including a record field's set, or a product,
+    /// quotient or sum of such: a scale whose sign is known.
+    fn nonnegative_value(&self, x: NodeId) -> bool {
+        let r = self.resolve(x);
+        self.positive_value(x)
+            || self.positive_under_true_cond(x)
+            || (matches!(self.head(r), Some("mul" | "divide" | "add"))
+                && self
+                    .call(r)
+                    .is_some_and(|c| c.args.iter().all(|&a| self.nonnegative_value(a))))
+            || self.m.valueset_of(r).is_some_and(nonnegative_set)
+            || self.field_set(r).is_some_and(nonnegative_set)
+    }
+
+    /// The set of the field `f` in the value set of `rec`, for `get(rec, "f")`:
+    /// inference types the field access `reals`, the record set keeps it.
+    fn field_set(&self, x: NodeId) -> Option<&ValueSet> {
+        if self.head(x) != Some("get") {
+            return None;
+        }
+        let [rec, field] = self.call(x)?.args[..] else {
+            return None;
+        };
+        let Node::Lit(Scalar::Str(f)) = self.m.node(field) else {
+            return None;
+        };
+        let Some(ValueSet::RecordSet(fields)) = self.m.valueset_of(self.resolve(rec)) else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|(n, _)| self.name(*n) == &**f)
+            .map(|(_, s)| s)
     }
 
     fn positive_value(&self, x: NodeId) -> bool {
@@ -3603,11 +3925,14 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// A scalar's number when it is a literal, and its Stan text.
-    fn folded(&mut self, x: NodeId) -> Result<(Option<f64>, Ex)> {
+    /// A scalar as a folding operand ([`Folded`]).
+    pub(super) fn folded(&mut self, x: NodeId) -> Result<Folded> {
         match self.literal_number(x) {
             Some(n) => Ok(number_ex(n)),
-            None => Ok((None, self.real(x)?)),
+            None => {
+                let int = self.shape(x).is_none_or(|s| s.int);
+                Ok((None, self.real(x)?, int))
+            }
         }
     }
 
@@ -3758,7 +4083,7 @@ impl<'m> Emitter<'m> {
         })
     }
 
-    fn interval(&mut self, s: NodeId) -> Result<(Option<String>, Option<String>)> {
+    pub(super) fn interval(&mut self, s: NodeId) -> Result<(Option<String>, Option<String>)> {
         match self.m.node(s) {
             Node::Const(c) => match self.name(*c) {
                 "unitinterval" => Ok((Some("0".into()), Some("1".into()))),
@@ -3839,6 +4164,62 @@ impl<'m> Emitter<'m> {
             ));
         };
         self.law_from_row(m, name, row, pat, binds, broadcast)
+    }
+
+    /// Stan's GLM functions read the design matrix as data. A regression law
+    /// whose design is not data is the vectorized statement of its broadcast
+    /// law (§09), as the model would write it.
+    fn regression_on_parameters(
+        &mut self,
+        m: NodeId,
+        member: &str,
+        args: &[NodeId],
+    ) -> Result<Option<Law>> {
+        let (law, id, x, alpha, beta, sigma) = match (member, args) {
+            ("NormalGLM", &[x, alpha, beta, sigma]) => {
+                ("Normal", "normal", x, alpha, beta, Some(sigma))
+            }
+            ("BernoulliLogitGLM", &[x, alpha, beta]) => {
+                ("Bernoulli", "bernoulli_logit", x, alpha, beta, None)
+            }
+            ("PoissonLogGLM", &[x, alpha, beta]) => {
+                ("Poisson", "poisson_log", x, alpha, beta, None)
+            }
+            _ => return Ok(None),
+        };
+        if self.m.phase_of(self.resolve(x)) == Some(Phase::Fixed) {
+            return Ok(None);
+        }
+        let Some(row) = tables::law_rows_by_head(law, None)
+            .into_iter()
+            .find(|row| row.id == id)
+        else {
+            return Ok(None);
+        };
+        let design = self.expr(x)?;
+        let coefficients = self.expr(beta)?;
+        let product = Ex {
+            s: format!("{} * {}", design.at(P_MUL), coefficients.at(P_MUL + 1)),
+            prec: P_MUL,
+        };
+        let eta = if self.literal_number(alpha) == Some(0.0) {
+            product
+        } else {
+            let intercept = self.real(alpha)?;
+            Ex {
+                s: format!("{} + {}", intercept.at(P_ADD), product.at(P_ADD + 1)),
+                prec: P_ADD,
+            }
+        };
+        let mut binds = HashMap::new();
+        if let Some(sigma) = sigma {
+            binds.insert("mu".to_string(), pattern::Bound::Expr(eta));
+            binds.insert("sigma".to_string(), pattern::Bound::Node(sigma));
+        } else {
+            binds.insert("a".to_string(), pattern::Bound::Expr(eta));
+        }
+        let pat = pattern::parse(&row.pattern);
+        self.law_from_row(m, law, row, pat, binds, true).map(Some)
     }
 
     /// A law called with one record argument, its fields as the keyword
@@ -3930,6 +4311,28 @@ impl<'m> Emitter<'m> {
         ))
     }
 
+    /// `true` when the value `n` prints as an integer array of `rank`. A data
+    /// name is declared from the node `declare` types: the value itself, or,
+    /// for an observed draw, its observed value (`beta ~ iid(Normal(0, 1), 2)`
+    /// observed at `[1, 2]` is `array[2] int`). It reads no print state, so
+    /// the answer does not depend on what printed first.
+    fn declared_int(&self, n: NodeId, rank: usize) -> bool {
+        let int_at = |id: NodeId| self.shape(id).is_some_and(|s| s.rank == rank && s.int);
+        if rank == 0 || int_at(n) {
+            return rank > 0;
+        }
+        let Node::Ref(r) = self.m.node(self.resolve(n)) else {
+            return false;
+        };
+        r.ns == RefNs::SelfMod
+            && self
+                .m
+                .alias_chain(r.name)
+                .iter()
+                .chain([&r.name])
+                .any(|s| self.observed_at.get(s).is_some_and(|&v| int_at(v)))
+    }
+
     /// The law of a matched `distributions.ron` row with its pattern
     /// variables bound.
     fn law_from_row(
@@ -3938,7 +4341,7 @@ impl<'m> Emitter<'m> {
         name: &str,
         row: &'static tables::LawRow,
         pat: pattern::Pat,
-        binds: HashMap<String, pattern::Bound>,
+        mut binds: HashMap<String, pattern::Bound>,
         broadcast: bool,
     ) -> Result<Law> {
         match row.kind.as_str() {
@@ -3959,6 +4362,14 @@ impl<'m> Emitter<'m> {
                     Some(m),
                     name.to_string(),
                     format!("`{name}` has no Stan density: {}", row.note),
+                ));
+            }
+            // Lowered by its own code where it stands as an observed variate
+            // or in `logdensityof` (`intensity.rs`), not as a law elsewhere.
+            "structural" => {
+                return Err(Refusal::not_yet(
+                    Some(m),
+                    format!("the law `{name}` in this position"),
                 ));
             }
             // A user-defined `_lpdf`: its text goes into `functions` once.
@@ -3997,6 +4408,26 @@ impl<'m> Emitter<'m> {
                     broadcast && rank > expected.get(v).copied().unwrap_or(0),
                 );
             }
+        }
+        // A real container argument (`real_container_args`) takes an integer
+        // array as `to_vector(…)` or `to_matrix(…)`, by its declared rank; a
+        // real one prints as it is, and is not printed here, so its data
+        // declarations keep their order.
+        for v in row.real_container_args.iter().filter(|v| *v != "y") {
+            // A per-element argument prints through `gather_at`, not whole.
+            let Some(&pattern::Bound::Node(n)) = binds.get(v) else {
+                continue;
+            };
+            let rank = expected.get(v).copied().unwrap_or(0);
+            if per.get(v).copied().unwrap_or(false) || !self.declared_int(n, rank) {
+                continue;
+            }
+            let to = if rank == 2 { "to_matrix" } else { "to_vector" };
+            let e = self.expr(n)?;
+            binds.insert(
+                v.clone(),
+                pattern::Bound::Expr(Ex::atom(format!("{to}({})", e.s))),
+            );
         }
         let is_per = |v: &str| per.get(v).copied().unwrap_or(false);
         let scalar_variate = row.variate.starts_with("real") || row.variate.starts_with("int");
@@ -4052,15 +4483,21 @@ impl<'m> Emitter<'m> {
         let vector_per_element = per
             .iter()
             .any(|(v, &p)| p && expected.get(v).copied().unwrap_or(0) > 0);
-        // The normalized custom rows have overloads for scalar parameters
-        // only (a vector variate, scalar parameters).
+        // A normalized custom row has overloads for its declared parameter
+        // ranks only (a vector variate; scalars, or a regression GLM's design
+        // matrix and coefficient vector): an argument above its declared rank
+        // has none.
         if row.kind == "custom_lpdf"
             && row.normalized
-            && binds.values().any(|b| rank_of(self, b) > 0)
+            && let Some(v) = row.vars.iter().find(|v| {
+                binds
+                    .get(*v)
+                    .is_some_and(|b| rank_of(self, b) > expected.get(*v).copied().unwrap_or(0))
+            })
         {
             return Err(Refusal::not_yet(
                 Some(m),
-                format!("the law `{name}` with array parameters"),
+                format!("the law `{name}` broadcast over `{v}`"),
             ));
         }
         Ok(Law {
@@ -4082,12 +4519,19 @@ impl<'m> Emitter<'m> {
             floor_arg: (!row.floor.is_empty())
                 .then(|| row.args.split(", ").position(|a| a == row.floor))
                 .flatten(),
+            ceil_arg: (!row.ceil.is_empty())
+                .then(|| row.args.split(", ").position(|a| a == row.ceil))
+                .flatten(),
             extra: vec![],
             declared: false,
             unnormalized: !row.normalized,
             stan_name: row.stan.clone(),
             flatppl: row.flatppl.clone(),
-            custom: row.kind == "custom_lpdf",
+            vector_variate: row.real_container_args.iter().any(|a| a == "y"),
+            glm: row
+                .module
+                .as_deref()
+                .is_some_and(|m| m.split(' ').next() == Some("regression")),
             unchecked_support: row.unchecked_support,
             total_support: row.total_support,
             support_type: row
@@ -4357,8 +4801,14 @@ fn variate_bounds(variate: &str) -> (Option<String>, Option<String>) {
     out
 }
 
-fn number_ex(x: f64) -> (Option<f64>, Ex) {
+/// A scalar as a folding operand: its number when it is a literal, its Stan
+/// text, and whether that text can be integer-typed in Stan. `/` of two
+/// integers rounds in Stan, so [`fold_div`] reads the last.
+pub(super) type Folded = (Option<f64>, Ex, bool);
+
+pub(super) fn number_ex(x: f64) -> Folded {
     let s = crate::stan_type::number(x);
+    let int = !s.contains(['.', 'e', 'i', 'N']);
     let ex = if x < 0.0 {
         Ex {
             s,
@@ -4367,11 +4817,11 @@ fn number_ex(x: f64) -> (Option<f64>, Ex) {
     } else {
         Ex::atom(s)
     };
-    (Some(x), ex)
+    (Some(x), ex, int)
 }
 
 /// `x + y`, folded for literals and 0.
-fn fold_add(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
+pub(super) fn fold_add(x: &Folded, y: &Folded) -> Folded {
     match (x.0, y.0) {
         (Some(a), Some(b)) => number_ex(a + b),
         (Some(0.0), _) => y.clone(),
@@ -4382,12 +4832,22 @@ fn fold_add(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
                 s: format!("{} + {}", x.1.at(super::P_ADD), y.1.at(super::P_ADD + 1)),
                 prec: super::P_ADD,
             },
+            x.2 && y.2,
         ),
     }
 }
 
+/// A set with no negative member.
+fn nonnegative_set(vs: &ValueSet) -> bool {
+    match vs {
+        ValueSet::PosReals | ValueSet::NonNegReals => true,
+        ValueSet::Interval(lo, _) => *lo >= 0.0,
+        _ => false,
+    }
+}
+
 /// `x * y`, folded for literals, 0 and 1.
-fn fold_mul(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
+pub(super) fn fold_mul(x: &Folded, y: &Folded) -> Folded {
     match (x.0, y.0) {
         (Some(a), Some(b)) => number_ex(a * b),
         (Some(0.0), _) | (_, Some(0.0)) => number_ex(0.0),
@@ -4399,6 +4859,76 @@ fn fold_mul(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
                 s: format!("{} * {}", x.1.at(super::P_MUL), y.1.at(super::P_MUL + 1)),
                 prec: super::P_MUL,
             },
+            x.2 && y.2,
         ),
+    }
+}
+
+/// `-x`, folded for a literal.
+pub(super) fn fold_neg(x: &Folded) -> Folded {
+    match x.0 {
+        Some(a) => number_ex(-a),
+        None => (
+            None,
+            Ex {
+                s: format!("-{}", x.1.at(super::P_UNARY + 1)),
+                prec: super::P_UNARY,
+            },
+            x.2,
+        ),
+    }
+}
+
+/// `x - y`, folded for literals and 0.
+pub(super) fn fold_sub(x: &Folded, y: &Folded) -> Folded {
+    match (x.0, y.0) {
+        (Some(a), Some(b)) => number_ex(a - b),
+        (Some(0.0), _) => fold_neg(y),
+        (_, Some(0.0)) => x.clone(),
+        _ => (
+            None,
+            Ex {
+                s: format!("{} - {}", x.1.at(super::P_ADD), y.1.at(super::P_ADD + 1)),
+                prec: super::P_ADD,
+            },
+            x.2 && y.2,
+        ),
+    }
+}
+
+/// `x / y`, folded for literals and 1. The quotient is real, as `divide` is
+/// elsewhere in the emitter: where both operands can be integer-typed, a
+/// literal operand prints as a real literal (`2.0`), and two other operands
+/// take `1.0 * x / y`.
+pub(super) fn fold_div(x: &Folded, y: &Folded) -> Folded {
+    let real = |v: f64| {
+        let s = super::real_literal(v);
+        Ex {
+            prec: if v < 0.0 { super::P_UNARY } else { P_ATOM },
+            s,
+        }
+    };
+    match (x.0, y.0) {
+        (Some(a), Some(b)) if b != 0.0 => number_ex(a / b),
+        (_, Some(1.0)) => x.clone(),
+        _ => {
+            let (l, r) = match (x.2 && y.2, x.0, y.0) {
+                (false, _, _) => (x.1.at(super::P_MUL), y.1.at(super::P_MUL + 1)),
+                (true, _, Some(b)) => (x.1.at(super::P_MUL), real(b).at(super::P_MUL + 1)),
+                (true, Some(a), None) => (real(a).at(super::P_MUL), y.1.at(super::P_MUL + 1)),
+                (true, None, None) => (
+                    format!("1.0 * {}", x.1.at(super::P_MUL)),
+                    y.1.at(super::P_MUL + 1),
+                ),
+            };
+            (
+                None,
+                Ex {
+                    s: format!("{l} / {r}"),
+                    prec: super::P_MUL,
+                },
+                false,
+            )
+        }
     }
 }

@@ -112,34 +112,23 @@ fn finite_bound(set: &ValueSet) -> bool {
     }
 }
 
-/// The value a fixed record literal holds for `get(record(...), "name")`, the
-/// form `data.name` takes once `load_data` has read a record.
-pub(super) fn record_field(m: &Module, id: NodeId, reducer: &Reducer) -> Option<NodeId> {
-    let get = call(m, id, "get")?;
-    let [record, key] = *get.args else {
-        return None;
-    };
-    let Node::Lit(Scalar::Str(key)) = m.node(resolve(m, key, &reducer.boundary)) else {
-        return None;
-    };
-    call(m, resolve(m, record, &reducer.boundary), "record")?
-        .named
-        .iter()
-        .find(|field| m.resolve(field.name) == &**key)
-        .map(|field| field.value)
-}
-
 /// Infinities in a multivariate primitive can interact with covariance entries.
 /// A few scalar flags cannot reconstruct those IEEE outcomes after compression.
-/// Materialized fixed data prove this by their literal values, whatever value
-/// set their `load_data` declared; other data need a finite declared bound.
 pub(super) fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
-    let id = resolve(m, root, &reducer.boundary);
-    let finite = |child: NodeId| finite_data(m, child, reducer);
-    let declared = || m.valueset_of(root).is_some_and(finite_bound);
-    if let Some(field) = record_field(m, id, reducer) {
-        return finite(field) || declared();
-    }
+    // A fixed design assembled from file columns is worth factoring once.
+    // Inlining its QR into ordinary scoring costs more than the row score.
+    let id = if reducer.preparing {
+        let id = super::resolve_record_field(m, root, &reducer.boundary);
+        match super::operation(m, id) {
+            Some(("zeros" | "ones", _)) => return true,
+            Some(("ifelse", [_, left, right])) => {
+                return finite_data(m, *left, reducer) && finite_data(m, *right, reducer);
+            }
+            _ => id,
+        }
+    } else {
+        resolve(m, root, &reducer.boundary)
+    };
     match m.node(id) {
         Node::Ref(r) if r.ns == RefNs::SelfMod && reducer.boundary.contains(&r.name) => {
             let Some(bid) = m.binding_by_name(r.name) else {
@@ -149,7 +138,7 @@ pub(super) fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
             ["external", "load_data", "elementof"]
                 .iter()
                 .any(|head| call(m, rhs, head).is_some())
-                && declared()
+                && m.valueset_of(root).is_some_and(finite_bound)
         }
         Node::Lit(Scalar::Real(x)) => x.is_finite() && (2.0 * *x as f32).is_finite(),
         Node::Lit(Scalar::Int(_)) => true,
@@ -159,28 +148,15 @@ pub(super) fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
             .all(|x| x.is_finite() && (2.0 * *x as f32).is_finite()),
         Node::Packed(flatppl_core::Packed::Int(_)) => true,
         Node::Call(c) if matches!(c.head, flatppl_core::CallHead::Builtin(h) if matches!(m.resolve(h), "vector" | "rowstack" | "colstack" | "cat" | "fill" | "neg")) => {
-            c.args.iter().all(|&child| finite(child))
+            c.args.iter().all(|&child| finite_data(m, child, reducer))
         }
-        Node::Call(c) => {
-            let flatppl_core::CallHead::Builtin(head) = c.head else {
-                return declared();
-            };
-            let ifelse =
-                |f: NodeId| matches!(m.node(f), Node::Const(s) if m.resolve(*s) == "ifelse");
-            let structural = match (m.resolve(head), &*c.args) {
-                // A fixed array literal: its flat values, sizes and order.
-                ("array", args) => args.iter().all(|&child| finite(child)),
-                ("ones" | "zeros", _) => true,
-                // Selecting cells of finite data keeps them finite.
-                ("get" | "get0", [array, ..]) => finite(*array),
-                // The condition only chooses between two finite branches.
-                ("ifelse", [_, a, b]) => finite(*a) && finite(*b),
-                ("broadcast", [f, _, a, b]) if ifelse(*f) => finite(*a) && finite(*b),
-                _ => false,
-            };
-            structural || declared()
+        // Prepared data are baked literals, so a derived column's values are in
+        // hand. Without preparation the design is not factored at all.
+        _ => {
+            m.valueset_of(root).is_some_and(finite_bound)
+                || (reducer.preparing
+                    && crate::fixed_values::fixed_values(m, root, &reducer.boundary).is_some())
         }
-        _ => declared(),
     }
 }
 

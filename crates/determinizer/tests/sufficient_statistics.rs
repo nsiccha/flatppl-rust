@@ -497,6 +497,105 @@ fn grouped_gathers_prepare_only_occupied_partitions() {
 }
 
 #[test]
+fn fixed_groups_share_one_score_per_shape_in_ordinary_and_prepared_queries() {
+    let source = "mu=elementof(cartpow(reals,6))\ns=elementof(posreals)\ng=[4,1,3,4,2,5,1,4,3]\ninputs=(mu,s)\noutputs=logdensityof(Normal.(mu[g],s),[1.0,-2.0,3.0,2.0,0.0,-1.0,1.5,4.0,5.0])";
+    let ordinary = lower(source, true);
+    let prepared = prepare_unpacked(&lower(source, false), &[]);
+    assert_eq!(summary_count(&ordinary), prepared.summaries.len());
+    for module in [ordinary, prepared.score] {
+        let source = flatppl_syntax::print(&module);
+        // Groups 4, 1 and 3 use moments. Groups 2 and 5 are primitive
+        // singleton scores. Group 6 is unused.
+        assert_eq!(
+            source.matches("builtin_logdensityof").count(),
+            2,
+            "{source}"
+        );
+        let wire = flatppl_flatpir::try_write(&module).unwrap();
+        let mut restored = flatppl_flatpir::read(&wire).unwrap();
+        flatppl_infer::infer(&mut restored);
+        assert!(flatppl_determinizer::is_flatpdl(&restored).is_ok());
+    }
+}
+
+#[test]
+fn a_shared_record_retains_its_scalar_group_scores() {
+    // The two moment scores share the same parameter record. The other two
+    // groups have separate parameters and can still batch their singleton scores.
+    let source = "a=elementof(reals)\nb=elementof(reals)\nc=elementof(reals)\ns=elementof(posreals)\nt=elementof(posreals)\nu=elementof(posreals)\nloc=[a,a,b,c]\nscale=[s,s,t,u]\ng=[1,3,2,4,2,1,1]\ninputs=(a,b,c,s,t,u)\noutputs=logdensityof(Normal.(loc[g],scale[g]),[1.0,2.0,3.0,4.0,2.1,5.0,3.0])";
+    let reduced = flatppl_syntax::print(&lower(source, true));
+    assert_eq!(
+        reduced.matches("builtin_logdensityof(").count(),
+        2,
+        "{reduced}"
+    );
+    assert_eq!(
+        reduced.matches("builtin_logdensityof.(").count(),
+        1,
+        "{reduced}"
+    );
+}
+
+#[test]
+fn grouped_normal_pools_occupied_means_only_for_proven_fixed_rows() {
+    use flatppl_determinizer::{
+        ReductionOutcome, ReductionReport, sufficient_statistics_with_report,
+    };
+
+    for (observed, pooled) in [
+        ("[1.0,2.0,3.0,4.0,5.0,6.0]", true),
+        ("[1e-38,2e-38,3e-38,4e-38,5e-38,6e-38]", false),
+        ("[1.0,2e+30,3.0,4.0,5.0,6.0]", false),
+    ] {
+        let source = format!(
+            "mu=elementof(cartpow(reals,5))\ns=elementof(posreals)\ng=[4,1,4,2,1,4]\ninputs=(mu,s)\noutputs=logdensityof(Normal.(mu[g],s),{observed})"
+        );
+        let raw = lower(&source, false);
+        let mut module = raw.clone();
+        let mut report = ReductionReport::default();
+        sufficient_statistics_with_report(&mut module, &mut report);
+        assert_eq!(report.decisions.iter().any(|decision| matches!(&decision.outcome,
+            ReductionOutcome::Reduced { rule: "grouped Normal with common scale", partition: Some(p) }
+            if (p.observations, p.groups, p.singletons) == (6, 3, 1)
+        )), pooled);
+        if pooled {
+            assert_eq!(prepare_unpacked(&raw, &[]).summaries.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn grouped_normal_reuses_summaries_for_the_same_record_fields() {
+    let source = "a=elementof(cartpow(reals,3))\nb=elementof(cartpow(reals,3))\ns=elementof(posreals)\nd=(g=[3,1,2,1,3],y=[0.4,1.0,1.3,2.0,0.3])\ninputs=(a,b,s)\noutputs=logdensityof(Normal.(a[d.g],s),d.y)+logdensityof(Normal.(b[d.g],s),d.y)";
+    assert_eq!(
+        prepare_unpacked(&lower(source, false), &[]).summaries.len(),
+        3
+    );
+}
+
+#[test]
+fn grouped_normal_limits_roundoff_depth_in_fixed_residual_energy() {
+    let groups = ["1", "2"]
+        .into_iter()
+        .cycle()
+        .take(257)
+        .collect::<Vec<_>>()
+        .join(",");
+    let observed = ["1.0", "1.1", "1.2"]
+        .into_iter()
+        .cycle()
+        .take(257)
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        "a=elementof(cartpow(reals,2))\ns=elementof(posreals)\ng=[{groups}]\ninputs=(a,s)\noutputs=logdensityof(Normal.(a[g],s),[{observed}])"
+    );
+    let prepared = prepare_unpacked(&lower(&source, false), &[]);
+    assert!(flatppl_syntax::print(&prepared.preparation).contains("splitblocks"));
+    assert!(!flatppl_syntax::print(&prepared.score).contains("splitblocks"));
+}
+
+#[test]
 fn grouped_scalar_families_reuse_their_ordinary_guards() {
     for (law, event) in [
         ("LogNormal.(a[g],b[g])", "interval(0.1,10)"),
@@ -851,54 +950,6 @@ fn weighted_regression_keeps_unproved_scale_products_and_ranges_unchanged() {
 }
 
 #[test]
-fn regression_proves_finite_data_from_materialized_literals() {
-    use flatppl_determinizer::{
-        ReductionOutcome, ReductionReport, sufficient_statistics_with_report,
-    };
-    let outcome = |source: &str| {
-        let mut module = lower(source, false);
-        let mut report = ReductionReport::default();
-        sufficient_statistics_with_report(&mut module, &mut report);
-        assert_eq!(report.decisions.len(), 1, "{source}");
-        report.decisions[0].outcome.clone()
-    };
-    let unproven = ReductionOutcome::Retained {
-        reason: "regression data need fixed finite values or a bounded value set",
-    };
-    let prefix = "beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\ninputs=(beta,sigma)\noutputs=logdensityof(Normal.(X*beta,sigma),y)\n";
-    // The forms `load_data` leaves behind for data declared on `reals` or
-    // `posreals`: an `array` matrix, record fields with an intercept, and an
-    // indicator column of fixed labels.
-    for data in [
-        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3.0],[5,2],[1,2])\ny=[0.1,-0.7,1.9,0.4,2.5]",
-        "data=record(x=[0.5,1.5,2.0,0.25,3.0],y=[0.1,-0.7,1.9,0.4,2.5])\nX=colstack([ones(5),data.x])\ny=data.y",
-        "g=[1,2,2,1,3]\nX=colstack([ones(5),ifelse.(g .== 2,1.0,0.0)])\ny=[0.1,-0.7,1.9,0.4,2.5]",
-    ] {
-        let source = format!("{prefix}{data}");
-        assert!(
-            matches!(
-                outcome(&source),
-                ReductionOutcome::Reduced {
-                    rule: "regression statistics",
-                    ..
-                }
-            ),
-            "{source}"
-        );
-    }
-    // Values outside the float32 headroom and unbounded runtime data name the
-    // missing proof instead of the grouped rule's gather requirement.
-    for data in [
-        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3.0],[5,2],[1,2])\ny=[0.1,-0.7,1.9,0.4,2e38]",
-        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3e38],[5,2],[1,2])\ny=[0.1,-0.7,1.9,0.4,2.5]",
-        "X=array([1.0,0.5,1.0,-1.5,1.0,2.0,1.0,0.25,1.0,3.0],[5,2],[1,2])\ny=external(cartpow(reals,5))",
-    ] {
-        let source = format!("{prefix}{data}");
-        assert_eq!(outcome(&source), unproven, "{source}");
-    }
-}
-
-#[test]
 fn repeated_factors_share_preparation_and_parameter_dependent_observations_stay_live() {
     let prefix = "a=elementof(reals)\ny=external(cartpow(reals,3))\ninputs=(a,y)\n";
     let one = lower(
@@ -939,35 +990,40 @@ fn a_promoted_fixed_value_never_becomes_a_baked_statistic() {
     assert!(!inputs(&prepared.score).iter().any(|name| name == "y"));
 }
 
-fn occurrences(module: &Module, text: &str) -> usize {
-    flatppl_syntax::print(module).matches(text).count()
-}
-
 #[test]
-fn fixed_partitions_score_same_shape_groups_as_one_broadcast() {
-    // Twelve groups of three fixed observations and two singleton groups.
-    let mut g: Vec<usize> = (0..36).map(|i| i / 3 + 1).collect();
-    g.extend([13, 14]);
-    let y: Vec<String> = (0..g.len())
-        .map(|i| format!("{:.4}", (0.7 * i as f64).sin()))
-        .collect();
-    let g: Vec<String> = g.iter().map(ToString::to_string).collect();
-    let source = format!(
-        "mu=elementof(cartpow(reals,14))\nsigma=elementof(posreals)\ng=[{}]\ninputs=(mu,sigma)\noutputs=logdensityof(Normal.(mu[g],sigma),[{}])",
-        g.join(","),
-        y.join(",")
-    );
-    let reduced = lower(&source, true);
-    assert!(summary_count(&reduced) > 0);
-    // One family term per group shape, not one per group.
-    let scores = occurrences(&reduced, "builtin_logdensityof");
-    assert!((1..=2).contains(&scores), "{scores} scores");
-    assert!(flatppl_determinizer::is_flatpdl(&reduced).is_ok());
-    // Explicit preparation scores the same way; its summaries are unchanged.
-    let prepared = prepare_unpacked(&lower(&source, false), &[]);
-    let score = occurrences(&prepared.score, "builtin_logdensityof");
-    assert!((1..=2).contains(&score), "{score} scores");
-    assert!(flatppl_determinizer::is_flatpdl(&prepared.score).is_ok());
-    let serialized = flatppl_flatpir::try_write(&prepared.score).unwrap();
-    assert!(flatppl_flatpir::read(&serialized).is_ok());
+fn a_normal_regression_law_on_a_fixed_design_takes_the_regression_statistics() {
+    let model = |design: &str, alpha: &str| {
+        format!(
+            "reg = standard_module(\"regression\", \"0.1\")
+x = {design}
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 2))
+sigma = elementof(posreals)
+inputs = (alpha, beta, sigma)
+outputs = logdensityof(reg.NormalGLM(x, {alpha}, beta, sigma), [1.0, 2.0, 2.5, 4.0])
+"
+        )
+    };
+    let fixed = "rowstack([[1.0, 0.5], [1.0, 1.5], [1.0, 2.5], [1.0, 3.5]])";
+    for alpha in ["alpha", "0.0"] {
+        let law = lower(&model(fixed, alpha), true);
+        assert!(summary_count(&law) > 0, "{alpha}");
+        let written = model(fixed, alpha).replace(
+            &format!("reg.NormalGLM(x, {alpha}, beta, sigma)"),
+            &if alpha == "0.0" {
+                "Normal.(x * beta, sigma)".to_owned()
+            } else {
+                format!("Normal.({alpha} .+ x * beta, sigma)")
+            },
+        );
+        assert_eq!(
+            summary_count(&law),
+            summary_count(&lower(&written, true)),
+            "{alpha}"
+        );
+        assert_eq!(summary_count(&lower(&model(fixed, alpha), false)), 0);
+    }
+    // A design that depends on a scoring input keeps the fused regression score.
+    let live = model(&format!("sigma .* {fixed}"), "alpha");
+    assert_eq!(summary_count(&lower(&live, true)), 0);
 }

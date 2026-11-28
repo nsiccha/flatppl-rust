@@ -1,7 +1,6 @@
 //! Hermitian cyclic Jacobi iteration with ascending, orthonormal eigenpairs.
-//! An unbatched real input rotates only the two affected rows and columns of
-//! each pair, in the same cyclic order, instead of masking the whole matrix,
-//! and is emitted as the versioned private helper `__enzyme_linalg_eigh_v1_*`.
+//! An unbatched real input is emitted as the versioned private helper
+//! `__enzyme_linalg_eigh_v1_*`.
 
 use super::*;
 
@@ -16,6 +15,7 @@ pub(super) struct HermitianEigen {
 /// Hermitian within the eigensolver's tolerance.
 struct HermitianScaling {
     scale: Value,
+    safe_scale: Value,
     scaled: Pair,
     adjoint: Pair,
     tolerance: Value,
@@ -56,6 +56,7 @@ impl Emitter<'_> {
         let hermitian = self.compare("LE", &error, &tolerance);
         HermitianScaling {
             scale,
+            safe_scale,
             scaled,
             adjoint,
             tolerance,
@@ -119,174 +120,188 @@ impl Emitter<'_> {
         self.reduce_sum_last_axis(&value)
     }
 
-    /// A tensor known to hold only zeros, such as the imaginary part of a real input.
-    fn known_zero(&self, value: &Value) -> bool {
-        if let Some(data) = self.constants.get(&value.ssa) {
-            return data
-                .iter()
-                .all(|x| matches!(x, Scalar::Real(z) if z == 0.0) || matches!(x, Scalar::Int(0)));
-        }
-        match self.pointwise.get(&value.ssa).map(|record| &record.op) {
-            Some(Pointwise::Reshape(input) | Pointwise::Broadcast(input, _)) => {
-                self.known_zero(input)
-            }
-            _ => false,
-        }
-    }
-
-    /// A static `rows` x `cols` window of an unbatched matrix at runtime offsets.
-    fn matrix_window(
+    /// The scaled Jacobi tangent of the unbatched real loop avoids squaring a
+    /// large diagonal difference.
+    fn symmetric_rotation(
         &mut self,
-        matrix: &Value,
-        row: &Value,
-        col: &Value,
-        rows: u64,
-        cols: u64,
-    ) -> Value {
-        let ty = matrix.ty.render(self.dtype, matrix.elem);
-        let index_ty = row.ty.render(self.dtype, row.elem);
-        let window = MlirTy::Ranked(vec![Some(rows), Some(cols)]);
-        let window_ty = window.render(self.dtype, matrix.elem);
-        let ssa = self.pure(format!(
-            "stablehlo.dynamic_slice {}, {}, {}, sizes = [{rows}, {cols}] : ({ty}, {index_ty}, {index_ty}) -> {window_ty}",
-            matrix.ssa, row.ssa, col.ssa,
-        ));
-        Value {
-            ssa,
-            ty: window,
-            elem: matrix.elem,
-        }
+        difference: &Value,
+        coupling: &Value,
+        active: &Value,
+    ) -> (Value, Value, Value) {
+        let one = self.scalar(1.0);
+        let zero = self.scalar(0.0);
+        let safe_gamma = self.select(active, coupling, &one);
+        let two = self.scalar(2.0);
+        let twice_gamma = self.mul(&two, &safe_gamma);
+        let magnitude = self.abs(difference);
+        let coupling_magnitude = self.abs(&twice_gamma);
+        let scale = self.max(&magnitude, &coupling_magnitude);
+        let d = self.div(&magnitude, &scale);
+        let g = self.div(&twice_gamma, &scale);
+        let d2 = self.mul(&d, &d);
+        let g2 = self.mul(&g, &g);
+        let radius = self.add(&d2, &g2);
+        let radius = self.sqrt(&radius);
+        let denominator = self.add(&d, &radius);
+        let tangent = self.div(&g, &denominator);
+        let negative = self.compare("LT", difference, &zero);
+        let minus_tangent = self.neg(&tangent);
+        let tangent = self.select(&negative, &minus_tangent, &tangent);
+        let tangent = self.select(active, &tangent, &zero);
+        let t2 = self.mul(&tangent, &tangent);
+        let norm = self.add(&one, &t2);
+        let norm = self.sqrt(&norm);
+        let cosine = self.div(&one, &norm);
+        (cosine, tangent, safe_gamma)
     }
 
-    /// Write `update` into an unbatched matrix at runtime offsets.
-    fn matrix_write(&mut self, matrix: &Value, update: &Value, row: &Value, col: &Value) -> Value {
-        let ty = matrix.ty.render(self.dtype, matrix.elem);
-        let update_ty = update.ty.render(self.dtype, update.elem);
+    fn jacobi_panel_entry(&mut self, panel: &Value, row: &Value, col: &Value) -> Value {
+        let ty = MlirTy::Ranked(vec![Some(1), Some(1)]);
+        let panel_ty = panel.ty.render(self.dtype, panel.elem);
+        let slice_ty = ty.render(self.dtype, panel.elem);
         let index_ty = row.ty.render(self.dtype, row.elem);
         let ssa = self.pure(format!(
-            "stablehlo.dynamic_update_slice {}, {}, {}, {} : ({ty}, {update_ty}, {index_ty}, {index_ty}) -> {ty}",
-            matrix.ssa, update.ssa, row.ssa, col.ssa,
-        ));
-        let result = Value {
-            ssa,
-            ..matrix.clone()
-        };
-        self.axes_view(&result, self.axes_of(matrix))
-    }
-
-    /// Entry `index` of a static rank-1 integer table.
-    fn table_entry(&mut self, table: &Value, index: &Value) -> Value {
-        let ty = table.ty.render(self.dtype, table.elem);
-        let index_ty = index.ty.render(self.dtype, index.elem);
-        let one = MlirTy::Ranked(vec![Some(1)]);
-        let one_ty = one.render(self.dtype, table.elem);
-        let ssa = self.pure(format!(
-            "stablehlo.dynamic_slice {}, {}, sizes = [1] : ({ty}, {index_ty}) -> {one_ty}",
-            table.ssa, index.ssa,
+            "stablehlo.dynamic_slice {}, {}, {}, sizes = [1, 1] : ({panel_ty}, {index_ty}, {index_ty}) -> {slice_ty}",
+            panel.ssa, row.ssa, col.ssa,
         ));
         let entry = Value {
             ssa,
-            ty: one,
-            elem: table.elem,
+            ty,
+            elem: panel.elem,
         };
         self.reshape(&entry, MlirTy::Scalar)
     }
 
-    /// Cyclic Jacobi for an unbatched real symmetric matrix: the same pairs,
-    /// order and rotations as the general loop, visiting only `p < q` and
-    /// updating only columns and rows `p` and `q`, so each pair costs O(n)
-    /// instead of O(n^2). Returns the real and imaginary parts of the rotated
-    /// matrix and, when requested, of the vectors.
+    fn jacobi_update(&mut self, a: &Value, v: &Value, start: [&Value; 2]) -> Value {
+        let [row, col] = start;
+        let matrix_ty = a.ty.render(self.dtype, a.elem);
+        let slice_ty = v.ty.render(self.dtype, v.elem);
+        let index_ty = row.ty.render(self.dtype, row.elem);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_update_slice {}, {}, {}, {} : ({matrix_ty}, {slice_ty}, {index_ty}, {index_ty}) -> {matrix_ty}",
+            a.ssa, v.ssa, row.ssa, col.ssa,
+        ));
+        Value { ssa, ..a.clone() }
+    }
+
+    fn rotate_columns(
+        &mut self,
+        panel: &Value,
+        n: u64,
+        cosine: &Value,
+        sine: &Value,
+    ) -> (Value, Value) {
+        let x = self.slice(panel, &[0, 0], &[n, 1], &[1, 1]);
+        let y = self.slice(panel, &[0, 1], &[n, 2], &[1, 1]);
+        let cx = self.mul(cosine, &x);
+        let sy = self.mul(sine, &y);
+        let sx = self.mul(sine, &x);
+        let cy = self.mul(cosine, &y);
+        (self.sub(&cx, &sy), self.add(&sx, &cy))
+    }
+
     fn symmetric_jacobi(
         &mut self,
         n: u64,
-        a: Value,
-        vectors: Option<Value>,
+        a: &Value,
+        vectors: Option<&Value>,
         epsilon: f64,
     ) -> Vec<Value> {
-        let pairs: Vec<(i64, i64)> = (0..n as i64)
-            .flat_map(|p| (p + 1..n as i64).map(move |q| (p, q)))
-            .collect();
-        let has_vectors = vectors.is_some();
-        let mut initial = vec![a];
-        initial.extend(vectors);
-        let result = if pairs.is_empty() {
-            initial
-        } else {
-            let table = |e: &mut Self, values: Vec<i64>| {
-                let ty = MlirTy::Ranked(vec![Some(values.len() as u64)]);
-                let text = values
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let rendered = ty.render(e.dtype, ElemKind::Int);
-                let ssa = e.pure(format!("stablehlo.constant dense<[{text}]> : {rendered}"));
-                Value {
-                    ssa,
-                    ty,
-                    elem: ElemKind::Int,
-                }
-            };
-            let ps = table(self, pairs.iter().map(|pair| pair.0).collect());
-            let qs = table(self, pairs.iter().map(|pair| pair.1).collect());
-            let count = pairs.len() as u64;
-            self.matrix_loop(32, 0, &initial, |e, _, state| {
-                e.matrix_loop(count, 0, state, |e, k, state| {
-                    let a = state[0].clone();
-                    let p = e.table_entry(&ps, k);
-                    let q = e.table_entry(&qs, k);
-                    let origin = e.int_value_const(0);
-                    let entry = |e: &mut Self, row: &Value, col: &Value| {
-                        let window = e.matrix_window(&a, row, col, 1, 1);
-                        e.reshape(&window, MlirTy::Scalar)
-                    };
-                    let alpha = entry(e, &p, &p);
-                    let beta = entry(e, &q, &q);
-                    let gamma = entry(e, &p, &q);
-                    let eps = e.scalar(epsilon);
-                    let (cosine, w, _) =
-                        e.jacobi_rotation(&alpha, &beta, (&gamma, None), &eps, &eps, None);
-                    // p' = c p - w q; q' = w p + c q, as the general rotation with real phase.
-                    let rotate = |e: &mut Self, x: &Value, y: &Value| {
-                        let cx = e.mul(&cosine, x);
-                        let wy = e.mul(&w, y);
-                        let wx = e.mul(&w, x);
-                        let cy = e.mul(&cosine, y);
-                        (e.sub(&cx, &wy), e.add(&wx, &cy))
-                    };
-                    let columns = |e: &mut Self, m: &Value| {
-                        let cp = e.matrix_window(m, &origin, &p, n, 1);
-                        let cq = e.matrix_window(m, &origin, &q, n, 1);
-                        let (np, nq) = rotate(e, &cp, &cq);
-                        let m = e.matrix_write(m, &np, &origin, &p);
-                        e.matrix_write(&m, &nq, &origin, &q)
-                    };
-                    // A' = G^T (A G): columns first, then rows of the result.
-                    let a = columns(e, &a);
-                    let rp = e.matrix_window(&a, &p, &origin, 1, n);
-                    let rq = e.matrix_window(&a, &q, &origin, 1, n);
-                    let (np, nq) = rotate(e, &rp, &rq);
-                    let a = e.matrix_write(&a, &np, &p, &origin);
-                    let a = e.matrix_write(&a, &nq, &q, &origin);
-                    let mut next = vec![a];
-                    if has_vectors {
-                        next.push(columns(e, &state[1]));
-                    }
-                    next
+        let mut matrices = vec![a.clone()];
+        matrices.extend(vectors.cloned());
+        if n > 1 {
+            let zero = self.int_value_const(0);
+            let one = self.int_value_const(1);
+            let limit = self.int_value_const(n as i64);
+            let eps = self.scalar(epsilon);
+            let tolerance = self.scalar(64.0 * n as f64 * epsilon);
+            let rows = self.axis_indices(a, 0);
+            let cols = self.axis_indices(a, 1);
+            let diagonal = self.compare("EQ", &rows, &cols);
+            let zero_real = self.scalar(0.0);
+            matrices.push(self.bool_value_const(true));
+            matrices = self.matrix_loop(32, 0, &matrices, |e, _, state| {
+                let (unfinished, matrices) = state.split_last().unwrap();
+                e.matrix_if_values(unfinished, state, |e| {
+                    // One final sweep after reaching the rotation tolerance retains
+                    // the tangent of a separated eigenvector at exactly zero coupling.
+                    let magnitude = e.abs(&matrices[0]);
+                    let off = e.select(&diagonal, &zero_real, &magnitude);
+                    let off = e.reduce_max(&off);
+                    let unfinished = e.compare("GT", &off, &eps);
+                    // Visit the strict upper triangle in row-major order.
+                    let mut initial = vec![zero.clone(), one.clone()];
+                    initial.extend_from_slice(matrices);
+                    let result = e.matrix_loop(n * (n - 1) / 2, 0, &initial, |e, _, state| {
+                        let (p, q, a) = (&state[0], &state[1], &state[2]);
+                        // Keep only these columns live on the reverse-loop tape.
+                        let indices = e.vector(&[p.clone(), q.clone()]);
+                        let panel = e.gather_axis(a, &indices, 0, 1);
+                        let alpha = e.jacobi_panel_entry(&panel, p, &zero);
+                        let beta = e.jacobi_panel_entry(&panel, q, &one);
+                        let gamma = e.jacobi_panel_entry(&panel, p, &one);
+                        let absolute = e.abs(&gamma);
+                        let difference = e.sub(&beta, &alpha);
+                        let gap = e.abs(&difference);
+                        let coupled = e.compare("GT", &absolute, &eps);
+                        let separated = e.compare("GT", &gap, &tolerance);
+                        let active = e.or(&coupled, &separated);
+                        // The signed tangent is smooth at zero coupling for a separated
+                        // diagonal pair. Its derivative rotates the corresponding eigenspaces.
+                        let (c, t, _) = e.symmetric_rotation(&difference, &gamma, &active);
+                        let s = e.mul(&c, &t);
+                        let (cp, cq) = ([&zero, p], [&zero, q]);
+                        let (x, y) = e.rotate_columns(&panel, n, &c, &s);
+                        // Gᵀ A G has symmetric rows and columns. The pivot block
+                        // becomes diag(α − tγ, β + tγ) on an active rotation.
+                        let shift = e.mul(&t, &gamma);
+                        let alpha = e.sub(&alpha, &shift);
+                        let beta = e.add(&beta, &shift);
+                        let origin = e.scalar(0.0);
+                        let off = e.select(&active, &origin, &gamma);
+                        let rows = e.axis_indices(&x, 0);
+                        let at_p = e.compare("EQ", &rows, p);
+                        let at_q = e.compare("EQ", &rows, q);
+                        let x = e.select(&at_p, &alpha, &x);
+                        let x = e.select(&at_q, &off, &x);
+                        let y = e.select(&at_p, &off, &y);
+                        let y = e.select(&at_q, &beta, &y);
+                        let a = e.jacobi_update(a, &x, cp);
+                        let a = e.jacobi_update(&a, &y, cq);
+                        let xr = e.transpose(&x, &[1, 0]);
+                        let yr = e.transpose(&y, &[1, 0]);
+                        let a = e.jacobi_update(&a, &xr, [p, &zero]);
+                        let both = e.jacobi_update(&a, &yr, [q, &zero]);
+                        let next_q = e.add(q, &one);
+                        let end_row = e.compare("EQ", &next_q, &limit);
+                        let next_p = e.add(p, &one);
+                        let first_q = e.add(&next_p, &one);
+                        let mut next = vec![
+                            e.select(&end_row, &next_p, p),
+                            e.select(&end_row, &first_q, &next_q),
+                            both,
+                        ];
+                        if let Some(v) = state.get(3) {
+                            let panel = e.gather_axis(v, &indices, 0, 1);
+                            let (x, y) = e.rotate_columns(&panel, n, &c, &s);
+                            let v = e.jacobi_update(v, &x, cp);
+                            next.push(e.jacobi_update(&v, &y, cq));
+                        }
+                        next
+                    });
+                    result.into_iter().skip(2).chain([unfinished]).collect()
                 })
-            })
-        };
-        let mut result = result.into_iter();
-        let a = result.next().unwrap();
-        let zero = self.constant_like(0.0, &a);
-        let mut out = vec![a, zero];
-        if has_vectors {
-            let v = result.next().unwrap();
-            let zero = self.constant_like(0.0, &v);
-            out.extend([v, zero]);
+            });
+            matrices.pop();
         }
-        out
+        // Return the same component layout as the Hermitian iteration.
+        matrices
+            .into_iter()
+            .flat_map(|v| {
+                let zero = self.constant_like(0.0, &v);
+                [v, zero]
+            })
+            .collect()
     }
 
     pub(super) fn matrix_hermitian(
@@ -294,6 +309,7 @@ impl Emitter<'_> {
         id: NodeId,
         input: Pair,
         vectors: bool,
+        real: bool,
     ) -> Result<HermitianEigen, EmitError> {
         let MlirTy::Ranked(dims) = self.cell_ty(&input.0) else {
             return Err(EmitError::at(
@@ -318,12 +334,12 @@ impl Emitter<'_> {
             self.convert(&input.0, ElemKind::Real),
             self.convert(&input.1, ElemKind::Real),
         );
-        let real = self.batch_rank(&input.0) == 0 && self.known_zero(&input.1);
+        let local = real && self.batch_rank(&input.0) == 0;
         // Explicit host batches keep primitive replay, as the solve helpers do.
-        if n > 0 && real && !self.host_batch {
+        if n > 0 && local && !self.host_batch {
             return Ok(self.symmetric_eigen_helper(&input, n, vectors));
         }
-        Ok(self.hermitian_eigen(input, n, vectors, real, true).0)
+        Ok(self.hermitian_eigen(input, n, vectors, local, true).0)
     }
 
     /// Unbatched real symmetric eigenpairs through the versioned private
@@ -428,6 +444,7 @@ impl Emitter<'_> {
         let epsilon = self.eigen_epsilon();
         let HermitianScaling {
             scale,
+            safe_scale,
             scaled,
             adjoint,
             tolerance,
@@ -447,8 +464,7 @@ impl Emitter<'_> {
             initial.extend([identity.clone(), zero_matrix]);
         }
         let result = if real {
-            let vectors = vectors.then(|| initial[2].clone());
-            self.symmetric_jacobi(n, initial[0].clone(), vectors, epsilon)
+            self.symmetric_jacobi(n, &initial[0], initial.get(2), epsilon)
         } else {
             self.matrix_loop(32, 0, &initial, |e, _, state| {
                 e.matrix_loop(n * n, 0, state, |e, index, state| {
@@ -528,7 +544,7 @@ impl Emitter<'_> {
         let sorted = self.compare("EQ", &ranks, &cols);
         let permutation = self.convert(&sorted, ElemKind::Real);
         let permutation_t = self.svd_transpose(&permutation);
-        let values = self.mul(&values, &scale);
+        let values = self.mul(&values, if real { &safe_scale } else { &scale });
         let values = self.matvec(&permutation_t, &values);
         let nan = self.scalar(f64::NAN);
         let values = self.select(&valid, &values, &nan);
@@ -612,10 +628,10 @@ mod tests {
             };
             // Two solves of the same shape share one definition.
             let first = emitter
-                .matrix_hermitian(id, (re.clone(), imaginary.clone()), vectors)
+                .matrix_hermitian(id, (re.clone(), imaginary.clone()), vectors, !complex)
                 .unwrap();
             let second = emitter
-                .matrix_hermitian(id, (re.clone(), imaginary), vectors)
+                .matrix_hermitian(id, (re.clone(), imaginary), vectors, !complex)
                 .unwrap();
             let codes = emitter.runtime_codes();
             let mut rets = vec![&first.values, &second.values];

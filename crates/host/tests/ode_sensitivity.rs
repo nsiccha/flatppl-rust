@@ -203,8 +203,8 @@ fn returned_key(stablehlo: &str) -> &str {
 
 #[test]
 fn a_sampling_export_lowers_its_draw_on_both_step_regimes() {
-    // flatppl-python's snag `ode-sensitivity-3b060798`: the successor key
-    // reached the combination of the two passes and panicked.
+    // A sampling export as flatppl-python compiles it: the successor key
+    // once reached the combination of the two passes and panicked.
     for law in [
         "m = odesolve(decay, [1.0], 0.0, [1.0], k)\noutputs = rand(Normal(m[1][1], 1.0), state)",
         "outputs = rand(Normal(odesolve(decay, [1.0], 0.0, [1.0], k)[1][1], 1.0), state)",

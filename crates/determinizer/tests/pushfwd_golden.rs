@@ -4,7 +4,21 @@
 //! the explicit-bijection form.
 mod common;
 use common::determinize;
+/// A program the tests feed the determinizer infers clean: it is what a user
+/// reaches.
 fn parse_infer(src: &str) -> flatppl_core::Module {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let errors: Vec<_> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "inference errors in:\n{src}\n{errors:?}");
+    m
+}
+
+/// An ill-formed program, for a test that the determinizer still refuses it
+/// when inference has already reported the error.
+fn parse_infer_ill_formed(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
     m
@@ -316,7 +330,7 @@ fn pushfwd_coupled_nonlinear_multivariate_refuses() {
     // term exp(x) depends on the input, so the forward Jacobian is not the
     // constant L and logabsdet(L) would be the wrong log-volume. Refuse rather
     // than mislower (the shift `mu` must not reference the input placeholder).
-    let e = determinize(&parse_infer(
+    let e = determinize(&parse_infer_ill_formed(
         "L = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          d = pushfwd(x -> exp(x) + L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])",
@@ -410,9 +424,9 @@ fn pushfwd_elementwise_both_spellings_byte_equal() {
     // (pushfwd_matrix_affine_nonidentity_logdet) specifically because substring
     // matches can miss a sign/shape bug that a full structural pin catches. The
     // non-degenerate pin here is §06's OWN invariant — the two spellings of the
-    // same elementwise map must lower identically, since §06 nowhere distinguishes
-    // `pushfwd(g, M)` from `pushfwd(x -> broadcast(g, x), M)` and
-    // [`wrap_elementwise`] is their single emission site:
+    // same elementwise map must lower identically, `fn(g.(_))` and
+    // `fn(broadcast(g, _))`, since [`wrap_elementwise`] is their single emission
+    // site:
     //   f_inv(y)  = broadcast(log, y)                 (per-cell scalar inverse)
     //   logvol(y) = sum(broadcast(y -> log(y), y))    (diagonal log-det, per-cell
     //                                                  `log|g'(g⁻¹(yᵢ))| = log yᵢ`,
@@ -425,8 +439,10 @@ fn pushfwd_elementwise_both_spellings_byte_equal() {
     // (§06 → "Engine contract for `pushfwd` density evaluation"), so reproducing
     // `sum(broadcast(log, v))` from `broadcast(log, v)` would need the forward back —
     // the round trip the query-point spelling exists to remove.
-    let bare = pir("d = pushfwd(exp, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
-         lp = logdensityof(d, [0.5, 0.6, 0.7])");
+    let bare = pir(
+        "d = pushfwd(fn(exp.(_)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.5, 0.6, 0.7])",
+    );
     let lambda = pir(
         "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
          lp = logdensityof(d, [0.5, 0.6, 0.7])",
@@ -434,7 +450,7 @@ fn pushfwd_elementwise_both_spellings_byte_equal() {
     assert!(bare.contains("builtin_logdensityof"), "got:\n{bare}");
     assert_eq!(
         bare, lambda,
-        "the bare and broadcast spellings of the same elementwise map must lower identically"
+        "the dotted and broadcast spellings of the same elementwise map must lower identically"
     );
 }
 
@@ -464,7 +480,7 @@ fn pushfwd_matrix_affine_non_square_refuses() {
     // rank-2 shape rowstack/colstack/lower_cholesky produce. linsolve/logabsdet
     // need a square matrix; the non-square guard must recognise this nested
     // form too, or a genuine non-square L silently lowers instead of refusing.
-    let e = determinize(&parse_infer(
+    let e = determinize(&parse_infer_ill_formed(
         "mu = [0.0, 0.0]\n\
          L = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
          d = pushfwd(x -> mu .+ L * x, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\

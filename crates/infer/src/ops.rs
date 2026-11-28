@@ -473,13 +473,9 @@ fn op_rule(
             cumulative_bool_type(arg_ty(args, 0))
         }
         // Vector normalizations: same-shape real vector — shape must thread through.
-        "softmax" | "logsoftmax" => match arg_ty(args, 0) {
-            Some(Type::Array { shape, .. }) if shape.len() == 1 => Type::Array {
-                shape: shape.clone(),
-                elem: Box::new(Type::Scalar(ScalarType::Real)),
-            },
-            _ => Type::Deferred,
-        },
+        "softmax" | "logsoftmax" => arg_ty(args, 0)
+            .and_then(softmax_type)
+            .unwrap_or(Type::Deferred),
 
         // ---- value-preserving assertion (spec §07) ----
         // `checked`/`fixed` are identity for typing (spec §03: `fixed(x)` ≡
@@ -544,7 +540,26 @@ fn op_rule(
             )),
         },
         // tile(A, size) keeps A's rank and element kind; only the sizes change.
-        "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
+        "tile" => match (args.first(), args.get(1)) {
+            (Some((_, Type::Array { shape, elem }, _)), Some((size, _, _))) => {
+                let repeats = count_dims(inf, *size);
+                if shape.len() != repeats.len() {
+                    arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims)
+                } else {
+                    let shape = shape
+                        .iter()
+                        .zip(repeats.iter())
+                        .map(|(&len, &factor)| dim_product(len, factor))
+                        .collect();
+                    Type::Array {
+                        shape,
+                        elem: elem.clone(),
+                    }
+                }
+            }
+            (Some((_, ty, _)), _) => with_dynamic_dims(ty),
+            _ => Type::Deferred,
+        },
         // `aggregate(f, output_axes, expr)` / `metricsum(metric, output_axes,
         // expr)` (spec §04): an einsum-style reduction. The result RANK is the
         // number of output axes (the `output_axes` vector at arg 1); the element
@@ -633,7 +648,9 @@ fn op_rule(
                 args.get(1).map(|a| a.0),
             ),
         ) {
-            (Some(Type::Array { shape, elem }), Some(k)) if shape.len() == 1 && k > 0 => {
+            (Some(Type::Array { shape, elem }), Some(k))
+                if shape.len() == 1 && (k > 0 || inf.concrete_empty_axes) =>
+            {
                 Type::Array {
                     shape: Box::new([crate::consteval::static_dim(k as i64)]),
                     elem: elem.clone(),
@@ -641,18 +658,40 @@ fn op_rule(
             }
             (t, _) => t.map_or(Type::Deferred, with_dynamic_dims),
         },
-        // partition(xs, spec) splits a vector into a vector of sub-vectors (spec
-        // §07): an outer vector whose elements are dynamic-length copies of xs.
-        "partition" => match arg_ty(args, 0) {
-            Some(t @ Type::Array { .. }) => Type::Array {
-                shape: Box::new([Dim::Dynamic]),
-                elem: Box::new(with_dynamic_dims(t)),
-            },
+        "partition" => partition_result(inf, args),
+        "bandedmat" => match (args.first(), args.get(1)) {
+            (Some((_, Type::Array { shape, elem }, _)), Some((rows, _, _))) if shape.len() == 1 => {
+                let rows = resolve_dim(inf, *rows);
+                let cols = match (shape[0], rows) {
+                    (Dim::Static(width), Dim::Static(rows)) => rows
+                        .checked_sub(1)
+                        .and_then(|r| r.checked_add(width))
+                        .map_or(Dim::Dynamic, Dim::Static),
+                    _ => Dim::Dynamic,
+                };
+                Type::Array {
+                    shape: Box::new([rows, cols]),
+                    elem: elem.clone(),
+                }
+            }
             _ => Type::Deferred,
         },
-        // selectbins(edges, region, counts) returns a shorter count array (spec
-        // §07): counts' type and rank, with the selected axis dynamic.
-        "selectbins" => arg_ty(args, 2).map_or(Type::Deferred, with_dynamic_dims),
+        "blockdiagmat" => blockdiag_result(inf, args),
+        "selectbins" => match args {
+            [
+                (edges, _, _),
+                (region, _, _),
+                (_, Type::Array { shape, elem }, _),
+            ] if shape.len() == 1 => {
+                let count =
+                    crate::consteval::fixed_selectbins_count(inf, *edges, *region, shape[0]);
+                Type::Array {
+                    shape: Box::new([count.map_or(Dim::Dynamic, |n| static_dim(n as i64))]),
+                    elem: elem.clone(),
+                }
+            }
+            _ => arg_ty(args, 2).map_or(Type::Deferred, with_dynamic_dims),
+        },
         // addaxes(A, n_leading, n_trailing) (spec §07) inserts `n_leading`
         // size-1 axes before A's axes and `n_trailing` after — exact when the
         // counts are fixed integers: result shape = [1;nl] ++ A.shape ++ [1;nt],
@@ -859,7 +898,7 @@ fn op_rule(
         // the codomain; fall back to `f`'s un-substituted body, then to `%any`
         // (honest — never a guess). Mass is filled (mass-preserving) by `fill_mass`.
         "pushfwd" => {
-            return pushfwd_codomain(inf, args).map(inf, move |_, codomain| {
+            return pushfwd_codomain(inf, id, args, joined).map(inf, move |_, codomain| {
                 (
                     Type::Measure {
                         domain: Box::new(codomain.unwrap_or(Type::Any)),
@@ -2948,6 +2987,16 @@ fn scalar_word(s: ScalarType) -> &'static str {
 /// reductions", `lengthof` counts.
 ///
 /// Heads without a cell rule, including multi-axis index tuples, remain deferred.
+fn softmax_type(cell: &Type) -> Option<Type> {
+    let Type::Array { shape, .. } = cell else {
+        return None;
+    };
+    (shape.len() == 1).then(|| Type::Array {
+        shape: shape.clone(),
+        elem: Box::new(Type::Scalar(ScalarType::Real)),
+    })
+}
+
 fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
     let elem = match cell {
         Type::Array { elem, .. } | Type::TVector { elem, .. } => elem.as_ref(),
@@ -2961,6 +3010,11 @@ fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
         "var" | "std" | "median" | "quantile" | "l1norm" | "l2norm" | "linfnorm" | "logsumexp" => {
             matches!(elem, Type::Scalar(_)).then_some(Type::Scalar(ScalarType::Real))
         }
+        "cumsum" | "cumprod" if bool_elem_array(Some(cell)) => {
+            Some(cumulative_bool_type(Some(cell)))
+        }
+        "cumsum" | "cumprod" | "cummax" | "cummin" => Some(cell.clone()),
+        "softmax" | "logsoftmax" => softmax_type(cell),
         "lany" | "lall" => Some(Type::Scalar(ScalarType::Boolean)),
         "lengthof" => Some(Type::Scalar(ScalarType::Integer)),
         "sizeof" => Some(sizeof_type(Some(cell))),
@@ -3898,6 +3952,7 @@ fn get_array_type(
     for (dim, (node, ty, _)) in shape.iter().zip(selectors) {
         match inf.module.node(*node) {
             Node::Const(name) if inf.module.resolve(*name) == "all" => retained.push(*dim),
+            Node::Const(name) if inf.module.resolve(*name) == "only" && *dim == Dim::Static(1) => {}
             Node::Axis(_) | Node::Lit(Scalar::Int(_)) => {}
             _ => match ty {
                 Type::Scalar(ScalarType::Integer) => {}
@@ -4746,6 +4801,101 @@ fn has_real_array_domain(name: &str) -> bool {
 /// `t` with every array dim (at every nesting level) replaced by `%dynamic`,
 /// preserving rank and element type. For ops that keep an argument's rank and
 /// element but change its sizes (`tile`, `cat`).
+fn dim_product(a: Dim, b: Dim) -> Dim {
+    match (a, b) {
+        (Dim::Static(a), Dim::Static(b)) => a.checked_mul(b).map_or(Dim::Dynamic, Dim::Static),
+        _ => Dim::Dynamic,
+    }
+}
+
+fn partition_result(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
+    let [(_, Type::Array { shape, elem }, _), (spec, kind, _)] = args else {
+        return Type::Deferred;
+    };
+    let [len] = **shape else {
+        return Type::Deferred;
+    };
+    let sizes = count_dims(inf, *spec);
+    let result = match (len, kind, sizes.as_ref()) {
+        (Dim::Static(len), Type::Scalar(ScalarType::Integer), [Dim::Static(group)])
+            if *group > 0 && len % group == 0 =>
+        {
+            Some((Dim::Static(len / group), Dim::Static(*group)))
+        }
+        (Dim::Static(len), Type::Array { .. }, [first @ Dim::Static(_), ..])
+            if sizes.iter().all(|d| d == first)
+                && dim_product(*first, static_dim(sizes.len() as i64)) == Dim::Static(len) =>
+        {
+            Some((static_dim(sizes.len() as i64), *first))
+        }
+        _ => None,
+    };
+    let (outer, inner) = result.unwrap_or((Dim::Dynamic, Dim::Dynamic));
+    Type::Array {
+        shape: Box::new([outer]),
+        elem: Box::new(Type::Array {
+            shape: Box::new([inner]),
+            elem: elem.clone(),
+        }),
+    }
+}
+
+fn blockdiag_result(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
+    let Some((mats, ty, _)) = args.first() else {
+        return Type::Deferred;
+    };
+    if let Type::Array { shape, elem } = ty
+        && let &[count] = shape.as_ref()
+        && let Type::Array { shape, elem } = elem.as_ref()
+        && let &[rows, cols] = shape.as_ref()
+    {
+        return Type::Array {
+            shape: Box::new([dim_product(count, rows), dim_product(count, cols)]),
+            elem: elem.clone(),
+        };
+    }
+    let resolved = flatppl_core::graph::resolve_ref(inf.module, *mats).0;
+    let Some(vector) = flatppl_core::graph::expect_builtin_call(inf.module, resolved, "vector")
+    else {
+        return Type::Deferred;
+    };
+    let mut dimensions = [0_u32; 2];
+    let mut kind = None;
+    for &value in &vector.args {
+        let (ty, _) = inf.node_annotation(value);
+        let Type::Array { shape, elem } = ty else {
+            return Type::Deferred;
+        };
+        let [Dim::Static(rows), Dim::Static(cols)] = *shape else {
+            return Type::Deferred;
+        };
+        let Type::Scalar(scalar) = *elem else {
+            return Type::Deferred;
+        };
+        if let (Some(a), Some(b)) = (
+            dimensions[0].checked_add(rows),
+            dimensions[1].checked_add(cols),
+        ) {
+            dimensions = [a, b];
+        } else {
+            return Type::Deferred;
+        }
+        kind = Some(match kind {
+            None => scalar,
+            Some(previous) => {
+                match promote2(Some(&Type::Scalar(previous)), Some(&Type::Scalar(scalar))) {
+                    Type::Scalar(kind) => kind,
+                    _ => return Type::Deferred,
+                }
+            }
+        });
+    }
+    kind.map_or(Type::Deferred, |kind| Type::Array {
+        shape: Box::new(dimensions.map(Dim::Static)),
+        elem: Box::new(Type::Scalar(kind)),
+    })
+}
+
 fn with_dynamic_dims(t: &Type) -> Type {
     match t {
         Type::Array { shape, elem } => Type::Array {
@@ -6994,7 +7144,12 @@ fn reified_body(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<NodeId> {
 /// and `f`'s re-inferred body type is the codomain. Falls back to `f`'s
 /// un-substituted body type, then `None` (caller uses `%any`) when `f` is not a
 /// resolvable reification or its body is `%deferred`.
-fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Option<Type>> {
+fn pushfwd_codomain(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    joined: Phase,
+) -> RuleStep<Option<Type>> {
     let Some((f_node, _, _)) = args.first() else {
         return Ready(None);
     };
@@ -7016,15 +7171,62 @@ fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<
         }
         _ => None,
     };
-    let sub = match seed {
-        Some(s) => substituted_result(inf, f_node, &s, &[], None, true),
-        None => Ready(None),
+    // A one-argument function whose §07 domain is a scalar is no map of an
+    // array variate, bare or as a `bijection`'s forward: §04 broadcasting
+    // applies to calls, and a bare name is no call, so the elementwise map is
+    // written `fn(f.(_))`.
+    let forward = resolve_binding_refs(inf, f_node);
+    if let (Some(s), Node::Const(op)) = (&seed, inf.module.node(forward))
+        && crate::scalar_domain_function(inf.module.resolve(*op))
+        && matches!(&s[0].1, Type::Array { .. } | Type::TVector { .. })
+    {
+        let name = inf.module.resolve(*op).to_string();
+        inf.diags.push(crate::Diagnostic::error_at(
+            args[0].0,
+            format!(
+                "pushfwd's map `{name}` takes a scalar, and the base measure's variate is an \
+                 array. Write the elementwise map `fn({name}.(_))` (spec §04 \"Broadcasting\")"
+            ),
+        ));
+        return Ready(Some(Type::Failed(
+            format!("pushfwd through `{name}` of an array variate").into(),
+        )));
+    }
+    // A built-in function as the map (`pushfwd(log, M)`, §06 recognizes the
+    // maps by name) takes the ordinary call checks at M's domain, as a
+    // built-in `weighted` weight does. Any other name than the scalar-domain
+    // ones above (an array domain: `inv`, `row_gram`, `sum`; both: `neg`; two
+    // arguments: `atan2`) takes the call check with the whole variate. A
+    // distribution name is no map (§06 takes a function) and keeps the rule
+    // below, as does a `bijection(…)` map.
+    use crate::catalogue::Sig;
+    let builtin = match inf.module.node(resolved) {
+        Node::Const(op)
+            if !matches!(
+                crate::catalogue::builtin().base(inf.module.resolve(*op)),
+                Some(Sig::Distribution { .. })
+            ) =>
+        {
+            Some(*op)
+        }
+        _ => None,
+    };
+    let sub = match (seed, builtin) {
+        (Some(s), Some(op)) => {
+            let application = Call {
+                head: CallHead::Builtin(op),
+                args: s.iter().map(|arg| arg.0).collect(),
+                named: Box::new([]),
+                inputs: None,
+            };
+            call_rule(inf, id, &application, None, &s, &[], joined).map(inf, |_, (ty, _)| Some(ty))
+        }
+        (Some(s), None) => substituted_result(inf, f_node, &s, &[], None, true)
+            .map(inf, |_, sub| sub.map(|(ty, _)| ty)),
+        (None, _) => Ready(None),
     };
     sub.map(inf, move |inf, sub| {
-        match sub
-            .map(|(ty, _)| ty)
-            .or_else(|| reified_result_type(inf, f_node))
-        {
+        match sub.or_else(|| reified_result_type(inf, f_node)) {
             Some(Type::Deferred) | None => None,
             Some(t) => Some(t),
         }
@@ -7927,7 +8129,7 @@ fn broadcast_type(
             "complex" | "cis" | "real" | "imag" | "conj" | "abs" | "abs2" | "exp" | "log" | "sqrt"
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
             | "acosh" | "atanh" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1"
-            | "loggamma",
+            | "loggamma" | "boolean" | "floor" | "ceil" | "round",
             _,
         ) => function_result(inf.module, &op_name, &cells).unwrap_or(Type::Deferred),
         // The comparisons and the logical connectives, whose per-cell result is a

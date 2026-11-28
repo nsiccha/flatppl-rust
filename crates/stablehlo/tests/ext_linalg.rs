@@ -66,6 +66,25 @@ fn hermitian_values_and_vector_columns_retain_batch_axes() {
 }
 
 #[test]
+fn unbatched_real_jacobi_rotates_rows_and_columns_in_the_upper_triangle() {
+    for output in ["e.eigh(A).vectors", "e.eigvalsh(A)"] {
+        let ir = emit(&format!(
+            "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
+             A=external(cartpow(reals,[5,5]))\ninputs=A\noutputs={output}"
+        ));
+        assert!(ir.contains("dense<10> : tensor<i64>")); // 5 × 4 / 2 pairs
+        assert!(ir.lines().any(|line| {
+            line.contains("stablehlo.gather") && line.ends_with("-> tensor<5x2xf32>")
+        }));
+        for shape in ["tensor<5x1xf32>", "tensor<1x5xf32>"] {
+            assert!(ir.lines().any(|line| {
+                line.contains("stablehlo.dynamic_update_slice") && line.contains(shape)
+            }));
+        }
+    }
+}
+
+#[test]
 fn empty_rank_is_an_authored_output_even_when_status_has_the_same_ssa() {
     let ir = emit(
         "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
@@ -88,34 +107,5 @@ fn authored_zero_does_not_change_the_slot_of_a_runtime_failure() {
     assert!(
         signature.contains("-> (tensor<i32>, tensor<i32>, tensor<i32>)"),
         "{signature}"
-    );
-}
-
-#[test]
-fn real_eigh_rotates_only_the_affected_rows_and_columns() {
-    let real = emit(
-        "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
-         A=external(cartpow(reals,[5,5]))\n\
-         inputs=A\noutputs=e.eigh(A).vectors",
-    );
-    assert!(real.contains("stablehlo.dynamic_update_slice"), "{real}");
-    // The inner loop visits each pair p < q once: 5 * 4 / 2 iterations.
-    assert!(
-        real.contains("stablehlo.constant dense<10> : tensor<i64>"),
-        "{real}"
-    );
-    assert!(
-        !real.contains("stablehlo.constant dense<25> : tensor<i64>"),
-        "{real}"
-    );
-    // Batched cells keep the masked rotation.
-    let batched = emit(
-        "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
-         A=external(cartpow(cartpow(reals,[5,5]),3))\n\
-         vectors(a)=e.eigh(a).vectors\ninputs=A\noutputs=vectors.(A)",
-    );
-    assert!(
-        !batched.contains("stablehlo.dynamic_update_slice"),
-        "{batched}"
     );
 }

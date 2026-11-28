@@ -244,75 +244,33 @@ fn fixed_category_files_fold_after_loading_and_promoted_labels_stay_live() {
 }
 
 #[test]
-fn loaded_regression_data_reduce_whatever_value_set_they_declare() {
+fn fixed_record_groups_reduce_after_loading_and_promoted_records_stay_live() {
     let directory =
-        std::env::temp_dir().join(format!("flatppl-loaded-regression-{}", std::process::id()));
+        std::env::temp_dir().join(format!("flatppl-record-groups-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(
-        directory.join("X.json"),
-        "[[1.0,62.0],[1.0,70.5],[1.0,66.0],[1.0,59.0],[1.0,73.0],[1.0,68.0]]",
-    )
-    .unwrap();
-    std::fs::write(
-        directory.join("y.json"),
-        "[21000.0,52000.0,30500.0,9000.0,61000.0,40000.0]",
-    )
-    .unwrap();
+    let source = directory.join("query.flatppl");
     std::fs::write(
         directory.join("data.json"),
-        r#"{"earn":[21000.0,52000.0,30500.0,9000.0,61000.0,40000.0],"height":[62.0,70.5,66.0,59.0,73.0,68.0]}"#,
+        r#"{"rows":{"g":[2,1,1,3,2],"y":[4.0,0.0,2.0,1.0,3.0]}}"#,
     )
     .unwrap();
-    let matrix = |x: &str, y: &str| {
-        format!(
-            "X=load_data(\"X.json\",cartpow({x},[6,2]))\ny=load_data(\"y.json\",cartpow({y},6))\nbeta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\ninputs=(beta,sigma)\noutputs=logdensityof(Normal.(X*beta,sigma),y)"
-        )
-    };
-    let record = |y: &str| {
-        format!(
-            "data=load_data(\"data.json\",cartprod(earn=cartpow({y},6),height=cartpow({y},6)))\nX=colstack([ones(6),data.height])\nbeta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\ninputs=(beta,sigma)\noutputs=logdensityof(Normal.(X*beta,sigma),data.earn)"
-        )
-    };
-    let source = directory.join("query.flatppl");
-    let emit = |model: &str| {
-        std::fs::write(&source, model).unwrap();
+    for (inputs, fixed) in [("mu", true), ("(mu,d)", false)] {
+        let query = format!(
+            "mu=elementof(cartpow(reals,4))\nd=load_data(\"data.json\",cartprod(rows=cartprod(g=cartpow(posintegers,5),y=cartpow(reals,5))))\nrows=d.rows\ninputs={inputs}\noutputs=logdensityof(Normal.(mu[rows.g],1.0),rows.y)"
+        );
+        std::fs::write(&source, query).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_flatppl"))
-            .args(["stablehlo", "--dtype", "f64", "--explain-reductions"])
+            .args(["determinize", "--explain-reductions"])
             .arg(&source)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{model}");
-        (output.stdout, String::from_utf8(output.stderr).unwrap())
-    };
-    let (bounded, report) = emit(&matrix("interval(-100.0,100.0)", "interval(0.0,1e6)"));
-    assert!(
-        report.contains("reduced by regression statistics"),
-        "{report}"
-    );
-    for model in [
-        matrix("reals", "reals"),
-        matrix("reals", "posreals"),
-        record("posreals"),
-    ] {
-        let (program, report) = emit(&model);
-        assert!(
-            report.contains(
-                "Likelihood reductions (lowering):\noutputs [NodeId("
-            ) && report.contains(
-                "Normal: retained: regression data need fixed finite values or a bounded value set"
-            ),
+        let report = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{report}");
+        assert_eq!(
+            report.contains("5 observations, 3 occupied groups, 1 singletons"),
+            fixed,
             "{report}"
         );
-        assert!(
-            report
-                .split("(materialized data):")
-                .nth(1)
-                .is_some_and(|after| after.contains("Normal: reduced by regression statistics")),
-            "{report}"
-        );
-        if model.contains("load_data(\"X.json\"") {
-            assert_eq!(program, bounded, "{model}");
-        }
     }
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -294,13 +294,10 @@ arithmetic inside per-cell lambdas retain ordinary scoring.
 Literal observations and derived data vectors use
 partitions with total selector length equal to the observation count. No
 operation scans every observation once per possible group, and unused groups
-add no scoring terms on the fixed-partition path. Runtime Bernoulli scoring batches
-the group terms. Fixed-partition group terms of one shape, differing only in
-literals, summaries and literal parameter cells, become one elementwise
-`broadcast` over stacked group vectors and a `sum`, so the scoring program does
-not grow with the number of groups. The summaries, and so the preparation ABI,
-are unchanged. Terms that inference cannot type in vector form keep their
-scalar form.
+add no scoring terms on the fixed-partition path. Fixed groups with matching scalar
+score expressions share one broadcast and reduction per shape. A scalar or record
+result must retain its exact cell type along the group axis. Remaining groups
+keep their scalar scores. Runtime Bernoulli scoring batches the group terms.
 Preparation reuses monotonically allocated summary names.
 Runtime Normal and LogNormal partitions also prepare guarded centered moments.
 Gathered parameters must share their selector, origin and array extent. Scalar
@@ -401,16 +398,13 @@ and retains raw data needed by unreduced factors or other outputs. No identity
 cache can silently retain a caller's changed arrays. Both queries must use the
 same numeric precision.
 
-Fixed data are literals in the emitted program, and XLA does not fold loops
-over them, so ordinary emission repeats data-only setup, such as a bounded QR,
-on every call. `LoadedModule::compile_prepared` splits the ordinarily reduced
-query like explicit preparation with no data inputs, since some reductions
-match fixed data only before `load_data` becomes literals. It returns the
-scoring program with the preparation as `Export::preparation`. A host runs the
-preparation once, checks its status, and passes its output leaves after the
-declared input leaves of every call. Batched prepared compiles share those
-leaves across batch cells. Queries without separable summaries compile as
-`compile` does.
+`LoadedModule::compile_prepared` can split the lowered query using only
+fixed data from the module's snapshot. A successful split adds a zero-input
+`preparation` query to the export. The host runs it once per binding, checks
+its runtime status, and passes its tensor results in order after the declared
+inputs of each score call. Both programs use the selected precision and target.
+`compile_batched_prepared` takes an unmapped axis row for each trailing tensor.
+Queries without eligible summaries use ordinary emission.
 
 `LoweringOptions::disable_sufficient_statistics` disables the shared rewrite.
 `EmitOptions::sufficient_statistics` controls both shared lowering and the
