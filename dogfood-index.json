@@ -1,0 +1,555 @@
+{
+  "schema": 1,
+  "line": {
+    "repo": "nsiccha/flatppl-rust",
+    "ref": "dogfood",
+    "sha": "08da2bb2129320bf422c4561762d5032a3867fc4"
+  },
+  "upstream": {
+    "repo": "flatppl/flatppl-rust",
+    "ref": "main",
+    "sha": "f5508b32904b09fd561ac0255322c4747c171a85"
+  },
+  "prepared_at": "2026-11-28T02:53:40Z",
+  "problems": [
+    {
+      "id": "odesolve",
+      "role": "fix",
+      "title": "No ODE solver: add odesolve with Stan rk45-equivalent dense output",
+      "summary": "FlatPPL could not express models whose likelihood needs an ODE solution (PosteriorDB lotka_volterra, one_comp_mm_elim_abs, soil_incubation). odesolve(f, y0, t0, ts[, p]; rtol, atol, max_steps) lowers to an adaptive Dormand-Prince 5(4) integrator that reproduces Boost.Odeint's dense-output integrate_times as Stan's ode_rk45 drives it. Enzyme-JAX forward mode differentiates it; its reverse mode does not yet support the data-dependent loop.",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "1247e3e07e56d213bdcd75dc52d72ddbfc7d0a5d",
+          "bd3b502dc7377b912932030da1ce695b516d6880",
+          "1ee0455063ceabc03b09346b940f009e5bea9fe4",
+          "5cd91e9095287f17650a24091c45e3e2b2216f5c"
+        ],
+        "why_together": "The builtin, its inference rule, the Stan-matching integrator and the doc of its AD boundary."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/odesolve.rs"
+          ],
+          "result": "passed",
+          "detail": "Lotka-Volterra log density within 4.3e-12 of BridgeStan 2.9.0 log_density at three points; one-compartment Michaelis-Menten and two-pool soil within ~1e-9 of exact solutions; forward-mode derivatives within 5e-8 of central differences of an exact solve."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/odesolve.rs"
+          ],
+          "result": "passed",
+          "detail": "At 08da2bb: Lotka-Volterra log density within 4.5e-13 of BridgeStan 2.9.0 log_density at three points; at tight tolerances within 8.4e-10 of an exact solve; one-compartment Michaelis-Menten trajectories within 1.5e-9 and two-pool soil pools within 9.1e-10 of exact solutions. The branch's test suites pass at 08da2bb, on upstream f5508b3."
+        }
+      ]
+    },
+    {
+      "id": "record-set-membership",
+      "role": "regression",
+      "title": "'in' over a record set refused record-valued points that are not written out",
+      "summary": "A truncated record-set Lebesgue prior queried with one whole record input refused with \"'in' over a record set needs a written record point\" (PosteriorDB uk_drivers-state_space_stochastic_level_stochastic_seasonal). Record points are now tested field by field. Upstream fixed this itself (#726). From upstream f5508b3 on the branch runs upstream's lowering and keeps only its regression test of the whole-record query.",
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/flatppl/flatppl-rust/pull/726",
+          "relation": "superseded-by"
+        }
+      ],
+      "fix": {
+        "originals": [
+          "fdc0e1a3807560fee44df8a0caad1ecf7f374953"
+        ],
+        "why_together": "One lowering change and its test."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/record_set_membership.rs"
+          ],
+          "result": "passed",
+          "detail": "Values and Enzyme gradients bit-identical to the written-record query at the three testsuite oracle points; gradients within 4.2e-11 of the BridgeStan-derived expectations."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/record_set_membership.rs"
+          ],
+          "result": "passed",
+          "detail": "With upstream's lowering: values and Enzyme gradients are bit-identical between the whole-record and the written-record query at the three testsuite oracle points; gradients within 4.2e-11 of the BridgeStan-derived expectations."
+        }
+      ]
+    },
+    {
+      "id": "lognormal-cdf",
+      "role": "regression",
+      "title": "Truncated LogNormal could not be normalized (no LogNormal CDF)",
+      "summary": "normalize(truncate(LogNormal(mu, sigma), interval(a, b))) refused because builtin_touniform had no LogNormal CDF. Upstream added the CDF itself (#749). From upstream f5508b3 on the branch runs upstream's and keeps only its regression test of the truncated law.",
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/flatppl/flatppl-rust/pull/749",
+          "relation": "superseded-by"
+        }
+      ],
+      "fix": {
+        "originals": [
+          "520bcd24e138287d53d68395f71c0e96317d0cf4"
+        ],
+        "why_together": "One registry entry and its test."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/lognormal_cdf.rs"
+          ],
+          "result": "passed",
+          "detail": "Log densities within 4.4e-16 of scipy.stats.lognorm; Enzyme gradients within ~1e-10 of central differences."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/lognormal_cdf.rs"
+          ],
+          "result": "passed",
+          "detail": "With upstream's CDF: log densities within 4.4e-16 of scipy.stats.lognorm; Enzyme gradients within 5e-10 of central differences."
+        }
+      ]
+    },
+    {
+      "id": "logit-scale-bernoulli-binomial",
+      "role": "fix",
+      "title": "Bernoulli/Binomial densities with an invlogit probability saturate at large logits",
+      "summary": "Bernoulli/Binomial densities with an invlogit probability are scored on the logit scale in StableHLO (finite values and gradients at large logits). Upstream fixed this itself (#725): it scores both outcomes from the smaller probability and the log odds. From upstream f5508b3 on the branch runs upstream's code and carries none of its own for this.",
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/flatppl/flatppl-rust/pull/725",
+          "relation": "superseded-by"
+        }
+      ],
+      "fix": {
+        "originals": [
+          "fa5ffd65853df07f3494c225bcf40d0dd9dd4da1"
+        ],
+        "why_together": "One lowering change across the density and likelihood-summary paths, with its tests."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/logit_link_densities.rs"
+          ],
+          "result": "passed",
+          "detail": "Finite values and gradients at logits of +-1000; full-model SAT 2PL scores within 7e-10 of BridgeStan at abilities +-50."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/host/tests/repeated_predictors.rs",
+            "crates/stablehlo/tests/golden.rs"
+          ],
+          "result": "passed",
+          "detail": "With upstream's scoring: grouped logit Bernoulli and Binomial scores within 6.3e-16 of the unreduced program at six points with logits up to 800, all finite; PosteriorDB wells and GLM binomial queries finite at eight reference points with gradients within 2.9e-15 relative."
+        }
+      ]
+    },
+    {
+      "id": "corrcholesky",
+      "role": "fix",
+      "title": "No set for Cholesky correlation factors (support of LKJCholesky)",
+      "summary": "Models with Cholesky-factor correlation parameters (PosteriorDB dogs-dogs_nonhierarchical, sat-hier_2pl, synthetic_grid_RBF_kernels-kronecker_gp) could not declare or chart them. corrcholesky(n) adds the set with Stan's chart and n(n-1)/2 free coordinates. Upstream's chart-deficit bookkeeping treats the set as it treats the support of LKJCholesky: a lower-dimensional set without a reference measure.",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "d61c641b0def5d39619b7320b583fdf770733c21"
+        ],
+        "why_together": "The set across core, inference, FlatPIR, host chart, StableHLO membership, Stan emission and tooling."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/infer",
+            "crates/host",
+            "crates/stablehlo",
+            "crates/stan"
+          ],
+          "result": "passed",
+          "detail": "LKJCholesky log densities within 8.3e-16 relative of Stan math at 60 digits; chart log-Jacobian within 2.3e-13 of Stan's; free-coordinate gradients match."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/infer",
+            "crates/host",
+            "crates/stablehlo",
+            "crates/stan"
+          ],
+          "result": "passed",
+          "detail": "The branch's test suites pass at 08da2bb, on upstream f5508b3."
+        }
+      ]
+    },
+    {
+      "id": "nested-product-charts",
+      "role": "fix",
+      "title": "Coordinate transforms refused powers of array sets (nested product leaves)",
+      "summary": "Free-coordinate charts refused records with fields such as cartpow(stdsimplex(3), 3) or arrays of vectors (\"coordinate transforms require scalar or scalar-array leaves in records and table rows\"), and inspection domains flattened arrays of arrays to matrices (PosteriorDB hmm_gaussian, iohmm_reg, ldaK2/ldaK5). Powers of array sets are now charted element by element and keep their nesting; linfnorm lowers per cell inside a broadcast.",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "b2f5579fddbc2df6d479c6e3f6ab385195825b9e",
+          "2fa1bf2eab09612ec00fd5d1fe8f47d0bdcaaffe",
+          "12a5f6c86f418e050561fd393ddaeb4618a52e1b"
+        ],
+        "why_together": "A StableHLO prerequisite (per-cell linfnorm) and the host chart and domain changes it enables."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/host",
+            "crates/stablehlo/tests/golden_norms.rs",
+            "crates/stablehlo/tests/golden_order.rs"
+          ],
+          "result": "passed",
+          "detail": "Constrained densities within 1.3e-14 (hmm_gaussian), 7.9e-16 (iohmm_reg) and 4.7e-14 (three_men1-ldaK2) relative of BridgeStan 2.9.0 at its oracle points; round trips within 5.6e-16; log volumes and gradients agree with finite differences."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/host",
+            "crates/stablehlo/tests/golden_order.rs"
+          ],
+          "result": "passed",
+          "detail": "The branch's test suites pass at 08da2bb, on upstream f5508b3."
+        }
+      ]
+    },
+    {
+      "id": "fixed-data-reduction-overhead",
+      "role": "fix",
+      "title": "Likelihood reductions with fixed data re-ran their data-only setup on every call",
+      "summary": "With fixed data, the sufficient-statistic reductions emitted their data-only setup into the scoring program, and XLA does not fold loops over constants: a regression's bounded QR ran on every value and gradient call (PosteriorDB earnings-earn_height, nes1984-nes), and grouped summaries scored each group with its own scalar term (radon partially pooled, 85 groups). LoadedModule::compile_prepared returns the data-only preparation as Export::preparation for a host to run once per compile (python-api: export(..., prepare_fixed_data=True); the default ABI is unchanged), and same-shape group terms are scored as one broadcast plus a sum. Upstream added the prepared compile with the same interface (LoadedModule::compile_prepared, Export::preparation) and its own group vectorizer (#727). From upstream f5508b3 on the branch runs upstream's code and carries none of its own for this.",
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/flatppl/flatppl-rust/pull/727",
+          "relation": "superseded-by"
+        }
+      ],
+      "fix": {
+        "originals": [
+          "77df07a7051195c9a2d24eb8fea253c042c8d04d",
+          "9949b2a39e782a05ed440dee66b1e34547dafc33",
+          "81b081e7a3cbdb8a3b15a66f556dd9eb4d3b43bd"
+        ],
+        "why_together": "The prepared compile and the grouped-term vectorizer address the two halves of the per-call cost of fixed-data reductions; the third commit keeps vectorized invlogit group probabilities on the logit scale."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/host/tests/prepared_compile.rs",
+            "crates/determinizer/tests/sufficient_statistics.rs",
+            "crates/host/tests/repeated_predictors.rs"
+          ],
+          "result": "passed",
+          "detail": "Values and gradients agree with the unreduced program within 4.4e-13 relative at four prior points per model, and grouped logit Bernoulli/Binomial scores within 4.3e-16 at logits up to 800. Per jitted value-and-gradient call (one XLA thread, a host running the preparation once): earn_height 135 -> 5.0 us, nes1984 631 -> 4.9 us, radon partially pooled 34 -> 7.6 us, against a 3.9 us jax.jit dispatch floor."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/host/tests/prepared_compile.rs",
+            "crates/determinizer/tests/sufficient_statistics.rs"
+          ],
+          "result": "passed",
+          "detail": "With upstream's preparation: prepared scores of earnings-earn_height and nes1984-nes agree with the unreduced programs within 8.5e-14 relative in value and gradient at six points, and the per-call programs contain no loop. Inputs, outputs and the preparation interface of 172 host exports are unchanged from the previous tip."
+        }
+      ]
+    },
+    {
+      "id": "eigh-jacobi-sweep-cost",
+      "role": "fix",
+      "title": "Real symmetric eigh cost O(n^4) per Jacobi sweep",
+      "summary": "ext-linear-algebra eigh ran its cyclic Jacobi iteration over all n^2 index pairs per sweep and applied every rotation to the whole n x n matrix through masks, carrying a zero imaginary part for real input: O(n^2) per rotation and O(n^4) per sweep. Spectral models were therefore far slower than their dense equivalents (a FlatPPL port of PosteriorDB synthetic_grid_RBF_kernels-kronecker_gp that uses two 30 x 30 eigh calls: 594 ms per log density against 18.7 ms for a dense formulation). Unbatched real input now visits only the pairs p < q in the same cyclic order and updates just rows and columns p and q: O(n) per rotation and O(n^3) per sweep. Rotation formulas, the sweep budget, the convergence and Hermitian checks, sorting and phase canonicalization are unchanged; batched and complex input keep the masked loop. Upstream rewrote the unbatched real loop itself (#724): two-column panels, a signed tangent, and no further rotations after the sweep that follows convergence. From upstream f5508b3 on the branch runs upstream's loop.",
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/flatppl/flatppl-rust/pull/724",
+          "relation": "superseded-by"
+        }
+      ],
+      "fix": {
+        "originals": [
+          "87ebd099b38c69d8a86c24dca2b485a8b6bbc7f9"
+        ],
+        "why_together": "One lowering change and its test."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/ext_linalg.rs"
+          ],
+          "result": "passed",
+          "detail": "Eigenvalues within 4.7e-15, eigenvectors (canonical phase) within 8.4e-15 and gradients within 1.2e-12 of numpy and jax.numpy.linalg.eigh for real symmetric n = 1, 2, 3, 5, 8 and 30 (including an RBF kernel with clustered eigenvalues, L L^T of a normalized Cholesky factor, diagonal and rank-one matrices), complex Hermitian n = 3 and 8, and a 4 x 6 x 6 batch. On a score with two 30 x 30 eigendecompositions, one CPU core: value 538-599 -> 6.6-7.1 ms, value and gradient 863-946 -> 254-327 ms."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/ext_linalg.rs"
+          ],
+          "result": "passed",
+          "detail": "With upstream's loop: eigenvalues within 1.8e-15, residuals within 7.2e-15 and orthogonality within 4.5e-15 of numpy for real symmetric n = 1, 2, 3, 5, 8 and 30 (random, RBF, L L^T, diagonal, rank-one and 1e300-scaled matrices); runtime statuses unchanged. n = 30 value: 0.44 ms against 3.2 ms for the branch's previous 32-sweep loop."
+        }
+      ]
+    },
+    {
+      "id": "fixed-data-compile-memory",
+      "role": "fix",
+      "title": "Large fixed load_data exhausted memory at compile time",
+      "summary": "A fixed load_data array became one literal node per value, then one string and one scalar copy per value in the StableHLO emitter, so the 47 million fixed values of PosteriorDB mnist could not be compiled (a run was stopped at 16.9 GiB). Fixed data are now held as packed literal vectors in one shared buffer (Node::Packed), which inference, the emitter and the likelihood reductions treat as the equivalent vector call. load_data decodes JSON straight into typed buffers, and a host Constant::Array keeps its entries in typed buffers (ArrayData, a change to the flatppl-host Rust API). The JSON format and the emitted programs are unchanged. The rules upstream added up to f5508b3 (fixed filter counts, fixed-value proofs, repeated predictor rows, the optimiser's indexed Poisson partition and stacked columns) read the packed form too.",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "4d7ff67cc0f657e972c7bf2f01a78aae859ff388",
+          "ece73bafccd4ef200f1cc684dee2c4dbab841f87"
+        ],
+        "why_together": "One representation change across core, inference, the emitter, the reductions and the host data readers, and its reading in the fixed-data rules upstream added afterwards."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/host/tests/packed_data.rs"
+          ],
+          "result": "passed",
+          "detail": "Every model emits the same StableHLO as before. MNIST-shaped data with 6000 rows (4.7 million values): compile pipeline peak 1.42 -> 0.16 GiB and 24 -> 0.5 s, 586 nodes instead of 4.7 million. The full 47-million-value mnist data compile through the Python bindings at a 2.0 GiB peak in 6 s."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/host/tests/packed_data.rs"
+          ],
+          "result": "passed",
+          "detail": "At 08da2bb, 114 of the 116 models of the flatppl-testsuite PosteriorDB corpus emit the same StableHLO as upstream f5508b3; the other two differ in a scalar constant reshaped to one element and in value numbering. Values and reverse-mode gradients of all 116 agree with the previous tip within 6.6e-15 and 1.5e-11 relative."
+        }
+      ]
+    },
+    {
+      "id": "regression-reduction-unbounded-data",
+      "role": "fix",
+      "title": "Gaussian regressions with data loaded on reals or posreals kept the full likelihood",
+      "summary": "The regression-statistics reduction proved its data finite only from a bounded declared value set or a vector of literals. Data read with load_data on reals or posreals, the usual spelling (PosteriorDB earnings-earn_height, nes1984-nes), therefore kept the per-row likelihood: once loaded, the values arrive as array literals, record field reads, ones(n) and ifelse indicator columns. The finiteness proof and the bounds of the row-scaled regression now read those forms, so the reduction applies once load_data is materialized, whatever value set the source declared. When finiteness alone still blocks it, the reduction report says so. Upstream fixed this itself (#753) by evaluating data-only expressions over the prepared literals, which also covers derived columns such as a logarithm or a product of columns. It applies on the preparing path only: a plain compile of such a regression keeps the per-row likelihood, a prepared compile reduces it. From upstream f5508b3 on the branch runs upstream's code and carries none of its own for this.",
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/flatppl/flatppl-rust/pull/753",
+          "relation": "superseded-by"
+        }
+      ],
+      "fix": {
+        "originals": [
+          "5291a06cd43ddad3a772d791401b370538f1085e"
+        ],
+        "why_together": "One change to the finiteness proof and the bounds reader, with its tests."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/determinizer/tests/sufficient_statistics.rs",
+            "crates/cli/tests/sufficient_statistics.rs"
+          ],
+          "result": "passed",
+          "detail": "A reals spelling of a loaded design emits byte-identical StableHLO to its bounded spelling. Reduced against unreduced values and gradients agree within 6.6e-14 relative over 14 points on three modules. Prepared value and gradient per call in a compiled loop: earnings-earn_height 833 -> 20 ns, nes1984-nes 1245 -> 38 ns."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/host/tests/model_analysis.rs"
+          ],
+          "result": "passed",
+          "detail": "With upstream's proof: prepared compiles of the earnings-earn_height and nes1984-nes queries, whose data are declared on reals, still carry a preparation and no loop in the score; prepared values and gradients within 8.5e-14 relative of the unreduced programs."
+        }
+      ]
+    },
+    {
+      "id": "odesolve-step-size-derivative",
+      "role": "fix",
+      "title": "odesolve gradients differentiated the adaptive step-size controller (up to 44% off)",
+      "summary": "Each Dormand-Prince step size follows from the error estimate, which depends on the parameters, so differentiating odesolve also differentiated the controller and added d(solution)/d(step size) times d(step size)/d(parameters), a term the ODE's solution does not have. On PosteriorDB lotka_volterra at Stan's rtol 1e-5, atol 1e-3 the gradient's worst coordinate was up to 44% from an exact sensitivity solve. The controller now reads the error norm as floor(err * 2^64) / 2^64: the same value with zero derivative (StableHLO has no stop-gradient), so step sizes and accept/reject decisions carry no derivative, as in Stan. The sensitivities are still not part of the error estimate.",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "8374d5ada5e182addb91fd3301afcdf99dd0c1ea"
+        ],
+        "why_together": "One lowering change and its test."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/odesolve.rs"
+          ],
+          "result": "passed",
+          "detail": "Log densities bit-identical to the previous lowering. Lotka-Volterra (rtol 1e-5, atol 1e-3) against a 1e-13 sensitivity solve at three points: gradient worst coordinate 3.7e-2, 6.3e-2, 4.4e-1 -> 1.8e-3, 3.2e-3, 9.9e-3 (Stan 3.6e-4, 1.4e-4, 2.8e-3). One-compartment Michaelis-Menten: 1.4e-8..1.9e-8 -> 1.3e-9..2.7e-9. Reverse against forward mode within 1.4e-12."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/odesolve.rs"
+          ],
+          "result": "passed",
+          "detail": "The branch's test suites pass at 08da2bb, on upstream f5508b3."
+        }
+      ]
+    },
+    {
+      "id": "odesolve-steady-state-reverse-nan",
+      "role": "fix",
+      "title": "Reverse-mode odesolve gradients were NaN at an ODE steady state",
+      "summary": "The step-size controller computes both factors on every step and selects one. At a steady state (for example lotka_volterra started at its equilibrium) every error estimate is exactly 0, so the unselected rejection factor err^(-1/3) was +inf, and reverse mode turned the discarded branch's zero cotangent into NaN for every parameter. The rejection factor now reads max(err, 1), which equals err wherever a step is rejected, so values, step sizes and forward-mode derivatives are unchanged.",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "4c927ab4d765c3ac6d73be3458467ef742f67443"
+        ],
+        "why_together": "One lowering change and its test."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/odesolve.rs"
+          ],
+          "result": "passed",
+          "detail": "Lotka-Volterra at its equilibrium: the reverse gradient was NaN in all six ODE coordinates and now equals forward mode within 1.7e-14, at the model's tolerances and at rtol = atol = 1e-10. Elsewhere values and forward gradients are bit-identical and reverse gradients identical to before."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/odesolve.rs"
+          ],
+          "result": "passed",
+          "detail": "The branch's test suites pass at 08da2bb, on upstream f5508b3."
+        }
+      ]
+    },
+    {
+      "id": "eigh-svd-zero-coupling-derivative",
+      "role": "fix",
+      "title": "eigh and svd gave zero eigenvector and singular-vector derivatives at an exactly zero off-diagonal",
+      "summary": "The Jacobi rotations of ext-linear-algebra eigh (the unbatched real loop and the batched or complex Hermitian loop) and of svd (and so pinv, lstsq, rank and cond) skipped a pair whose coupling was at most a small threshold, and built the rotation from the coupling's magnitude times a separate unit phase. At a coupling that is exactly zero, as in a diagonal matrix for eigh or orthogonal columns for svd, both choices make the emitted program constant in the coupling, so any AD gave a zero eigenvector or singular-vector derivative where the true value is dA_pq / (lambda_q - lambda_p). Gradients of scores that depend on the vectors were silently wrong there, by up to 100% for eigh and 178% for svd; eigenvalue-only and singular-value-only scores were exact. A shared rotation now forms its tangent from the signed coupling, t = 2 gamma sgn(d) / (|d| + sqrt(d^2 + 4 |gamma|^2)), which is linear in gamma near zero, and rotates every pair whose gap exceeds the threshold however small its coupling. Upstream's #724 gave the unbatched real eigh loop its own signed tangent, which the branch uses from upstream f5508b3 on. Upstream's batched and complex eigh loop and its svd still gate a rotation on the coupling magnitude, so the branch keeps this fix there.",
+      "repairs": [],
+      "upstream_refs": [
+        {
+          "url": "https://github.com/flatppl/flatppl-rust/pull/724",
+          "relation": "related"
+        }
+      ],
+      "fix": {
+        "originals": [
+          "42e3768675bd69bb781ff38a419f960641ff5bb0"
+        ],
+        "why_together": "One rotation shared by the eigh and svd loops."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/tests/ext_linalg.rs"
+          ],
+          "result": "passed",
+          "detail": "Diagonal-input eigh and orthogonal-column svd gradients match jax.numpy.linalg.eigh and svd within 8e-14, through Enzyme-JAX 0.0.15+flatppl.23 and the adaptive-while wheel. Eigenvalues are bit-identical on non-degenerate input; an exactly degenerate cluster can come back in a different, equally valid basis. Models without eigh or svd emit byte-identical StableHLO, and n = 30 value and gradient cost is unchanged (137 vs 136 ms)."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/ext_linalg.rs"
+          ],
+          "result": "passed",
+          "detail": "Diagonal-input eigh gradients through upstream's real loop are within 1.8e-11 of matrix-function references for n = 2, 3, 5, 8 and 30, with and without the analytic rule. The branch's test suites pass at 08da2bb, on upstream f5508b3."
+        }
+      ]
+    },
+    {
+      "id": "eigh-reverse-through-jacobi-loop",
+      "role": "fix",
+      "title": "Reverse-mode eigh gradients ran back through the 32-sweep Jacobi loop",
+      "summary": "Enzyme differentiated real symmetric eigh and eigvalsh by reversing the whole fixed-count Jacobi iteration, so spectral models paid far more for a gradient than their dense equivalents (a FlatPPL port of PosteriorDB synthetic_grid_RBF_kernels-kronecker_gp with two 30 x 30 eigh calls: 838 ms per value and gradient, against 233 ms for a dense formulation). Unbatched real eigh and eigvalsh now call a private function __enzyme_linalg_eigh_v1_{f32|f64}_{cpu|gpu}_n{n}(A) whose body is the same solver, returning the ascending eigenvalues, the eigenvector columns at canonical phase and one validity flag. Enzyme-JAX builds that recognise the name (the FlatPPL wheels from 0.0.15+flatppl.23.adaptivewhile.boolrange.eigh.1 on) differentiate it with an analytic eigh adjoint; any other build inlines the body and differentiates the loop as before. Batched, complex and empty input keep the inline loop, and runtime statuses 12 (not symmetric) and 10 (not converged) are reported as before. From upstream f5508b3 on the function's body is upstream's two-column panel loop (#724).",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "522dba170c13ceeacaa5c276c08567034acc23fd",
+          "3444842c9f9a9ed0c2a52bdd92004055b2575bdd"
+        ],
+        "why_together": "The helper emission, and a lint fix to it after it was rebased onto the zero-coupling rotation."
+      },
+      "validation": [
+        {
+          "base": "a7cd995d27de64c8368fd228eac5aaad0cadbf2c",
+          "tests": [
+            "crates/stablehlo/src/hermitian.rs",
+            "crates/stablehlo/tests/ext_linalg.rs"
+          ],
+          "result": "passed",
+          "detail": "Eigenvalues, eigenvectors and runtime status are bit-identical to the inline lowering in all 63 cases checked (random, RBF with gaps down to 5e-18, L L^T, diagonal, rank-one, non-symmetric, NaN and 1e300-scaled matrices, n = 1 to 30), with and without the rule. Without the rule all 60 eigh gradients are bit-identical; eigvalsh gradients agree within 3.7e-13 but cost more (n = 30: 195 against 74 ms), because the body also accumulates eigenvectors. With the rule gradients are finite and symmetric and within 1.7e-11 of matrix-function references wherever eigenvalue gaps exceed 1e-3; n = 30 value and gradient: eigh 4.5 against 187 ms, eigvalsh 4.6 against 107 ms; the Kronecker GP takes 21 ms, gradients within 7.6e-12 of dense."
+        },
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/src/hermitian.rs",
+            "crates/stablehlo/tests/ext_linalg.rs"
+          ],
+          "result": "passed",
+          "detail": "With upstream's loop as the body, 60 gradient cases (random, RBF, L L^T, diagonal and rank-one matrices, n = 1 to 30): all finite; wherever eigenvalue gaps exceed 1e-3 they are within 1.8e-11 of matrix-function references, and within 2.2e-12 (loop differentiated) and 2.1e-14 (analytic rule) of the previous body. n = 30 value and gradient on one loaded CPU: 0.52 ms with the rule (0.0.15+flatppl.23.adaptivewhile.boolrange.eigh.enzymedialect.batchedreverse.1) against 4.9 ms for the previous body, and 21 ms without it (0.0.15+flatppl.23) against 364 ms. Plain and batched host exports of a spectral Kronecker GP differentiate on those two wheels and on ...boolrange.eigh.1, gradients within 4.0e-12 of the reference through the loop and within 1.5e-9 with the rule."
+        }
+      ]
+    },
+    {
+      "id": "odesolve-coupled-sensitivity-control",
+      "role": "fix",
+      "title": "odesolve gradients followed value-only step control, unlike Stan's gradient call",
+      "summary": "Stan's log_density_gradient integrates the coupled sensitivity system, so its steps also control the error of the sensitivities. odesolve's derivative followed the steps chosen for the value alone, which left gradients up to 1.3e-2 relative from Stan's on PosteriorDB lotka_volterra and wrong at an ODE equilibrium. An opt-in option (EmitOptions::ode_sensitivity_control, the CLI's --ode-sensitivity-control, the python-api export keyword of the same name) lowers the outputs a second time on Stan's coupled steps and takes derivatives there; values keep the value-only steps of Stan's log_density. The sensitivities' Jacobian-vector products are enzyme.fwddiff operations, so the emitted module needs an Enzyme-JAX build whose hlo_call accepts Enzyme's dialect. Sample mode refuses the option.",
+      "repairs": [],
+      "upstream_refs": [],
+      "fix": {
+        "originals": [
+          "5e88ac4c424f9d1d8d2356310317ecb1f2763dab",
+          "475b44acdcd9c7bbeb62393298d4abf53cb71d59",
+          "213ab67c53dd7c66494b92f73afe652c4e4b7188",
+          "24346a65335c72b1ec3c2d74b48a1dfc59390909"
+        ],
+        "why_together": "The option in logdensity mode, its host-export and Python path, a test of sample mode's refusal, and the rng-key fix for sampling exports."
+      },
+      "depends_on": [
+        "odesolve"
+      ],
+      "validation": [
+        {
+          "base": "f5508b32904b09fd561ac0255322c4747c171a85",
+          "tests": [
+            "crates/stablehlo/tests/odesolve.rs",
+            "crates/host/tests/ode_sensitivity.rs"
+          ],
+          "result": "passed",
+          "detail": "At 08da2bb, Lotka-Volterra with the option: gradient within 8.5e-15 of BridgeStan 2.9.0 log_density_gradient at three recorded points and at the equilibrium (without it 1.6e-3 to 1.3e-2 at the three points); values unchanged; reverse against forward mode within 9.4e-14. One-compartment Michaelis-Menten and two-pool soil gradients within 1.6e-8 of exact solves, with and without the option."
+        }
+      ]
+    }
+  ]
+}
